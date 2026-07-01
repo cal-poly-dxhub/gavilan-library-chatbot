@@ -1,0 +1,28 @@
+# ---- Python (CDK infra, Lambda app, eval) ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# ---- Environment / secrets ----
+.env
+.env.*
+*.local
+
+# ---- AWS CDK ----
+cdk.out/
+.cdk.staging/
+cdk.context.json
+
+# ---- Node (only for the widget's tooling, if any) ----
+frontend/node_modules/
+node_modules/
+
+# ---- IDE / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
