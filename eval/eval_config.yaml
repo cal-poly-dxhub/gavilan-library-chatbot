@@ -37,3 +37,14 @@ eval:
     # overrideSearchType: HYBRID or SEMANTIC. v1 retrieval is semantic-only; HYBRID is the
     # Phase 2 target, so this knob lets eval compare them without code changes.
     search_type: "SEMANTIC"
+
+  # Retrieve-and-generate evaluation: the answer-quality evaluator. BRING-YOUR-OWN-INFERENCE
+  # Metrics: Correctness, Completeness, Faithfulness, Helpfulness, Harmfulness
+  # (+ CitationCoverage/CitationPrecision only when citations are captured).
+  generate:
+    # BYOI source id. MUST match output.knowledgeBaseIdentifier in every JSONL line and
+    # ragSourceIdentifier in the inferenceConfig. Human-chosen string.
+    rag_source_identifier: "gavilan-bot-v1"
+    # Deployed bot's HTTP API /query endpoint. The capture stage POSTs each question
+    # here. TBD: real URL once the bot is deployed (see capture_outputs.py).
+    bot_api_url: "https://TBD.execute-api.us-west-2.amazonaws.com/query"
