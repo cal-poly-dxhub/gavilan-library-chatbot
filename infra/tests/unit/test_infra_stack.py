@@ -13,6 +13,12 @@ def _template():
     return assertions.Template.from_stack(stack)
 
 
+def _one(template, res_type):
+    """Return the single resource of res_type (fails if there isn't exactly one)."""
+    (res,) = template.find_resources(res_type).values()
+    return res
+
+
 def test_vector_collection_and_policies_created():
     template = _template()
     template.has_resource_properties(
@@ -109,7 +115,14 @@ def test_web_crawler_data_source_created_after_knowledge_base():
 
 def test_query_lambda_and_http_api_synthesize():
     template = _template()
-    template.resource_count_is("AWS::Lambda::Function", 1)
+    # Exactly one query Lambda, identified by its handler. Other AWS::Lambda::Function
+    # resources exist for the S3 BucketDeployment + auto-delete-objects custom resources,
+    # so scope the count to the query function rather than counting all functions.
+    query_funcs = template.find_resources(
+        "AWS::Lambda::Function",
+        {"Properties": {"Handler": "handler.lambda_handler"}},
+    )
+    assert len(query_funcs) == 1, list(query_funcs)
     template.has_resource_properties(
         "AWS::Lambda::Function",
         {"Handler": "handler.lambda_handler", "Runtime": "python3.13"},
@@ -135,20 +148,27 @@ def test_query_lambda_has_its_own_role_distinct_from_kb_role():
         statements = role["Properties"]["AssumeRolePolicyDocument"]["Statement"]
         return {s["Principal"]["Service"] for s in statements}
 
-    lambda_roles = [
-        rid for rid, r in roles.items()
-        if "lambda.amazonaws.com" in assumed_services(r)
-    ]
+    # Exactly one KB role (assumed by the Bedrock service).
     kb_roles = [
         rid for rid, r in roles.items()
         if "bedrock.amazonaws.com" in assumed_services(r)
     ]
-    # Exactly one Lambda role and one KB role, and they are different resources.
-    assert len(lambda_roles) == 1, lambda_roles
     assert len(kb_roles) == 1, kb_roles
-    assert lambda_roles[0] != kb_roles[0]
 
-    # The Lambda role grants Retrieve + InvokeModel but NOT the KB's aoss actions.
+    # The query Lambda's role is the one attached to the handler.lambda_handler function.
+    # (Other lambda-assumed roles exist for the S3 deployment + auto-delete helpers, so
+    # identify the query role via its function rather than by counting lambda roles.)
+    query_funcs = template.find_resources(
+        "AWS::Lambda::Function",
+        {"Properties": {"Handler": "handler.lambda_handler"}},
+    )
+    (query_func,) = query_funcs.values()
+    query_role_id = query_func["Properties"]["Role"]["Fn::GetAtt"][0]
+
+    assert "lambda.amazonaws.com" in assumed_services(roles[query_role_id])
+    assert query_role_id != kb_roles[0]
+
+    # The query role grants Retrieve + InvokeModel but NOT the KB's aoss actions.
     template.has_resource_properties(
         "AWS::IAM::Policy",
         assertions.Match.object_like(
@@ -165,7 +185,71 @@ def test_query_lambda_has_its_own_role_distinct_from_kb_role():
                         ]
                     )
                 },
-                "Roles": [{"Ref": lambda_roles[0]}],
+                "Roles": [{"Ref": query_role_id}],
             }
         ),
     )
+
+
+# --- Widget hosting: S3 + CloudFront (OAC) + BucketDeployment --------------------
+
+
+def test_widget_bucket_is_private_and_oac_ready():
+    template = _template()
+    # Exactly one S3 bucket (the widget bucket): all public access blocked, and ACLs
+    # disabled via bucket-owner-enforced ownership (the ownership OAC requires).
+    template.resource_count_is("AWS::S3::Bucket", 1)
+    template.has_resource_properties(
+        "AWS::S3::Bucket",
+        {
+            "PublicAccessBlockConfiguration": {
+                "BlockPublicAcls": True,
+                "BlockPublicPolicy": True,
+                "IgnorePublicAcls": True,
+                "RestrictPublicBuckets": True,
+            },
+            "OwnershipControls": {
+                "Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]
+            },
+        },
+    )
+
+
+def test_widget_distribution_uses_oac_not_oai():
+    template = _template()
+    template.resource_count_is("AWS::CloudFront::Distribution", 1)
+    # OAC is the required mechanism: an OriginAccessControl resource must exist and there
+    # must be NO legacy Origin Access Identity.
+    template.resource_count_is("AWS::CloudFront::OriginAccessControl", 1)
+    template.resource_count_is("AWS::CloudFront::CloudFrontOriginAccessIdentity", 0)
+
+    dist = _one(template, "AWS::CloudFront::Distribution")
+    origin = dist["Properties"]["DistributionConfig"]["Origins"][0]
+    # The origin references the OAC and does NOT use an OAI (empty OriginAccessIdentity).
+    assert "OriginAccessControlId" in origin, origin
+    assert origin.get("S3OriginConfig", {}).get("OriginAccessIdentity", "") == ""
+
+
+def test_widget_bucket_deployment_uploads_the_widget():
+    template = _template()
+    # The BucketDeployment renders as a CDK bucket-deployment custom resource.
+    template.resource_count_is("Custom::CDKBucketDeployment", 1)
+
+
+def test_stack_outputs_ready_to_paste_embed_tag():
+    template = _template()
+    outputs = template.find_outputs("*")
+    assert "WidgetEmbedTag" in outputs, list(outputs)
+    assert "WidgetCdnDomain" in outputs
+    assert "ChatbotApiUrl" in outputs
+
+    # The embed tag is a full <script ... data-api-url="..." defer></script> snippet,
+    # assembled from the CloudFront domain and the API endpoint via Fn::Join. Check the
+    # literal fragments that surround the two injected tokens.
+    value = outputs["WidgetEmbedTag"]["Value"]
+    literals = "".join(p for p in value["Fn::Join"][1] if isinstance(p, str))
+    assert literals.startswith('<script src="https://'), literals
+    assert "/widget.js" in literals
+    assert 'data-api-url="' in literals
+    assert "/query" in literals
+    assert literals.endswith("defer></script>"), literals

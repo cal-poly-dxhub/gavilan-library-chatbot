@@ -10,15 +10,10 @@ Crawler data source:
   Bedrock Knowledge Base (VECTOR, OpenSearch Serverless storage)
   Web Crawler data source (type WEB, FIXED_SIZE chunking)
   query-path Lambda (own role) + HTTP API (API Gateway v2), POST /query
+  widget hosting: private S3 bucket + CloudFront (OAC) + BucketDeployment(widget.js)
 
-All changeable knobs come from the repo-root config.yaml (see infra/infra/config.py),
-not from literals in this file. NOT wired here yet (later tasks): the real system prompt,
-Bedrock Guardrails, the widget, WAF, and auth.
+All changeable knobs come from the repo-root config.yaml
 
-API shapes (CfnIndex, CfnKnowledgeBase, CfnDataSource web crawler, aoss policy JSON,
-apigatewayv2 HttpApi + HttpLambdaIntegration, Lambda) were verified against aws-cdk-lib
-2.260.0 by introspecting the installed package, not from memory. HTTP API v2 is in core
-in this version (no aws-apigatewayv2-alpha package needed).
 """
 
 import json
@@ -26,20 +21,29 @@ from pathlib import Path
 from typing import Any, Dict
 
 from aws_cdk import (
+    CfnOutput,
     Duration,
+    RemovalPolicy,
     Stack,
     aws_apigatewayv2 as apigwv2,
     aws_apigatewayv2_integrations as apigwv2_integrations,
     aws_bedrock as bedrock,
+    aws_cloudfront as cloudfront,
+    aws_cloudfront_origins as origins,
     aws_iam as iam,
     aws_lambda as _lambda,
     aws_opensearchserverless as oss,
+    aws_s3 as s3,
+    aws_s3_deployment as s3deploy,
 )
 from constructs import Construct
 
 # Repo-root app/ directory holding the Lambda handler source (app/handler.py).
 # infra_stack.py is <repo>/infra/infra/infra_stack.py, so parents[2] is the repo root.
 _APP_DIR = Path(__file__).resolve().parents[2] / "app"
+# Repo-root frontend/ directory. Only widget.js is uploaded (mock.js / demo.html are
+# dev-only and must never ship to production).
+_FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 
 
 class GavilanChatbotStack(Stack):
@@ -402,4 +406,95 @@ class GavilanChatbotStack(Stack):
             integration=apigwv2_integrations.HttpLambdaIntegration(
                 "QueryIntegration", query_lambda
             ),
+        )
+
+        # --- Widget hosting: private S3 bucket + CloudFront (OAC) ----------------------
+
+        # The production widget file is served from a private S3 bucket, reachable ONLY
+        # through CloudFront via Origin Access Control (OAC). It lives in THIS stack (not a
+        # separate one) so the whole thing installs with one `cdk deploy`: OAC has a known
+        # cross-stack cyclical-dependency problem, and one-click install wants a single
+        # deploy.
+        widget_bucket = s3.Bucket(
+            self,
+            "WidgetBucket",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            # OAC requires ACLs disabled (bucket-owner-enforced ownership). That is the
+            # default for freshly created buckets; we set it explicitly to keep the OAC
+            # requirement legible.
+            object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            enforce_ssl=True,
+            # One-click install implies one-click uninstall: on `cdk destroy`, remove the
+            # bucket and empty it first (auto_delete_objects adds a small custom resource).
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+        )
+
+        # OAC origin via the CURRENT L2 construct (NOT the deprecated S3Origin/OAI, NOT a
+        # hand-rolled CfnOriginAccessControl). with_origin_access_control provisions the
+        # OAC and wires the bucket policy so only this distribution can read the object.
+        widget_origin = origins.S3BucketOrigin.with_origin_access_control(widget_bucket)
+
+        widget_distribution = cloudfront.Distribution(
+            self,
+            "WidgetDistribution",
+            comment="Gavilan Library chat widget CDN (serves widget.js).",
+            default_root_object="widget.js",
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=widget_origin,
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED,
+            ),
+        )
+        # NOTE: do NOT add an explicit distribution->bucket dependency. The origin already
+        # references the bucket (GetAtt), so CloudFormation orders the bucket first. Adding
+        # node.add_dependency(bucket) instead pulls in ALL the bucket's children, including
+        # the auto-delete-objects custom resource, which DependsOn the OAC bucket policy,
+        # which DependsOn the distribution -> a synth-blocking dependency cycle.
+
+        # Upload ONLY frontend/widget.js into the bucket. The include-only exclude pattern
+        # ("*" then "!widget.js") keeps mock.js, demo.html, and any future dev files out of
+        # production. On deploy, invalidate the CloudFront cache for the file so an updated
+        # widget.js is served immediately instead of from edge cache.
+        s3deploy.BucketDeployment(
+            self,
+            "WidgetDeployment",
+            destination_bucket=widget_bucket,
+            sources=[
+                s3deploy.Source.asset(
+                    str(_FRONTEND_DIR), exclude=["*", "!widget.js"]
+                )
+            ],
+            distribution=widget_distribution,
+            distribution_paths=["/widget.js"],
+        )
+
+        # --- Outputs: ready-to-paste embed tag + raw domain / API URL ------------------
+
+        # http_api.api_endpoint has NO trailing slash; the POST route is /query. The
+        # CloudFront domain has no scheme, so widget.js is served at https://<domain>/widget.js.
+        widget_src = f"https://{widget_distribution.distribution_domain_name}/widget.js"
+        query_url = f"{http_api.api_endpoint}/query"
+        embed_tag = (
+            f'<script src="{widget_src}" data-api-url="{query_url}" defer></script>'
+        )
+
+        CfnOutput(
+            self,
+            "WidgetEmbedTag",
+            value=embed_tag,
+            description="Ready-to-paste embed snippet for the library website.",
+        )
+        CfnOutput(
+            self,
+            "WidgetCdnDomain",
+            value=widget_distribution.distribution_domain_name,
+            description="CloudFront domain name serving widget.js.",
+        )
+        CfnOutput(
+            self,
+            "ChatbotApiUrl",
+            value=query_url,
+            description="HTTP API POST /query endpoint the widget calls.",
         )
