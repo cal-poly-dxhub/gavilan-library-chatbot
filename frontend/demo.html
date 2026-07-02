@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Widget demo — Gavilan Library Chatbot (dev harness)</title>
+  <!--
+    DEV HARNESS ONLY. This page stands in for the library's real website so you
+    can open the widget in a browser and use it fully offline against the mock.
+    It is NOT part of the embeddable widget; the library only ever adds the one
+    <script> tag near the bottom of this file.
+
+    To run: open this file in any browser (double-click, or `open demo.html`).
+    No server, no build step, no network needed — a dev-only mock (mock.js,
+    loaded on this page only) intercepts the widget's fetch and answers with
+    canned responses. widget.js itself contains no mock.
+
+    The CSS below is deliberately hostile (aggressive resets, wild colors,
+    huge/!important type, global selectors). If Shadow DOM isolation works, NONE
+    of it touches the widget, and the widget's own CSS never leaks back out to
+    style this page.
+  -->
+  <style>
+    /* --- intentionally hostile host-page CSS to test style isolation --- */
+    * {
+      box-sizing: content-box !important;
+      font-family: "Comic Sans MS", cursive !important;
+      letter-spacing: 0.5px;
+    }
+    body {
+      margin: 0;
+      padding: 0;
+      background: repeating-linear-gradient(45deg, #fff, #fff 20px, #f3f0ff 20px, #f3f0ff 40px);
+      color: #202020;
+    }
+    button, section, div, a, textarea, ul, li, span {
+      color: hotpink !important;
+      font-size: 20px !important;
+      border: 2px dashed limegreen;
+      text-transform: uppercase;
+    }
+    a { text-decoration: overline underline wavy blue !important; }
+    /* If any of the above bled into the widget, it would look obviously broken. */
+
+    /* Tidy styling for the harness page's own content (scoped to .host-*). */
+    .host-wrap { max-width: 720px; margin: 0 auto; padding: 40px 24px 120px; }
+    .host-card {
+      border: 1px solid #d9dee5 !important;
+      border-radius: 12px;
+      background: #ffffff;
+      padding: 20px 24px;
+      margin-top: 18px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+    }
+    .host-note { font-size: 14px !important; color: #444 !important; text-transform: none; }
+    code { background: #eef1f5; padding: 2px 6px; border-radius: 5px; font-family: monospace !important; }
+  </style>
+</head>
+<body>
+  <div class="host-wrap">
+    <h1>Gavilan College Library</h1>
+    <p class="host-note">
+      This is a mock host page (a stand-in for the library's real site) used to
+      develop and demo the embeddable chat widget. The page's own CSS is
+      intentionally hostile to prove the widget's Shadow DOM isolation holds.
+    </p>
+
+    <div class="host-card">
+      <h2>Try the widget</h2>
+      <p class="host-note">
+        Click <strong>“Ask the Library”</strong> at the bottom-right. Then try:
+      </p>
+      <ul class="host-note">
+        <li>“What are the library hours?” (answer + a source link)</li>
+        <li>“How do I check out a book?” (answer + a source link)</li>
+        <li>“I need a textbook for my class” (clarifying question, no sources)</li>
+        <li>“Can you help me find research articles?” (routes to a librarian)</li>
+        <li>Type <code>trigger error</code> to see the error + retry state.</li>
+      </ul>
+    </div>
+
+    <div class="host-card">
+      <h2 class="host-note">Going live later</h2>
+      <p class="host-note">
+        On this page the widget runs against a dev-only mock
+        (<code>mock.js</code>) that intercepts its network call. To point it at
+        the real backend, set the API Gateway <code>/query</code> URL in one
+        place — the <code>data-api-url</code> attribute on the
+        <code>widget.js</code> script tag — and drop <code>mock.js</code>.
+        Nothing else changes.
+      </p>
+    </div>
+  </div>
+
+  <!--
+    ============================================================
+    THIS is the entire embed. On the real site, the library adds
+    just ONE tag, pointing data-api-url at the deployed API
+    Gateway /query URL:
+
+      <script src="https://.../widget.js"
+              data-api-url="https://REPLACE-ME.execute-api.us-west-2.amazonaws.com/query"
+              defer></script>
+    ============================================================
+  -->
+
+  <!-- DEV-ONLY offline mock. NOT part of the real embed; the library never
+       ships this file. It transparently intercepts fetch() to the widget's
+       data-api-url and returns canned answers, so this page works with no
+       backend. Must load BEFORE widget.js (defer preserves document order). -->
+  <script src="mock.js" defer></script>
+
+  <!-- The widget. The data-api-url below is a placeholder the mock intercepts;
+       on the real site it is the deployed /query URL and no mock is present. -->
+  <script src="widget.js" data-api-url="https://api.mock.local/query" defer></script>
+</body>
+</html>
