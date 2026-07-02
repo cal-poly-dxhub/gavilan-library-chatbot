@@ -58,8 +58,8 @@ the KB `field_mapping` (defined once in `config.yaml` under `vector_store.fields
   encryption/network security policies, KB execution IAM role, data access policy, vector
   index, the `AWS::Bedrock::KnowledgeBase` (VECTOR, OSS storage), the
   `AWS::Bedrock::DataSource` (type WEB, FIXED_SIZE chunking), a query-path Lambda with its
-  OWN execution role, and an HTTP API (API Gateway v2) with a `POST /query` route. The
-  real system prompt, Guardrails, widget, WAF, and auth are NOT wired yet. Structure:
+  OWN execution role, and an HTTP API (API Gateway v2) with a `POST /query` route.
+  Guardrails, widget, WAF, and auth are NOT wired yet. Structure:
   - `app.py` — CDK app entrypoint; loads `config.yaml` and passes it to the stack
   - `infra/infra_stack.py` — the stack (`GavilanChatbotStack`); reads all knobs from config
   - `infra/config.py` — `load_config()`; resolves the repo-root `config.yaml` from `__file__`
@@ -71,9 +71,23 @@ the KB `field_mapping` (defined once in `config.yaml` under `vector_store.fields
   - `cdk.json` — toolkit config (`app: python3 app.py`)
   - `.venv/` — virtualenv (gitignored)
 - `app/` — Lambda code. `handler.py`: HTTP API (payload format 2.0) entrypoint with two
-  separate steps — `retrieve()` (KB `Retrieve`, NOT RetrieveAndGenerate) and `generate()`
-  (Bedrock Converse under a PLACEHOLDER system prompt). Wiring comes from env vars set by
-  the stack. boto3 is provided by the Lambda runtime (not vendored, not a dev dep).
+  separate steps - `retrieve()` (KB `Retrieve`, NOT RetrieveAndGenerate; returns
+  `{text, source}` per chunk) and `generate()` (Bedrock Converse). Wiring comes from env
+  vars set by the stack. boto3 is provided by the Lambda runtime (not vendored, not a dev dep).
+  - `system_prompt.md` - the real, finalized system prompt (the Gavilan Library assistant
+    role, scope, grounding, handoff, textbook flow, tone, fixed rules). Read once at cold
+    start via `Path(__file__).parent`, and passed to Converse via the `system` parameter
+    (never concatenated into the user message). It is packaged with the Lambda because the
+    stack uses `Code.from_asset(app/)`, which bundles the whole directory (verified in the
+    synthesized asset).
+  - Prompt/handler contract: the prompt expects retrieved passages inside `<context>` tags,
+    and the handler wraps chunks in exactly that tag (`handler.CONTEXT_TAG == "context"`).
+    The user message is the `<context>` block followed by `Question: <query>`.
+  - **`POST /query` response JSON shape** (the frontend builds against this):
+    `{ "answer": "<text>", "sources": [ {"uri": "<page url>", "excerpt": "<snippet>"} ] }`.
+    `sources` is deduplicated by uri, in retrieval order; passages with no resolvable source
+    uri are omitted from `sources` (they still inform the answer); on empty retrieval
+    `sources` is `[]` and the prompt tells the model to say it does not have the info.
 - `eval/` — eval harness (empty; planned): Q&A set + retrieval/faithfulness scoring
 - `frontend/` — JS widget (empty; planned)
 - `config.yaml` — declarative settings at the repo root; single source of truth for

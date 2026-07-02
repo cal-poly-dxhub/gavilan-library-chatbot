@@ -1,21 +1,31 @@
 """Query-path Lambda for the Gavilan Library Chatbot.
 
-Two separate steps per docs/architecture.md, deliberately NOT RetrieveAndGenerate:
-  1. retrieve()  -> Bedrock Knowledge Base `Retrieve` for relevant chunks.
-  2. generate()  -> Bedrock generation (Converse) over those chunks, under our own
-     system prompt, so we keep full prompt control.
+Two separate steps:
+  1. retrieve()  -> Bedrock Knowledge Base `Retrieve` for relevant chunks + their sources.
+  2. generate()  -> Bedrock Converse over those chunks, under the real system prompt
+     (app/system_prompt.md).
 
-Fronted by an API Gateway HTTP API (payload format 2.0). All wiring comes from env
-vars set by the CDK stack, never hardcoded here.
+Fronted by an API Gateway HTTP API (payload format 2.0). Wiring comes from env vars set
+by the CDK stack.
 
-NOTE: the system prompt below is a PLACEHOLDER. The real behavior (textbook clarifying
-questions, out-of-scope routing) is designed in a separate task, per the hard rule that
-behavior lives in the system prompt. Do not invest in prompt quality here.
+/query response JSON shape:
+  {
+    "answer": "<generated answer text>",
+    "sources": [
+      {"uri": "<source page url>", "excerpt": "<short snippet of that passage>"},
+      ...
+    ]
+  }
+  - `sources` is deduplicated by uri, in retrieval order. Passages with no resolvable
+    source uri are omitted from `sources` (they still inform the answer).
+  - On empty retrieval, `sources` is [] and the system prompt instructs the model to say
+    it does not have the information (rather than guess).
 """
 
 import base64
 import json
 import os
+from pathlib import Path
 
 import boto3
 
@@ -25,12 +35,17 @@ GENERATION_MODEL_ID = os.environ["GENERATION_MODEL_ID"]
 REGION = os.environ.get("BEDROCK_REGION") or os.environ.get("AWS_REGION")
 NUMBER_OF_RESULTS = int(os.environ.get("NUMBER_OF_RESULTS", "5"))
 
-# PLACEHOLDER system prompt. Replace in the prompt-design task. Not tuned on purpose.
-SYSTEM_PROMPT_PLACEHOLDER = (
-    "PLACEHOLDER SYSTEM PROMPT. You are an assistant for the Gavilan College Library. "
-    "Answer operational questions using only the provided context; if the answer is not "
-    "in the context, say so. This stub is replaced with the real system prompt later."
-)
+# The tag the system prompt expects retrieved passages in. MUST match "<context>" in
+# app/system_prompt.md (the prompt/handler contract).
+CONTEXT_TAG = "context"
+
+# Max characters of a passage surfaced as a source excerpt in the response.
+_EXCERPT_CHARS = 300
+
+# The real system prompt is packaged with the Lambda: app/system_prompt.md lives inside
+# the from_asset(app/) bundle, next to this file. Read once at cold start.
+_PROMPT_PATH = Path(__file__).resolve().parent / "system_prompt.md"
+SYSTEM_PROMPT = _PROMPT_PATH.read_text(encoding="utf-8").strip()
 
 _agent_runtime = None
 _bedrock_runtime = None
@@ -50,8 +65,28 @@ def _bedrock_client():
     return _bedrock_runtime
 
 
+def _extract_source(result):
+    """Pull a source URI from a KB Retrieve result. Web crawler -> page url; falls back to
+    the bedrock source-uri metadata."""
+    location = result.get("location") or {}
+    for key in (
+        "webLocation",
+        "s3Location",
+        "confluenceLocation",
+        "salesforceLocation",
+        "sharePointLocation",
+    ):
+        loc = location.get(key)
+        if isinstance(loc, dict):
+            uri = loc.get("url") or loc.get("uri")
+            if uri:
+                return uri
+    metadata = result.get("metadata") or {}
+    return metadata.get("x-amz-bedrock-kb-source-uri")
+
+
 def retrieve(query):
-    """Knowledge Base Retrieve API. Returns a list of chunk text strings."""
+    """Knowledge Base Retrieve API. Returns a list of {"text", "source"} dicts."""
     response = _agent_client().retrieve(
         knowledgeBaseId=KNOWLEDGE_BASE_ID,
         retrievalQuery={"text": query},
@@ -61,26 +96,51 @@ def retrieve(query):
     )
     chunks = []
     for result in response.get("retrievalResults", []):
-        text = result.get("content", {}).get("text")
+        text = (result.get("content") or {}).get("text")
         if text:
-            chunks.append(text)
+            chunks.append({"text": text, "source": _extract_source(result)})
     return chunks
 
 
-def generate(query, chunks):
-    """Bedrock Converse generation grounded in the retrieved chunks."""
-    if chunks:
-        context = "\n\n".join(f"[{i + 1}] {c}" for i, c in enumerate(chunks))
-        user_text = f"Context:\n{context}\n\nQuestion: {query}"
+def _build_context_block(chunks):
+    """Wrap the retrieved chunks in the <context> tag the system prompt expects."""
+    if not chunks:
+        inner = "(no relevant passages were retrieved)"
     else:
-        user_text = f"Question: {query}"
+        entries = []
+        for i, chunk in enumerate(chunks, start=1):
+            entry = f"[{i}] {chunk['text']}"
+            if chunk.get("source"):
+                entry += f"\nSource: {chunk['source']}"
+            entries.append(entry)
+        inner = "\n\n".join(entries)
+    return f"<{CONTEXT_TAG}>\n{inner}\n</{CONTEXT_TAG}>"
+
+
+def generate(query, chunks):
+    """Bedrock Converse generation. The system prompt goes in Converse `system`; the
+    <context> block and the question go in the user message. Returns the answer text."""
+    user_text = f"{_build_context_block(chunks)}\n\nQuestion: {query}"
 
     response = _bedrock_client().converse(
         modelId=GENERATION_MODEL_ID,
-        system=[{"text": SYSTEM_PROMPT_PLACEHOLDER}],
+        system=[{"text": SYSTEM_PROMPT}],
         messages=[{"role": "user", "content": [{"text": user_text}]}],
     )
     return response["output"]["message"]["content"][0]["text"]
+
+
+def _build_sources(chunks):
+    """Deduplicate retrieved chunks by source uri for the response `sources` list."""
+    sources = []
+    seen = set()
+    for chunk in chunks:
+        uri = chunk.get("source")
+        if not uri or uri in seen:
+            continue
+        seen.add(uri)
+        sources.append({"uri": uri, "excerpt": chunk["text"][:_EXCERPT_CHARS]})
+    return sources
 
 
 def _extract_query(event):
@@ -114,4 +174,4 @@ def lambda_handler(event, context):
 
     chunks = retrieve(query)
     answer = generate(query, chunks)
-    return _response(200, {"answer": answer, "sources_used": len(chunks)})
+    return _response(200, {"answer": answer, "sources": _build_sources(chunks)})
