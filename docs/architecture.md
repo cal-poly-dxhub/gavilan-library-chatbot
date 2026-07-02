@@ -49,7 +49,7 @@
 
 **Ingest (on sync):** Crawler → sponsor seed URLs, child links, include/exclude regex, robots.txt → Smart Parsing → chunk → Titan v2 embed → OSS NextGen. Re-sync on schedule (weekly baseline).
 
-**Query (runtime, v1):** Widget → API Gateway → Lambda → KB (embed, hybrid search, rerank, retrieve) → Bedrock LLM generates grounded answer + citations → Guardrails filter input → log → return. 
+**Query (runtime, v1):** Widget → API Gateway → Lambda → KB (embed, hybrid search, rerank, retrieve) → Bedrock LLM generates grounded answer + citations → Guardrails filter input and output → log → return.
 
 ---
 
