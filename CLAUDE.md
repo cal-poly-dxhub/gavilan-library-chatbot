@@ -7,7 +7,7 @@ RAG chatbot for Gavilan College Library. Answers operational student questions (
 ## Stack
 
 - **RAG:** Amazon Bedrock Managed Knowledge Base (Web Crawler connector → OpenSearch Serverless NextGen vector store)
-- **Generation:** Bedrock-hosted Claude via `Retrieve` + own generate call (NOT `RetrieveAndGenerate` — we need full system-prompt control)
+- **Generation:** Bedrock-hosted Claude via `Retrieve` + own generate call (NOT `RetrieveAndGenerate` — full system-prompt control required)
 - **Backend:** Lambda + API Gateway (Python)
 - **Infra:** AWS CDK (Python) — everything declared as code, nothing built by hand
 - **Guardrails:** Bedrock Guardrails (content + PII)
@@ -19,26 +19,70 @@ RAG chatbot for Gavilan College Library. Answers operational student questions (
 Architecture and rationale are in `docs/`:
 - `docs/architecture.md` — stack decisions, phases, data flow, verified facts
 
-When a task touches architecture or a "why did we choose X" question, read these first. Do not re-derive or contradict decisions recorded there.
+When a task touches architecture or a "why was X chosen" question, read these first. Do not re-derive or contradict decisions recorded there.
 
 ## Commands
 
-<!-- TODO: fill in as code lands. Repo is pre-build; these don't all exist yet. -->
-- Infra synth (offline validation): `cdk synth`
+The CDK app lives in `infra/`. The `cdk` CLI is installed globally. All infra commands
+run from `infra/` with the project virtualenv active.
+
+First-time setup (from `infra/`):
+- `python3 -m venv .venv` (already created by `cdk init`)
+- `source .venv/bin/activate`
+- `python -m pip install -r requirements.txt -r requirements-dev.txt`
+
+Then, from `infra/` with the venv active:
+- Infra synth (offline, no creds): `cdk synth`
+- Infra tests: `python -m pytest`
 - Infra deploy: `cdk deploy` (needs AWS creds — company account, pending)
 - Infra teardown: `cdk destroy` (IMPORTANT: also removes the OSS collection; deleting the KB alone does not)
-- Python tests: <!-- TODO: pytest invocation once test dir exists -->
-- Lambda unit tests use `moto` to mock AWS (no live account needed)
+
+Pinned: `aws-cdk-lib==2.260.0`, CDK CLI `2.1129.0`.
+
+- Handler unit tests (`tests/unit/test_handler.py`) stub `boto3` in `sys.modules` and
+  monkeypatch the client getters, so they need no boto3 install and no live AWS.
+
+## Knowledge Base / vector store facts
+
+Vector index field names. These MUST stay identical between the `CfnIndex` mappings and
+the KB `field_mapping` (defined once in `config.yaml` under `vector_store.fields`):
+- vector field: `bedrock-knowledge-base-default-vector` (knn_vector, 1024 dims = Titan Text Embeddings v2, faiss/hnsw/l2)
+- text field: `AMAZON_BEDROCK_TEXT_CHUNK`
+- metadata field: `AMAZON_BEDROCK_METADATA`
+- index name: `bedrock-knowledge-base-default-index`
 
 ## Repo layout
 
-<!-- TODO: update as directories are created -->
-- `infra/` — CDK app (KB, OSS NextGen, crawler, Lambda, API Gateway, IAM)
-- `app/` — Lambda code: two separate functions — (1) call KB `Retrieve`, (2) call Bedrock to generate
-- `eval/` — eval harness: Q&A set + retrieval/faithfulness scoring
-- `frontend/` — JS widget
-- `config.yaml` — declarative settings
-- `docs/` — design docs
+- `infra/` — CDK Python app (created by `cdk init`). The stack provisions the full
+  ingestion side plus the query path: OpenSearch Serverless collection +
+  encryption/network security policies, KB execution IAM role, data access policy, vector
+  index, the `AWS::Bedrock::KnowledgeBase` (VECTOR, OSS storage), the
+  `AWS::Bedrock::DataSource` (type WEB, FIXED_SIZE chunking), a query-path Lambda with its
+  OWN execution role, and an HTTP API (API Gateway v2) with a `POST /query` route. The
+  real system prompt, Guardrails, widget, WAF, and auth are NOT wired yet. Structure:
+  - `app.py` — CDK app entrypoint; loads `config.yaml` and passes it to the stack
+  - `infra/infra_stack.py` — the stack (`GavilanChatbotStack`); reads all knobs from config
+  - `infra/config.py` — `load_config()`; resolves the repo-root `config.yaml` from `__file__`
+  - `infra/__init__.py` — package marker
+  - `tests/unit/test_infra_stack.py` — stack assertion tests
+  - `tests/unit/test_handler.py` — handler unit tests (boto3 stubbed, payload-2.0 events)
+  - `requirements.txt` — pinned `aws-cdk-lib==2.260.0`, `constructs`, `PyYAML`
+  - `requirements-dev.txt` — `pytest`
+  - `cdk.json` — toolkit config (`app: python3 app.py`)
+  - `.venv/` — virtualenv (gitignored)
+- `app/` — Lambda code. `handler.py`: HTTP API (payload format 2.0) entrypoint with two
+  separate steps — `retrieve()` (KB `Retrieve`, NOT RetrieveAndGenerate) and `generate()`
+  (Bedrock Converse under a PLACEHOLDER system prompt). Wiring comes from env vars set by
+  the stack. boto3 is provided by the Lambda runtime (not vendored, not a dev dep).
+- `eval/` — eval harness (empty; planned): Q&A set + retrieval/faithfulness scoring
+- `frontend/` — JS widget (empty; planned)
+- `config.yaml` — declarative settings at the repo root; single source of truth for
+  changeable knobs (embedding model, vector store names/fields, crawler seed URLs +
+  filters + scope + rate limits, chunking, `retrieval.number_of_results`,
+  `generation.model_id`). The CDK app reads it at synth time via `infra/config.py`
+  (resolved relative to `__file__`, so cwd does not matter). Edit values here rather than
+  hardcoding in the stack.
+- `docs/` — design docs (`architecture.md`)
 
 ## Hard rules
 
@@ -53,3 +97,28 @@ Avoid em dashes (—); use " - " or parentheses instead.
 ## When testing
 
 Never hide failures. Show all test results, including failures, in full.
+
+## Lessons
+
+Things learned the hard way. Read before repeating the same work.
+
+- **Verify CDK construct APIs against the installed package, not memory.** The Bedrock/OSS
+  construct surface is in flux and training data is stale. For `aws-cdk-lib==2.260.0`,
+  introspecting the installed package settled several points that live docs got wrong:
+  `CfnIndex` takes structured `mappings`/`settings` (not an `index_body` blob);
+  `VectorKnowledgeBaseConfigurationProperty` has no `type` (the `type` is on
+  `KnowledgeBaseConfigurationProperty`); `CfnIndex.MethodProperty` uses
+  `name`/`engine`/`space_type`/`parameters`.
+- **HTTP API v2 is in `aws-cdk-lib` core as of 2.260.0.** `HttpApi` +
+  `CorsPreflightOptions` live in `aws_cdk.aws_apigatewayv2` and `HttpLambdaIntegration` in
+  `aws_cdk.aws_apigatewayv2_integrations`. The old `aws-cdk.aws-apigatewayv2-alpha` /
+  `-integrations-alpha` packages are gone (import fails) and are NOT needed. Decision:
+  HTTP API, not REST (~71% cheaper for a Lambda-proxy job, no REST-only features needed).
+  `HttpLambdaIntegration` defaults to payload format version 2.0.
+- **Deploy-time gaps `cdk synth` cannot catch (no surprises later):**
+  - The CDK/CloudFormation execution role needs `aoss:` permissions to create the index at
+    deploy time (the default bootstrap role has `es:*`, not `aoss:*`). It must also appear
+    as a Principal in the data access policy, since CloudFormation, not the KB role, is the
+    principal that actually creates `CfnIndex`. Today the policy names only the KB role.
+  - `CfnIndex` creation is eventually-consistent; the KB may race the index becoming ACTIVE
+    on first real deploy. Fallback if it does: a custom-resource index creator.

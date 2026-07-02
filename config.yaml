@@ -1,0 +1,63 @@
+# Gavilan Library Chatbot - declarative configuration.
+#
+# Single source of truth for changeable knobs. The CDK app in infra/ reads this file
+# (resolved at the repo root, one level up from infra/) and wires the values into the
+# stack. 
+
+knowledge_base:
+  name: gavilan-library-kb
+  # Titan Text Embeddings v2 -> 1024-dimension vectors.
+  embedding_model_id: amazon.titan-embed-text-v2:0
+  vector_dimension: 1024
+
+vector_store:
+  # OpenSearch Serverless names must be lowercase and <= 32 chars. The security-policy
+  # names are derived from this (<name>-enc / -net / -data).
+  collection_name: gavilan-library-kb
+  index_name: bedrock-knowledge-base-default-index
+  # Field names MUST stay identical between the index mappings and the KB field mapping.
+  # These are the Bedrock console defaults, kept for compatibility.
+  fields:
+    vector: bedrock-knowledge-base-default-vector
+    text: AMAZON_BEDROCK_TEXT_CHUNK
+    metadata: AMAZON_BEDROCK_METADATA
+  # knn (HNSW) index parameters.
+  hnsw:
+    engine: faiss
+    space_type: l2
+    ef_construction: 512
+    m: 16
+
+data_source:
+  web_crawler:
+    # Seed URLs. Placeholder for now; the real sponsor list drops in here later.
+    seed_urls:
+      - https://www.gavilan.edu/library/
+    # Blacklist regex patterns (exclusion filters). Empty for now.
+    exclude_patterns: []
+    # Allowlist regex patterns (inclusion filters). Empty for now.
+    include_patterns: []
+    # Crawl scope. One of: DEFAULT, HOST_ONLY, SUBDOMAINS.
+    # HOST_ONLY keeps the crawl on www.gavilan.edu and does not wander to subdomains.
+    scope: HOST_ONLY
+    # Rate limits.
+    max_pages: 1000
+    rate_limit: 300   # max crawl requests per minute
+
+chunking:
+  # v1 uses managed FIXED_SIZE chunking (architecture.md Phase 1). Phase 2 moves to
+  # HIERARCHICAL. One of: FIXED_SIZE, HIERARCHICAL, SEMANTIC, NONE.
+  strategy: FIXED_SIZE
+  max_tokens: 300
+  overlap_percentage: 20
+
+# --- Query path (Lambda + HTTP API) ---
+
+retrieval:
+  # Number of KB chunks to retrieve per query and feed to generation.
+  number_of_results: 5
+
+generation:
+  # Bedrock-hosted Claude model for answer generation. PLACEHOLDER: architecture.md lists
+  # this as "Haiku, TBD" pending DxHub/sponsor confirmation. Synth does not validate the id.
+  model_id: anthropic.claude-3-5-haiku-20241022-v1:0
