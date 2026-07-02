@@ -1,0 +1,27 @@
+# Eval-harness infrastructure config.
+#
+# A SDK/boto3 operational tooling, not part of the CDK
+# stack. All values below are PLACEHOLDER / TBD until the AWS account and evaluator model
+# access land.
+
+eval:
+  # AWS region where Bedrock evaluation jobs run. TBD: confirm the region once provisioned.
+  region: us-west-2
+
+  # IAM role Bedrock assumes to run the job. Needs read/write on the eval S3 bucket and
+  # access to the evaluator model. TBD: real role ARN.
+  role_arn: "arn:aws:iam::000000000000:role/TBD-bedrock-eval-role"
+
+  # S3 bucket for eval input (JSONL datasets) and Bedrock output (results). If browsed
+  # from a UI it needs CORS. TBD: real bucket name.
+  bucket: "gavilan-library-eval-TBD"
+
+  # Key prefixes within the bucket.
+  input_prefix: "eval/input"
+  output_prefix: "eval/output"
+
+  # LLM-as-judge evaluator model id. TBD: confirm model access in the account/region.
+  evaluator_model_id: "us.anthropic.claude-3-5-sonnet-20240620-v1:0"
+
+  # Bedrock evaluation application type for RAG evaluation.
+  application_type: "RagEvaluation"
