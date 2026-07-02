@@ -1,23 +1,26 @@
 """Gavilan Library Chatbot infrastructure stack.
 
 Phase 0/1 foundation, all L1 Cfn* from aws-cdk-lib core (see docs/architecture.md).
-This stack now stands up the full vector store and the Bedrock Knowledge Base:
+This stack stands up the full vector store, the Bedrock Knowledge Base, and its Web
+Crawler data source:
 
   encryption policy + network policy  ->  OpenSearch Serverless collection
   KB execution role + data access policy
   vector index (knn_vector, Titan v2 = 1024 dims)
   Bedrock Knowledge Base (VECTOR, OpenSearch Serverless storage)
+  Web Crawler data source (type WEB, FIXED_SIZE chunking)
 
-NOT wired here yet (later tasks): the Web Crawler data source, the Lambda, the API
-Gateway, and the widget. This ends at a KB that synths clean and is ready to attach a
-data source to.
+All changeable knobs come from the repo-root config.yaml (see infra/infra/config.py),
+not from literals in this file. NOT wired here yet (later tasks): the Lambda, the API
+Gateway, and the widget.
 
-API shapes (CfnIndex mappings/settings, CfnKnowledgeBase storage + field mapping, aoss
-policy JSON) were verified against aws-cdk-lib 2.260.0 by introspecting the installed
-package, not from memory.
+API shapes (CfnIndex, CfnKnowledgeBase, CfnDataSource web crawler, aoss policy JSON)
+were verified against aws-cdk-lib 2.260.0 by introspecting the installed package, not
+from memory.
 """
 
 import json
+from typing import Any, Dict
 
 from aws_cdk import (
     Stack,
@@ -27,29 +30,35 @@ from aws_cdk import (
 )
 from constructs import Construct
 
-# Vector index field names. These MUST match between the CfnIndex mappings (what the
-# index physically contains) and the Knowledge Base field_mapping (what Bedrock writes
-# to / reads from). They are the Bedrock console defaults, kept for compatibility.
-VECTOR_FIELD = "bedrock-knowledge-base-default-vector"
-TEXT_FIELD = "AMAZON_BEDROCK_TEXT_CHUNK"
-METADATA_FIELD = "AMAZON_BEDROCK_METADATA"
-INDEX_NAME = "bedrock-knowledge-base-default-index"
-
-# Titan Text Embeddings v2 -> 1024-dimension vectors.
-EMBEDDING_MODEL_ID = "amazon.titan-embed-text-v2:0"
-VECTOR_DIMENSION = 1024
-
 
 class GavilanChatbotStack(Stack):
-    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        *,
+        config: Dict[str, Any],
+        **kwargs,
+    ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
-        # OSS names must be lowercase and <= 32 chars. This backs the Bedrock KB vector
-        # store (NextGen, scale-to-zero).
-        collection_name = "gavilan-library-kb"
+        kb_cfg = config["knowledge_base"]
+        vs_cfg = config["vector_store"]
+        fields = vs_cfg["fields"]
+        hnsw = vs_cfg["hnsw"]
+        web_cfg = config["data_source"]["web_crawler"]
+        chunking_cfg = config["chunking"]
+
+        kb_name = kb_cfg["name"]
+        collection_name = vs_cfg["collection_name"]
+        index_name = vs_cfg["index_name"]
+        vector_field = fields["vector"]
+        text_field = fields["text"]
+        metadata_field = fields["metadata"]
 
         embedding_model_arn = (
-            f"arn:{self.partition}:bedrock:{self.region}::foundation-model/{EMBEDDING_MODEL_ID}"
+            f"arn:{self.partition}:bedrock:{self.region}"
+            f"::foundation-model/{kb_cfg['embedding_model_id']}"
         )
 
         # --- Security policies for the collection -------------------------------------
@@ -59,7 +68,7 @@ class GavilanChatbotStack(Stack):
         encryption_policy = oss.CfnSecurityPolicy(
             self,
             "CollectionEncryptionPolicy",
-            name="gavilan-library-kb-enc",
+            name=f"{collection_name}-enc",
             type="encryption",
             policy=json.dumps(
                 {
@@ -78,11 +87,11 @@ class GavilanChatbotStack(Stack):
         # Authorization is enforced by the data access policy + IAM below, NOT by network
         # isolation. This is the AWS-recommended pattern for a Bedrock-backed collection
         # serving public library-website content; VPC isolation is a compliance-only
-        # layer we do not need here.
+        # layer not needed here.
         network_policy = oss.CfnSecurityPolicy(
             self,
             "CollectionNetworkPolicy",
-            name="gavilan-library-kb-net",
+            name=f"{collection_name}-net",
             type="network",
             policy=json.dumps(
                 [
@@ -150,7 +159,7 @@ class GavilanChatbotStack(Stack):
         data_access_policy = oss.CfnAccessPolicy(
             self,
             "CollectionDataAccessPolicy",
-            name="gavilan-library-kb-data",
+            name=f"{collection_name}-data",
             type="data",
             policy=json.dumps(
                 [
@@ -187,31 +196,31 @@ class GavilanChatbotStack(Stack):
 
         # --- Vector index -------------------------------------------------------------
 
-        # knn_vector field at 1024 dims (Titan v2), plus a text chunk field and a stored
-        # (non-indexed) metadata field. Field names come from the module constants and MUST
-        # match the KB field_mapping below.
+        # knn_vector field at the configured dimension (Titan v2 = 1024), plus a text
+        # chunk field and a stored (non-indexed) metadata field. Field names come from
+        # config and MUST match the KB field_mapping below.
         vector_index = oss.CfnIndex(
             self,
             "VectorIndex",
             collection_endpoint=collection.attr_collection_endpoint,
-            index_name=INDEX_NAME,
+            index_name=index_name,
             mappings=oss.CfnIndex.MappingsProperty(
                 properties={
-                    VECTOR_FIELD: oss.CfnIndex.PropertyMappingProperty(
+                    vector_field: oss.CfnIndex.PropertyMappingProperty(
                         type="knn_vector",
-                        dimension=VECTOR_DIMENSION,
+                        dimension=kb_cfg["vector_dimension"],
                         method=oss.CfnIndex.MethodProperty(
                             name="hnsw",
-                            engine="faiss",
-                            space_type="l2",
+                            engine=hnsw["engine"],
+                            space_type=hnsw["space_type"],
                             parameters=oss.CfnIndex.ParametersProperty(
-                                ef_construction=512,
-                                m=16,
+                                ef_construction=hnsw["ef_construction"],
+                                m=hnsw["m"],
                             ),
                         ),
                     ),
-                    TEXT_FIELD: oss.CfnIndex.PropertyMappingProperty(type="text"),
-                    METADATA_FIELD: oss.CfnIndex.PropertyMappingProperty(
+                    text_field: oss.CfnIndex.PropertyMappingProperty(type="text"),
+                    metadata_field: oss.CfnIndex.PropertyMappingProperty(
                         type="text",
                         index=False,
                     ),
@@ -232,7 +241,7 @@ class GavilanChatbotStack(Stack):
         knowledge_base = bedrock.CfnKnowledgeBase(
             self,
             "KnowledgeBase",
-            name="gavilan-library-kb",
+            name=kb_name,
             role_arn=kb_role.role_arn,
             knowledge_base_configuration=bedrock.CfnKnowledgeBase.KnowledgeBaseConfigurationProperty(
                 type="VECTOR",
@@ -244,11 +253,11 @@ class GavilanChatbotStack(Stack):
                 type="OPENSEARCH_SERVERLESS",
                 opensearch_serverless_configuration=bedrock.CfnKnowledgeBase.OpenSearchServerlessConfigurationProperty(
                     collection_arn=collection.attr_arn,
-                    vector_index_name=INDEX_NAME,
+                    vector_index_name=index_name,
                     field_mapping=bedrock.CfnKnowledgeBase.OpenSearchServerlessFieldMappingProperty(
-                        vector_field=VECTOR_FIELD,
-                        text_field=TEXT_FIELD,
-                        metadata_field=METADATA_FIELD,
+                        vector_field=vector_field,
+                        text_field=text_field,
+                        metadata_field=metadata_field,
                     ),
                 ),
             ),
@@ -258,3 +267,49 @@ class GavilanChatbotStack(Stack):
         # policy, so that ordering is transitive.
         knowledge_base.add_dependency(vector_index)
         knowledge_base.node.add_dependency(kb_role)
+
+        # --- Web Crawler data source --------------------------------------------------
+
+        # Seed URLs and include/exclude regex filters come from config, not literals here.
+        # Empty filter lists are omitted (passed as None) rather than emitted as empty
+        # arrays. Chunking is FIXED_SIZE for v1 per architecture.md Phase 1.
+        seed_urls = [
+            bedrock.CfnDataSource.SeedUrlProperty(url=url)
+            for url in web_cfg["seed_urls"]
+        ]
+        web_data_source = bedrock.CfnDataSource(
+            self,
+            "WebCrawlerDataSource",
+            name=f"{kb_name}-web",
+            knowledge_base_id=knowledge_base.attr_knowledge_base_id,
+            data_source_configuration=bedrock.CfnDataSource.DataSourceConfigurationProperty(
+                type="WEB",
+                web_configuration=bedrock.CfnDataSource.WebDataSourceConfigurationProperty(
+                    source_configuration=bedrock.CfnDataSource.WebSourceConfigurationProperty(
+                        url_configuration=bedrock.CfnDataSource.UrlConfigurationProperty(
+                            seed_urls=seed_urls,
+                        ),
+                    ),
+                    crawler_configuration=bedrock.CfnDataSource.WebCrawlerConfigurationProperty(
+                        scope=web_cfg.get("scope"),
+                        inclusion_filters=web_cfg.get("include_patterns") or None,
+                        exclusion_filters=web_cfg.get("exclude_patterns") or None,
+                        crawler_limits=bedrock.CfnDataSource.WebCrawlerLimitsProperty(
+                            max_pages=web_cfg.get("max_pages"),
+                            rate_limit=web_cfg.get("rate_limit"),
+                        ),
+                    ),
+                ),
+            ),
+            vector_ingestion_configuration=bedrock.CfnDataSource.VectorIngestionConfigurationProperty(
+                chunking_configuration=bedrock.CfnDataSource.ChunkingConfigurationProperty(
+                    chunking_strategy=chunking_cfg["strategy"],
+                    fixed_size_chunking_configuration=bedrock.CfnDataSource.FixedSizeChunkingConfigurationProperty(
+                        max_tokens=chunking_cfg["max_tokens"],
+                        overlap_percentage=chunking_cfg["overlap_percentage"],
+                    ),
+                ),
+            ),
+        )
+        # The data source cannot be created before the KB exists.
+        web_data_source.add_dependency(knowledge_base)

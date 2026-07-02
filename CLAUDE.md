@@ -44,7 +44,7 @@ Pinned: `aws-cdk-lib==2.260.0`, CDK CLI `2.1129.0`.
 ## Knowledge Base / vector store facts
 
 Vector index field names. These MUST stay identical between the `CfnIndex` mappings and
-the KB `field_mapping` (defined once as constants in `infra/infra/infra_stack.py`):
+the KB `field_mapping` (defined once in `config.yaml` under `vector_store.fields`):
 - vector field: `bedrock-knowledge-base-default-vector` (knn_vector, 1024 dims = Titan Text Embeddings v2, faiss/hnsw/l2)
 - text field: `AMAZON_BEDROCK_TEXT_CHUNK`
 - metadata field: `AMAZON_BEDROCK_METADATA`
@@ -53,22 +53,28 @@ the KB `field_mapping` (defined once as constants in `infra/infra/infra_stack.py
 ## Repo layout
 
 - `infra/` — CDK Python app (created by `cdk init`). The stack now provisions the full
-  vector store and the Bedrock Knowledge Base (all L1 `Cfn*`): OpenSearch Serverless
-  collection + encryption/network security policies, KB execution IAM role, data access
-  policy, vector index, and the `AWS::Bedrock::KnowledgeBase` (VECTOR, OSS storage). The
-  Web Crawler data source, Lambda, API Gateway, and widget are NOT wired yet. Structure:
-  - `app.py` — CDK app entrypoint; instantiates `GavilanChatbotStack`
-  - `infra/infra_stack.py` — the stack (`GavilanChatbotStack`)
+  vector store, the Bedrock Knowledge Base, and its Web Crawler data source (all L1
+  `Cfn*`): OpenSearch Serverless collection + encryption/network security policies, KB
+  execution IAM role, data access policy, vector index, the `AWS::Bedrock::KnowledgeBase`
+  (VECTOR, OSS storage), and the `AWS::Bedrock::DataSource` (type WEB, FIXED_SIZE
+  chunking). The Lambda, API Gateway, and widget are NOT wired yet. Structure:
+  - `app.py` — CDK app entrypoint; loads `config.yaml` and passes it to the stack
+  - `infra/infra_stack.py` — the stack (`GavilanChatbotStack`); reads all knobs from config
+  - `infra/config.py` — `load_config()`; resolves the repo-root `config.yaml` from `__file__`
   - `infra/__init__.py` — package marker
   - `tests/unit/test_infra_stack.py` — stack assertion tests
-  - `requirements.txt` — pinned `aws-cdk-lib==2.260.0`, `constructs`
+  - `requirements.txt` — pinned `aws-cdk-lib==2.260.0`, `constructs`, `PyYAML`
   - `requirements-dev.txt` — `pytest`
   - `cdk.json` — toolkit config (`app: python3 app.py`)
   - `.venv/` — virtualenv (gitignored)
 - `app/` — Lambda code (empty; planned): two functions — (1) call KB `Retrieve`, (2) call Bedrock to generate
 - `eval/` — eval harness (empty; planned): Q&A set + retrieval/faithfulness scoring
 - `frontend/` — JS widget (empty; planned)
-- `config.yaml` — declarative settings (not created yet)
+- `config.yaml` — declarative settings at the repo root; single source of truth for
+  changeable knobs (embedding model, vector store names/fields, crawler seed URLs +
+  filters + scope + rate limits, chunking). The CDK app reads it at synth time via
+  `infra/config.py` (resolved relative to `__file__`, so cwd does not matter). Edit values
+  here rather than hardcoding in the stack.
 - `docs/` — design docs (`architecture.md`)
 
 ## Hard rules

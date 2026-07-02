@@ -3,11 +3,14 @@ import os
 
 import aws_cdk as cdk
 
+from infra.config import load_config
 from infra.infra_stack import GavilanChatbotStack
 
 
 app = cdk.App()
+config = load_config()
 GavilanChatbotStack(app, "GavilanChatbotStack",
+    config=config,
     # If you don't specify 'env', this stack will be environment-agnostic.
     # Account/Region-dependent features and context lookups will not work,
     # but a single synthesized template can be deployed anywhere.
