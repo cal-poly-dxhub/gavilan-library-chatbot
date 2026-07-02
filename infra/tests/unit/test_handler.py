@@ -32,30 +32,39 @@ import handler  # noqa: E402
 
 
 class FakeAgentRuntime:
-    def __init__(self):
+    """Returns two chunks, each with a web source uri (as the web crawler would)."""
+
+    def __init__(self, results=None):
         self.calls = []
+        self._results = results if results is not None else [
+            {
+                "content": {"text": "The library is open 9am to 5pm."},
+                "location": {"webLocation": {"url": "https://gav.edu/library/hours"}},
+            },
+            {
+                "content": {"text": "Checkout period is 3 weeks."},
+                "location": {"webLocation": {"url": "https://gav.edu/library/borrow"}},
+            },
+        ]
 
     def retrieve(self, **kwargs):
         self.calls.append(kwargs)
-        return {
-            "retrievalResults": [
-                {"content": {"text": "The library is open 9am to 5pm."}},
-                {"content": {"text": "Checkout period is 3 weeks."}},
-            ]
-        }
+        return {"retrievalResults": self._results}
 
 
 class FakeBedrockRuntime:
-    def __init__(self):
+    def __init__(self, answer="The library is open 9am to 5pm."):
         self.calls = []
+        self._answer = answer
 
     def converse(self, **kwargs):
         self.calls.append(kwargs)
-        return {
-            "output": {
-                "message": {"content": [{"text": "The library is open 9am to 5pm."}]}
-            }
-        }
+        return {"output": {"message": {"content": [{"text": self._answer}]}}}
+
+
+def _wire(monkeypatch, agent, bedrock):
+    monkeypatch.setattr(handler, "_agent_client", lambda: agent)
+    monkeypatch.setattr(handler, "_bedrock_client", lambda: bedrock)
 
 
 def _payload_v2_event(body, is_base64=False):
@@ -70,28 +79,131 @@ def _payload_v2_event(body, is_base64=False):
     }
 
 
-def test_happy_path(monkeypatch):
+def _user_text(bedrock):
+    """The text of the single user message sent to Converse."""
+    return bedrock.calls[0]["messages"][0]["content"][0]["text"]
+
+
+def test_real_system_prompt_loaded_from_file():
+    # The real prompt is loaded from app/system_prompt.md, not a placeholder string.
+    assert handler.SYSTEM_PROMPT.startswith("<role>")
+    assert "Gavilan College Library assistant" in handler.SYSTEM_PROMPT
+    assert "<context>" in handler.SYSTEM_PROMPT  # the tag the contract depends on
+    assert "PLACEHOLDER" not in handler.SYSTEM_PROMPT
+
+
+def test_happy_path_response_shape(monkeypatch):
     agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
-    monkeypatch.setattr(handler, "_agent_client", lambda: agent)
-    monkeypatch.setattr(handler, "_bedrock_client", lambda: bedrock)
+    _wire(monkeypatch, agent, bedrock)
 
     event = _payload_v2_event(json.dumps({"query": "What are the library hours?"}))
     resp = handler.lambda_handler(event, None)
 
     assert resp["statusCode"] == 200
     body = json.loads(resp["body"])
+    assert set(body.keys()) == {"answer", "sources"}
     assert body["answer"] == "The library is open 9am to 5pm."
-    assert body["sources_used"] == 2
+    assert body["sources"] == [
+        {"uri": "https://gav.edu/library/hours", "excerpt": "The library is open 9am to 5pm."},
+        {"uri": "https://gav.edu/library/borrow", "excerpt": "Checkout period is 3 weeks."},
+    ]
     # Retrieve was called against the configured KB id, not RetrieveAndGenerate.
     assert agent.calls[0]["knowledgeBaseId"] == "KB123456"
-    assert agent.calls[0]["retrievalQuery"] == {"text": "What are the library hours?"}
-    # Generation received the placeholder system prompt.
-    assert bedrock.calls[0]["system"][0]["text"].startswith("PLACEHOLDER")
+
+
+def test_system_prompt_passed_via_converse_system_not_message_body(monkeypatch):
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "hours?"})), None
+    )
+
+    # System prompt goes in the Converse `system` parameter...
+    assert bedrock.calls[0]["system"] == [{"text": handler.SYSTEM_PROMPT}]
+    # ...and NOT concatenated into the user message.
+    assert handler.SYSTEM_PROMPT not in _user_text(bedrock)
+
+
+def test_retrieved_chunks_wrapped_in_context_tag(monkeypatch):
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "What are the library hours?"})), None
+    )
+
+    user_text = _user_text(bedrock)
+    # The exact tag the system prompt references.
+    assert "<context>" in user_text and "</context>" in user_text
+    assert handler.CONTEXT_TAG == "context"
+    # Both retrieved chunks and their sources are inside the context block.
+    assert "The library is open 9am to 5pm." in user_text
+    assert "Source: https://gav.edu/library/hours" in user_text
+    # The question is present alongside the context.
+    assert "Question: What are the library hours?" in user_text
+    # Context comes before the question.
+    assert user_text.index("</context>") < user_text.index("Question:")
+
+
+def test_empty_retrieval_returns_no_sources(monkeypatch):
+    agent = FakeAgentRuntime(results=[])
+    bedrock = FakeBedrockRuntime(answer="I do not have that information. Please ask a librarian.")
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "Do you have a pool?"})), None
+    )
+
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["sources"] == []
+    assert body["answer"].startswith("I do not have that information")
+    # The context block still exists and signals the empty case to the model.
+    user_text = _user_text(bedrock)
+    assert "<context>" in user_text
+    assert "(no relevant passages were retrieved)" in user_text
+
+
+def test_sources_deduplicated_by_uri(monkeypatch):
+    # Two chunks from the same page -> a single source entry.
+    agent = FakeAgentRuntime(results=[
+        {"content": {"text": "Open 9-5."}, "location": {"webLocation": {"url": "https://gav.edu/library/hours"}}},
+        {"content": {"text": "Closed on holidays."}, "location": {"webLocation": {"url": "https://gav.edu/library/hours"}}},
+    ])
+    bedrock = FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "hours?"})), None
+    )
+    sources = json.loads(resp["body"])["sources"]
+    assert len(sources) == 1
+    assert sources[0]["uri"] == "https://gav.edu/library/hours"
+
+
+def test_chunk_without_source_omitted_from_sources(monkeypatch):
+    agent = FakeAgentRuntime(results=[
+        {"content": {"text": "A passage with no location."}},
+    ])
+    bedrock = FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "hours?"})), None
+    )
+    body = json.loads(resp["body"])
+    # No resolvable uri -> not in sources, but the chunk still reached the context.
+    assert body["sources"] == []
+    assert "A passage with no location." in _user_text(bedrock)
 
 
 def test_missing_query_returns_400(monkeypatch):
     # No client should be called when the body has no query.
-    monkeypatch.setattr(handler, "_agent_client", lambda: (_ for _ in ()).throw(AssertionError("should not retrieve")))
+    monkeypatch.setattr(
+        handler, "_agent_client",
+        lambda: (_ for _ in ()).throw(AssertionError("should not retrieve")),
+    )
     event = _payload_v2_event(json.dumps({"not_a_query": "hi"}))
     resp = handler.lambda_handler(event, None)
     assert resp["statusCode"] == 400
@@ -102,10 +214,10 @@ def test_base64_encoded_body(monkeypatch):
     import base64
 
     agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
-    monkeypatch.setattr(handler, "_agent_client", lambda: agent)
-    monkeypatch.setattr(handler, "_bedrock_client", lambda: bedrock)
+    _wire(monkeypatch, agent, bedrock)
 
     raw = json.dumps({"query": "hours?"}).encode("utf-8")
     event = _payload_v2_event(base64.b64encode(raw).decode("utf-8"), is_base64=True)
     resp = handler.lambda_handler(event, None)
     assert resp["statusCode"] == 200
+    assert "answer" in json.loads(resp["body"])
