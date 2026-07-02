@@ -1,8 +1,8 @@
 # Eval-harness infrastructure config.
 #
-# A SDK/boto3 operational tooling, not part of the CDK
+# A SDK/boto3 operational tooling
 # stack. All values below are PLACEHOLDER / TBD until the AWS account and evaluator model
-# access land.
+# access.
 
 eval:
   # AWS region where Bedrock evaluation jobs run. TBD: confirm the region once provisioned.
@@ -25,3 +25,15 @@ eval:
 
   # Bedrock evaluation application type for RAG evaluation.
   application_type: "RagEvaluation"
+
+  # Retrieve-only evaluation: the eval job points at the live KB and runs Retrieve itself.
+  # Measures chunking/retrieval quality via
+  # Builtin.ContextCoverage + Builtin.ContextRelevance.
+  retrieve:
+    # KB whose retrieval quality is being evaluated. TBD: id of the deployed KB.
+    knowledge_base_id: "TBD-knowledge-base-id"
+    # How many chunks Retrieve returns per query.
+    number_of_results: 5
+    # overrideSearchType: HYBRID or SEMANTIC. v1 retrieval is semantic-only; HYBRID is the
+    # Phase 2 target, so this knob lets eval compare them without code changes.
+    search_type: "SEMANTIC"
