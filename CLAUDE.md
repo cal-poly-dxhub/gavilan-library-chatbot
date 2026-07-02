@@ -59,7 +59,15 @@ the KB `field_mapping` (defined once in `config.yaml` under `vector_store.fields
   index, the `AWS::Bedrock::KnowledgeBase` (VECTOR, OSS storage), the
   `AWS::Bedrock::DataSource` (type WEB, FIXED_SIZE chunking), a query-path Lambda with its
   OWN execution role, and an HTTP API (API Gateway v2) with a `POST /query` route.
-  Guardrails, widget, WAF, and auth are NOT wired yet. Structure:
+  It ALSO hosts the widget: a private S3 bucket (block-all-public, bucket-owner-enforced)
+  fronted by a CloudFront distribution using **OAC** (`origins.S3BucketOrigin.with_origin_access_control`,
+  NOT OAI/S3Origin), with a `BucketDeployment` uploading ONLY `frontend/widget.js` (never
+  `mock.js`/`demo.html`) and invalidating `/widget.js` on deploy. Hosting is in the SAME
+  stack as the backend (OAC has a cross-stack cyclical-dependency problem; one-click install
+  wants one deploy). The stack outputs a ready-to-paste embed tag
+  (`<script src="https://{cloudfront}/widget.js" data-api-url="https://{api}/query" defer></script>`)
+  plus the raw CloudFront domain and `/query` URL. Guardrails, WAF, and auth are NOT wired
+  yet. Structure:
   - `app.py` — CDK app entrypoint; loads `config.yaml` and passes it to the stack
   - `infra/infra_stack.py` — the stack (`GavilanChatbotStack`); reads all knobs from config
   - `infra/config.py` — `load_config()`; resolves the repo-root `config.yaml` from `__file__`
@@ -154,3 +162,13 @@ Things learned the hard way. Read before repeating the same work.
     principal that actually creates `CfnIndex`. Today the policy names only the KB role.
   - `CfnIndex` creation is eventually-consistent; the KB may race the index becoming ACTIVE
     on first real deploy. Fallback if it does: a custom-resource index creator.
+  - **CloudFront is slow to create AND destroy (~15-30 min each).** The widget distribution
+    dominates `cdk deploy`/`cdk destroy` wall-clock time. The distribution's actual serving
+    behavior (OAC read of the S3 object, cache, HTTPS redirect) is only verifiable at deploy,
+    not by `cdk synth`.
+  - **OAC + `auto_delete_objects` dependency cycle.** Do NOT add an explicit
+    `distribution.node.add_dependency(bucket)`: the origin already references the bucket, and
+    the explicit edge pulls in the bucket's auto-delete custom resource, which `DependsOn` the
+    OAC bucket policy, which `DependsOn` the distribution -> a synth-blocking cycle. The bug
+    surfaces in `Template.from_stack` (tests) even when a plain `cdk synth` looks fine, so keep
+    the infra tests in the loop.
