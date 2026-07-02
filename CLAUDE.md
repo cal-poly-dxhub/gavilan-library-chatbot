@@ -7,7 +7,7 @@ RAG chatbot for Gavilan College Library. Answers operational student questions (
 ## Stack
 
 - **RAG:** Amazon Bedrock Managed Knowledge Base (Web Crawler connector → OpenSearch Serverless NextGen vector store)
-- **Generation:** Bedrock-hosted Claude via `Retrieve` + own generate call (NOT `RetrieveAndGenerate` — we need full system-prompt control)
+- **Generation:** Bedrock-hosted Claude via `Retrieve` + own generate call (NOT `RetrieveAndGenerate` — full system-prompt control required)
 - **Backend:** Lambda + API Gateway (Python)
 - **Infra:** AWS CDK (Python) — everything declared as code, nothing built by hand
 - **Guardrails:** Bedrock Guardrails (content + PII)
@@ -19,7 +19,7 @@ RAG chatbot for Gavilan College Library. Answers operational student questions (
 Architecture and rationale are in `docs/`:
 - `docs/architecture.md` — stack decisions, phases, data flow, verified facts
 
-When a task touches architecture or a "why did we choose X" question, read these first. Do not re-derive or contradict decisions recorded there.
+When a task touches architecture or a "why was X chosen" question, read these first. Do not re-derive or contradict decisions recorded there.
 
 ## Commands
 
@@ -41,11 +41,22 @@ Pinned: `aws-cdk-lib==2.260.0`, CDK CLI `2.1129.0`.
 
 - Lambda unit tests (once `app/` exists) will use `moto` to mock AWS (no live account needed)
 
+## Knowledge Base / vector store facts
+
+Vector index field names. These MUST stay identical between the `CfnIndex` mappings and
+the KB `field_mapping` (defined once as constants in `infra/infra/infra_stack.py`):
+- vector field: `bedrock-knowledge-base-default-vector` (knn_vector, 1024 dims = Titan Text Embeddings v2, faiss/hnsw/l2)
+- text field: `AMAZON_BEDROCK_TEXT_CHUNK`
+- metadata field: `AMAZON_BEDROCK_METADATA`
+- index name: `bedrock-knowledge-base-default-index`
+
 ## Repo layout
 
-- `infra/` — CDK Python app (created by `cdk init`). Currently a minimal Phase 0 skeleton:
-  the OpenSearch Serverless vector collection only. KB, crawler, Lambda, API Gateway, IAM
-  come next. Structure:
+- `infra/` — CDK Python app (created by `cdk init`). The stack now provisions the full
+  vector store and the Bedrock Knowledge Base (all L1 `Cfn*`): OpenSearch Serverless
+  collection + encryption/network security policies, KB execution IAM role, data access
+  policy, vector index, and the `AWS::Bedrock::KnowledgeBase` (VECTOR, OSS storage). The
+  Web Crawler data source, Lambda, API Gateway, and widget are NOT wired yet. Structure:
   - `app.py` — CDK app entrypoint; instantiates `GavilanChatbotStack`
   - `infra/infra_stack.py` — the stack (`GavilanChatbotStack`)
   - `infra/__init__.py` — package marker
@@ -73,3 +84,22 @@ No em dashes. No emojis. Direct and concise.
 ## When testing
 
 Never hide failures. Show all test results, including failures, in full.
+
+## Lessons
+
+Things learned the hard way. Read before repeating the same work.
+
+- **Verify CDK construct APIs against the installed package, not memory.** The Bedrock/OSS
+  construct surface is in flux and training data is stale. For `aws-cdk-lib==2.260.0`,
+  introspecting the installed package settled several points that live docs got wrong:
+  `CfnIndex` takes structured `mappings`/`settings` (not an `index_body` blob);
+  `VectorKnowledgeBaseConfigurationProperty` has no `type` (the `type` is on
+  `KnowledgeBaseConfigurationProperty`); `CfnIndex.MethodProperty` uses
+  `name`/`engine`/`space_type`/`parameters`.
+- **Deploy-time gaps `cdk synth` cannot catch (no surprises later):**
+  - The CDK/CloudFormation execution role needs `aoss:` permissions to create the index at
+    deploy time (the default bootstrap role has `es:*`, not `aoss:*`). It must also appear
+    as a Principal in the data access policy, since CloudFormation, not the KB role, is the
+    principal that actually creates `CfnIndex`. Today the policy names only the KB role.
+  - `CfnIndex` creation is eventually-consistent; the KB may race the index becoming ACTIVE
+    on first real deploy. Fallback if it does: a custom-resource index creator.
