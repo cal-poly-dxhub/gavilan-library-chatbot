@@ -23,22 +23,42 @@ When a task touches architecture or a "why did we choose X" question, read these
 
 ## Commands
 
-<!-- TODO: fill in as code lands. Repo is pre-build; these don't all exist yet. -->
-- Infra synth (offline validation): `cdk synth`
+The CDK app lives in `infra/`. The `cdk` CLI is installed globally. All infra commands
+run from `infra/` with the project virtualenv active.
+
+First-time setup (from `infra/`):
+- `python3 -m venv .venv` (already created by `cdk init`)
+- `source .venv/bin/activate`
+- `python -m pip install -r requirements.txt -r requirements-dev.txt`
+
+Then, from `infra/` with the venv active:
+- Infra synth (offline, no creds): `cdk synth`
+- Infra tests: `python -m pytest`
 - Infra deploy: `cdk deploy` (needs AWS creds — company account, pending)
 - Infra teardown: `cdk destroy` (IMPORTANT: also removes the OSS collection; deleting the KB alone does not)
-- Python tests: <!-- TODO: pytest invocation once test dir exists -->
-- Lambda unit tests use `moto` to mock AWS (no live account needed)
+
+Pinned: `aws-cdk-lib==2.260.0`, CDK CLI `2.1129.0`.
+
+- Lambda unit tests (once `app/` exists) will use `moto` to mock AWS (no live account needed)
 
 ## Repo layout
 
-<!-- TODO: update as directories are created -->
-- `infra/` — CDK app (KB, OSS NextGen, crawler, Lambda, API Gateway, IAM)
-- `app/` — Lambda code: two separate functions — (1) call KB `Retrieve`, (2) call Bedrock to generate
-- `eval/` — eval harness: Q&A set + retrieval/faithfulness scoring
-- `frontend/` — JS widget
-- `config.yaml` — declarative settings
-- `docs/` — design docs
+- `infra/` — CDK Python app (created by `cdk init`). Currently a minimal Phase 0 skeleton:
+  the OpenSearch Serverless vector collection only. KB, crawler, Lambda, API Gateway, IAM
+  come next. Structure:
+  - `app.py` — CDK app entrypoint; instantiates `GavilanChatbotStack`
+  - `infra/infra_stack.py` — the stack (`GavilanChatbotStack`)
+  - `infra/__init__.py` — package marker
+  - `tests/unit/test_infra_stack.py` — stack assertion tests
+  - `requirements.txt` — pinned `aws-cdk-lib==2.260.0`, `constructs`
+  - `requirements-dev.txt` — `pytest`
+  - `cdk.json` — toolkit config (`app: python3 app.py`)
+  - `.venv/` — virtualenv (gitignored)
+- `app/` — Lambda code (empty; planned): two functions — (1) call KB `Retrieve`, (2) call Bedrock to generate
+- `eval/` — eval harness (empty; planned): Q&A set + retrieval/faithfulness scoring
+- `frontend/` — JS widget (empty; planned)
+- `config.yaml` — declarative settings (not created yet)
+- `docs/` — design docs (`architecture.md`)
 
 ## Hard rules
 
