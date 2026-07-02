@@ -28,9 +28,12 @@ from memory:
     path: CloudFront + S3 deliver the widget CODE to the browser; the injected widget then
     uses the existing API Gateway query path for actual questions.
 
-NOT deployed today, so shown only in a distinct "Planned" group (per the stack docstring):
-Guardrails, WAF. Widget hosting IS built now, so the widget and its CDN are drawn as real
-current components (not planned).
+Bedrock Guardrails IS built now: a guardrail (content filters + PII) wraps the Lambda's
+Bedrock Converse call, screening the input before generation and the output after, so it is
+drawn as a real current component on the generation step (not planned). WAF is still NOT
+deployed today, so it alone remains in the distinct "Planned" group (per the stack
+docstring). Widget hosting IS built too, so the widget and its CDN are real current
+components.
 """
 
 import os
@@ -84,6 +87,7 @@ with Diagram(
         widget = Client("Chat widget\n(embedded JS,\ninjected into page)")
         api = APIGateway("API Gateway\nHTTP API v2\nPOST /query")
         query_fn = Lambda("Lambda (python3.13)\nretrieve + generate")
+        guardrails = Shield("Bedrock\nGuardrails\n(content + PII)")
         claude = Bedrock("Claude\n(Converse)\ngeneration")
 
     # Widget CODE delivery. SEPARATE concern from the query flow above: CloudFront + S3
@@ -95,7 +99,6 @@ with Diagram(
 
     with Cluster("Planned  (not deployed today)", graph_attr={"style": "dashed", "bgcolor": "gray95"}):
         waf = WAF("AWS WAF")
-        guardrails = Shield("Bedrock\nGuardrails")
 
     # --- Ingestion flow: crawl -> parse/chunk -> embed -> WRITE vectors ---
     library_site >> Edge(color="darkorange", label="crawl seeds\n+ child links") >> crawler
@@ -110,7 +113,10 @@ with Diagram(
     query_fn >> Edge(color="darkblue", label="1. Retrieve") >> kb
     # Same KB, but now READING the store (distinct from the ingestion write above).
     kb >> Edge(color="darkblue", style="dashed", label="read vectors") >> opensearch
-    query_fn >> Edge(style="dashed", label="2. Generate (Converse)") >> claude
+    # Generation is screened by Bedrock Guardrails: the Converse call passes through the
+    # guardrail, which checks the input before generation and the output after.
+    query_fn >> Edge(style="dashed", label="2. Generate (Converse)") >> guardrails
+    guardrails >> Edge(style="dashed", dir="both", label="screen input\n+ output") >> claude
 
     # --- Response back to the user ---
     query_fn >> Edge(color="darkgreen", style="dotted", label="answer JSON\n(via API GW + widget)") >> student
@@ -126,4 +132,3 @@ with Diagram(
 
     # --- Planned components (drawn distinct; no real traffic today) ---
     waf >> Edge(color="gray", style="dotted", label="planned") >> api
-    guardrails >> Edge(color="gray", style="dotted", label="planned") >> query_fn
