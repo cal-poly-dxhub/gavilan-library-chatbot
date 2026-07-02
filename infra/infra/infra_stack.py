@@ -9,26 +9,37 @@ Crawler data source:
   vector index (knn_vector, Titan v2 = 1024 dims)
   Bedrock Knowledge Base (VECTOR, OpenSearch Serverless storage)
   Web Crawler data source (type WEB, FIXED_SIZE chunking)
+  query-path Lambda (own role) + HTTP API (API Gateway v2), POST /query
 
 All changeable knobs come from the repo-root config.yaml (see infra/infra/config.py),
-not from literals in this file. NOT wired here yet (later tasks): the Lambda, the API
-Gateway, and the widget.
+not from literals in this file. NOT wired here yet (later tasks): the real system prompt,
+Bedrock Guardrails, the widget, WAF, and auth.
 
-API shapes (CfnIndex, CfnKnowledgeBase, CfnDataSource web crawler, aoss policy JSON)
-were verified against aws-cdk-lib 2.260.0 by introspecting the installed package, not
-from memory.
+API shapes (CfnIndex, CfnKnowledgeBase, CfnDataSource web crawler, aoss policy JSON,
+apigatewayv2 HttpApi + HttpLambdaIntegration, Lambda) were verified against aws-cdk-lib
+2.260.0 by introspecting the installed package, not from memory. HTTP API v2 is in core
+in this version (no aws-apigatewayv2-alpha package needed).
 """
 
 import json
+from pathlib import Path
 from typing import Any, Dict
 
 from aws_cdk import (
+    Duration,
     Stack,
+    aws_apigatewayv2 as apigwv2,
+    aws_apigatewayv2_integrations as apigwv2_integrations,
     aws_bedrock as bedrock,
     aws_iam as iam,
+    aws_lambda as _lambda,
     aws_opensearchserverless as oss,
 )
 from constructs import Construct
+
+# Repo-root app/ directory holding the Lambda handler source (app/handler.py).
+# infra_stack.py is <repo>/infra/infra/infra_stack.py, so parents[2] is the repo root.
+_APP_DIR = Path(__file__).resolve().parents[2] / "app"
 
 
 class GavilanChatbotStack(Stack):
@@ -48,6 +59,8 @@ class GavilanChatbotStack(Stack):
         hnsw = vs_cfg["hnsw"]
         web_cfg = config["data_source"]["web_crawler"]
         chunking_cfg = config["chunking"]
+        retrieval_cfg = config["retrieval"]
+        generation_cfg = config["generation"]
 
         kb_name = kb_cfg["name"]
         collection_name = vs_cfg["collection_name"]
@@ -313,3 +326,80 @@ class GavilanChatbotStack(Stack):
         )
         # The data source cannot be created before the KB exists.
         web_data_source.add_dependency(knowledge_base)
+
+        # --- Query path: Lambda + HTTP API --------------------------------------------
+
+        generation_model_arn = (
+            f"arn:{self.partition}:bedrock:{self.region}"
+            f"::foundation-model/{generation_cfg['model_id']}"
+        )
+
+        # The Lambda gets its OWN execution role, DISTINCT from the KB execution role.
+        # Basic execution (CloudWatch Logs) via the managed policy; Bedrock permissions
+        # are added narrowly below.
+        query_lambda_role = iam.Role(
+            self,
+            "QueryLambdaRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            description="Execution role for the query-path Lambda (retrieve + generate).",
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AWSLambdaBasicExecutionRole"
+                )
+            ],
+        )
+        # Retrieve chunks from the KB.
+        query_lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["bedrock:Retrieve"],
+                resources=[knowledge_base.attr_knowledge_base_arn],
+            )
+        )
+        # Invoke the generation model (Converse maps to the InvokeModel action).
+        query_lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["bedrock:InvokeModel"],
+                resources=[generation_model_arn],
+            )
+        )
+
+        query_lambda = _lambda.Function(
+            self,
+            "QueryFunction",
+            runtime=_lambda.Runtime.PYTHON_3_13,
+            handler="handler.lambda_handler",
+            code=_lambda.Code.from_asset(str(_APP_DIR)),
+            role=query_lambda_role,
+            timeout=Duration.seconds(30),
+            memory_size=256,
+            environment={
+                "KNOWLEDGE_BASE_ID": knowledge_base.attr_knowledge_base_id,
+                "GENERATION_MODEL_ID": generation_cfg["model_id"],
+                "NUMBER_OF_RESULTS": str(retrieval_cfg["number_of_results"]),
+                "BEDROCK_REGION": self.region,
+            },
+        )
+        # The Lambda queries the KB at runtime, so it must not exist before the KB.
+        query_lambda.node.add_dependency(knowledge_base)
+
+        # HTTP API (API Gateway v2), NOT REST: ~71% cheaper for a Lambda-proxy job and we
+        # need none of the REST-only features. CORS is permissive for now.
+        # TODO: lock allow_origins to the library widget domain before launch.
+        http_api = apigwv2.HttpApi(
+            self,
+            "ChatbotHttpApi",
+            api_name="gavilan-library-chatbot",
+            cors_preflight=apigwv2.CorsPreflightOptions(
+                allow_origins=["*"],
+                allow_methods=[apigwv2.CorsHttpMethod.POST, apigwv2.CorsHttpMethod.OPTIONS],
+                allow_headers=["Content-Type"],
+            ),
+        )
+        # HttpLambdaIntegration defaults to payload format version 2.0.
+        http_api.add_routes(
+            path="/query",
+            methods=[apigwv2.HttpMethod.POST],
+            integration=apigwv2_integrations.HttpLambdaIntegration(
+                "QueryIntegration", query_lambda
+            ),
+        )
