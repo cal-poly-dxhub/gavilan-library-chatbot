@@ -42,7 +42,7 @@ When a task touches architecture or a "why did we choose X" question, read these
 
 ## Hard rules
 
-- **Do not touch Git.** Never commit, or do anything related to Github. 
+- **Do not touch Git.** Never commit or do anything related to GitHub.
 - **Behavior lives in the system prompt, not routing code** (v1). Textbook clarifying questions and out-of-scope handling are prompt instructions, not Lambda branches.
 
 
