@@ -48,7 +48,7 @@ When a task touches architecture or a "why did we choose X" question, read these
 
 ## Writing style
 
-No em dashes. No emojis. Direct and concise.
+Avoid em dashes (—); use " - " or parentheses instead.
 
 ## When testing
 
