@@ -89,7 +89,25 @@ the KB `field_mapping` (defined once in `config.yaml` under `vector_store.fields
     uri are omitted from `sources` (they still inform the answer); on empty retrieval
     `sources` is `[]` and the prompt tells the model to say it does not have the info.
 - `eval/` — eval harness (empty; planned): Q&A set + retrieval/faithfulness scoring
-- `frontend/` — JS widget (empty; planned)
+- `frontend/` — embeddable JS widget (Shadow DOM, vanilla JS, dependency-free).
+  - `widget.js` — the ONLY file shipped to users. Production-clean: it contains just
+    the real request path and NO mock code, mock data, or mock branching. It reads its
+    backend endpoint from its own `<script>` tag's `data-api-url` attribute (the one swap
+    point) and POSTs `{ query }` to that URL, rendering the `{ answer, sources }` contract.
+    Until `data-api-url` is set it shows a graceful "not connected yet" message.
+  - `mock.js` — dev-only backend stand-in, used ONLY by `demo.html` and the tests; it is
+    never shipped. In the browser it transparently monkeypatches `window.fetch` to answer
+    requests to the widget's `data-api-url` with canned responses (and a "trigger error"
+    backdoor -> HTTP 500 to exercise the error state); in Node it exports `mockQuery`. The
+    dependency direction is one-way: demo + tests reference the mock; `widget.js` never
+    does and has no awareness it exists.
+  - `demo.html` — offline dev harness (hostile-CSS Shadow DOM isolation test). Loads
+    `mock.js` before `widget.js` (defer preserves order) so the widget's normal fetch is
+    intercepted with no backend.
+  - `test/widget.contract.test.js` — zero-dependency Node tests (`node
+    test/widget.contract.test.js`): response-contract normalization + URL sanitizer in
+    widget.js, mock routing/shape in mock.js, and a static scan asserting widget.js stays
+    production-clean (no mock/backdoor/canned-source references).
 - `config.yaml` — declarative settings at the repo root; single source of truth for
   changeable knobs (embedding model, vector store names/fields, crawler seed URLs +
   filters + scope + rate limits, chunking, `retrieval.number_of_results`,
