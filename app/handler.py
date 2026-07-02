@@ -35,6 +35,16 @@ GENERATION_MODEL_ID = os.environ["GENERATION_MODEL_ID"]
 REGION = os.environ.get("BEDROCK_REGION") or os.environ.get("AWS_REGION")
 NUMBER_OF_RESULTS = int(os.environ.get("NUMBER_OF_RESULTS", "5"))
 
+# Bedrock Guardrail (content filters + PII) attached to the Converse call. Set by the CDK
+# stack from config.yaml. If unset (e.g. local without a deployed guardrail), the Converse
+# call is made WITHOUT a guardrailConfig rather than failing.
+GUARDRAIL_ID = os.environ.get("GUARDRAIL_ID")
+GUARDRAIL_VERSION = os.environ.get("GUARDRAIL_VERSION")
+GUARDRAIL_TRACE = os.environ.get("GUARDRAIL_TRACE", "enabled")
+
+# Converse stopReason when the guardrail blocks the request or response.
+_GUARDRAIL_STOP_REASON = "guardrail_intervened"
+
 # The tag the system prompt expects retrieved passages in. MUST match "<context>" in
 # app/system_prompt.md (the prompt/handler contract).
 CONTEXT_TAG = "context"
@@ -117,17 +127,74 @@ def _build_context_block(chunks):
     return f"<{CONTEXT_TAG}>\n{inner}\n</{CONTEXT_TAG}>"
 
 
+def _guardrail_config():
+    """Converse guardrailConfig, or None if no guardrail is wired (id + version required).
+
+    No guardContent tagging: there is no contextual grounding, so the existing
+    <context>-wrapped message structure is unchanged and the guardrail just filters
+    content + PII across the whole input and output."""
+    if not GUARDRAIL_ID or not GUARDRAIL_VERSION:
+        return None
+    return {
+        "guardrailIdentifier": GUARDRAIL_ID,
+        "guardrailVersion": GUARDRAIL_VERSION,
+        "trace": GUARDRAIL_TRACE,
+    }
+
+
+def _first_text(response):
+    """The first text block of a Converse response. On a guardrail block this is the
+    configured blocked message; otherwise the generated answer."""
+    content = (
+        response.get("output", {}).get("message", {}).get("content", []) or []
+    )
+    for block in content:
+        if isinstance(block, dict) and "text" in block:
+            return block["text"]
+    return ""
+
+
+def _log_guardrail_assessment(response):
+    """Structured log of the guardrail outcome on every request, so interventions and PII
+    detections are measurable for later tuning. Goes to stdout -> CloudWatch Logs."""
+    trace = response.get("trace") or {}
+    print(
+        json.dumps(
+            {
+                "event": "guardrail_assessment",
+                "stop_reason": response.get("stopReason"),
+                "intervened": response.get("stopReason") == _GUARDRAIL_STOP_REASON,
+                "assessment": trace.get("guardrail"),
+            },
+            default=str,
+        )
+    )
+
+
 def generate(query, chunks):
-    """Bedrock Converse generation. The system prompt goes in Converse `system`; the
-    <context> block and the question go in the user message. Returns the answer text."""
+    """Bedrock Converse generation under the system prompt + guardrail. The system prompt
+    goes in Converse `system`; the <context> block and the question go in the user message.
+
+    Returns {"answer": <text>, "blocked": <bool>}. When the guardrail intervenes, `answer`
+    is the guardrail's configured blocked message and `blocked` is True."""
     user_text = f"{_build_context_block(chunks)}\n\nQuestion: {query}"
 
-    response = _bedrock_client().converse(
-        modelId=GENERATION_MODEL_ID,
-        system=[{"text": SYSTEM_PROMPT}],
-        messages=[{"role": "user", "content": [{"text": user_text}]}],
-    )
-    return response["output"]["message"]["content"][0]["text"]
+    kwargs = {
+        "modelId": GENERATION_MODEL_ID,
+        "system": [{"text": SYSTEM_PROMPT}],
+        "messages": [{"role": "user", "content": [{"text": user_text}]}],
+    }
+    guardrail = _guardrail_config()
+    if guardrail:
+        kwargs["guardrailConfig"] = guardrail
+
+    response = _bedrock_client().converse(**kwargs)
+    _log_guardrail_assessment(response)
+
+    return {
+        "answer": _first_text(response),
+        "blocked": response.get("stopReason") == _GUARDRAIL_STOP_REASON,
+    }
 
 
 def _build_sources(chunks):
@@ -173,5 +240,8 @@ def lambda_handler(event, context):
         return _response(400, {"error": "Missing 'query' in request body."})
 
     chunks = retrieve(query)
-    answer = generate(query, chunks)
-    return _response(200, {"answer": answer, "sources": _build_sources(chunks)})
+    result = generate(query, chunks)
+    # On a guardrail block the answer is the blocked message; don't attach library sources
+    # to it (v1: just return the message, no re-retrieve or escalation).
+    sources = [] if result["blocked"] else _build_sources(chunks)
+    return _response(200, {"answer": result["answer"], "sources": sources})

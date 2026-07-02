@@ -61,3 +61,54 @@ generation:
   # Bedrock-hosted Claude model for answer generation. PLACEHOLDER: architecture.md lists
   # this as "Haiku, TBD" pending DxHub/sponsor confirmation. Synth does not validate the id.
   model_id: anthropic.claude-3-5-haiku-20241022-v1:0
+
+# --- Bedrock Guardrails ---
+#
+# Content filters + PII only. Contextual grounding is DELIBERATELY excluded: AWS states it
+# does not support conversational/chatbot use cases and needs fragile guardContent tagging;
+# our system prompt already enforces hard grounding. No denied topics / word filters /
+# automated reasoning either. Tune strengths/actions/messages here, not in code.
+guardrail:
+  name: gavilan-library-guardrail
+  # Attach behavior for the Converse call: enabled | disabled | enabled_full.
+  trace: enabled
+  # Content filters. strength: NONE | LOW | MEDIUM | HIGH, applied to input AND output.
+  # PROMPT_ATTACK is INPUT-only (AWS requires its output strength to be NONE).
+  content_filters:
+    - type: HATE
+      input_strength: HIGH
+      output_strength: HIGH
+    - type: SEXUAL
+      input_strength: HIGH
+      output_strength: HIGH
+    - type: INSULTS
+      input_strength: MEDIUM
+      output_strength: MEDIUM
+    - type: VIOLENCE
+      input_strength: MEDIUM
+      output_strength: MEDIUM
+    - type: MISCONDUCT
+      input_strength: MEDIUM
+      output_strength: MEDIUM
+    - type: PROMPT_ATTACK
+      input_strength: HIGH
+      output_strength: NONE   # INPUT only
+  # Sensitive information (PII). action applies to both input and output.
+  #   ANONYMIZE = mask/redact (replace with the entity type, e.g. {EMAIL}).
+  #   BLOCK     = block the whole request/response and return the blocked message.
+  pii_entities:
+    - action: ANONYMIZE
+      types: [EMAIL, PHONE, NAME, ADDRESS, USERNAME, AGE]
+    - action: BLOCK
+      types:
+        - PASSWORD
+        - US_SOCIAL_SECURITY_NUMBER
+        - CREDIT_DEBIT_CARD_NUMBER
+        - CREDIT_DEBIT_CARD_CVV
+        - PIN
+        - INTERNATIONAL_BANK_ACCOUNT_NUMBER
+        - SWIFT_CODE
+        - DRIVER_ID
+  # Friendly, student-facing blocked messages (match the bot's tone).
+  blocked_input_messaging: "I can't help with that request. I'm here for questions about the Gavilan College Library, like hours, checkouts, and finding materials."
+  blocked_outputs_messaging: "I'm not able to provide a response to that. Try asking about library hours, services, or materials, or reach out to a librarian for more help."
