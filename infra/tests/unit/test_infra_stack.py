@@ -253,3 +253,129 @@ def test_stack_outputs_ready_to_paste_embed_tag():
     assert 'data-api-url="' in literals
     assert "/query" in literals
     assert literals.endswith("defer></script>"), literals
+
+
+# --- Bedrock Guardrail (content filters + PII) ----------------------------------
+
+
+def test_guardrail_synthesizes_with_content_filters_and_blocked_messages():
+    template = _template()
+    gr = CONFIG["guardrail"]
+    template.resource_count_is("AWS::Bedrock::Guardrail", 1)
+    template.has_resource_properties(
+        "AWS::Bedrock::Guardrail",
+        {
+            "Name": gr["name"],
+            "BlockedInputMessaging": gr["blocked_input_messaging"],
+            "BlockedOutputsMessaging": gr["blocked_outputs_messaging"],
+        },
+    )
+    # Content filters carry the configured strengths, and PROMPT_ATTACK is INPUT-only
+    # (output strength NONE, as AWS requires).
+    template.has_resource_properties(
+        "AWS::Bedrock::Guardrail",
+        assertions.Match.object_like(
+            {
+                "ContentPolicyConfig": {
+                    "FiltersConfig": assertions.Match.array_with(
+                        [
+                            assertions.Match.object_like(
+                                {
+                                    "Type": "HATE",
+                                    "InputStrength": "HIGH",
+                                    "OutputStrength": "HIGH",
+                                }
+                            ),
+                            assertions.Match.object_like(
+                                {
+                                    "Type": "PROMPT_ATTACK",
+                                    "InputStrength": "HIGH",
+                                    "OutputStrength": "NONE",
+                                }
+                            ),
+                        ]
+                    )
+                }
+            }
+        ),
+    )
+
+
+def test_guardrail_has_anonymize_and_block_pii_policies():
+    template = _template()
+    template.has_resource_properties(
+        "AWS::Bedrock::Guardrail",
+        assertions.Match.object_like(
+            {
+                "SensitiveInformationPolicyConfig": {
+                    "PiiEntitiesConfig": assertions.Match.array_with(
+                        [
+                            # A masked (anonymized) entity...
+                            assertions.Match.object_like(
+                                {"Type": "EMAIL", "Action": "ANONYMIZE"}
+                            ),
+                            # ...and a blocked entity.
+                            assertions.Match.object_like(
+                                {
+                                    "Type": "US_SOCIAL_SECURITY_NUMBER",
+                                    "Action": "BLOCK",
+                                }
+                            ),
+                        ]
+                    )
+                }
+            }
+        ),
+    )
+    # All 14 configured entities are present.
+    guardrail = _one(template, "AWS::Bedrock::Guardrail")
+    entities = guardrail["Properties"]["SensitiveInformationPolicyConfig"][
+        "PiiEntitiesConfig"
+    ]
+    expected = sum(len(g["types"]) for g in CONFIG["guardrail"]["pii_entities"])
+    assert len(entities) == expected
+
+
+def test_guardrail_version_created_and_wired_to_query_lambda():
+    template = _template()
+    template.resource_count_is("AWS::Bedrock::GuardrailVersion", 1)
+    # The query Lambda receives the guardrail id + version + trace via env vars.
+    template.has_resource_properties(
+        "AWS::Lambda::Function",
+        assertions.Match.object_like(
+            {
+                "Handler": "handler.lambda_handler",
+                "Environment": {
+                    "Variables": assertions.Match.object_like(
+                        {
+                            "GUARDRAIL_ID": assertions.Match.any_value(),
+                            "GUARDRAIL_VERSION": assertions.Match.any_value(),
+                            "GUARDRAIL_TRACE": "enabled",
+                        }
+                    )
+                },
+            }
+        ),
+    )
+
+
+def test_query_lambda_role_can_apply_the_guardrail():
+    template = _template()
+    # The query role must be granted bedrock:ApplyGuardrail (needed for the Converse
+    # guardrailConfig at runtime, in addition to InvokeModel).
+    template.has_resource_properties(
+        "AWS::IAM::Policy",
+        assertions.Match.object_like(
+            {
+                "PolicyDocument": {
+                    "Statement": assertions.Match.array_with(
+                        [
+                            assertions.Match.object_like(
+                                {"Action": "bedrock:ApplyGuardrail"}
+                            )
+                        ]
+                    )
+                }
+            }
+        ),
+    )

@@ -65,6 +65,7 @@ class GavilanChatbotStack(Stack):
         chunking_cfg = config["chunking"]
         retrieval_cfg = config["retrieval"]
         generation_cfg = config["generation"]
+        guardrail_cfg = config["guardrail"]
 
         kb_name = kb_cfg["name"]
         collection_name = vs_cfg["collection_name"]
@@ -331,6 +332,59 @@ class GavilanChatbotStack(Stack):
         # The data source cannot be created before the KB exists.
         web_data_source.add_dependency(knowledge_base)
 
+        # --- Bedrock Guardrail --------------------------------------------------------
+
+        # Content filters + PII ONLY. Contextual grounding is deliberately excluded (AWS:
+        # unsupported for chatbot use cases, needs guardContent tagging); the system prompt
+        # already enforces hard grounding. No denied topics / word filters / automated
+        # reasoning. All strengths, actions, and messages come from config.yaml.
+        content_filters = [
+            bedrock.CfnGuardrail.ContentFilterConfigProperty(
+                type=f["type"],
+                input_strength=f["input_strength"],
+                output_strength=f["output_strength"],
+            )
+            for f in guardrail_cfg["content_filters"]
+        ]
+        # Flatten the per-action PII groups into one entity list (action applies to both
+        # input and output).
+        pii_entities = [
+            bedrock.CfnGuardrail.PiiEntityConfigProperty(type=entity, action=group["action"])
+            for group in guardrail_cfg["pii_entities"]
+            for entity in group["types"]
+        ]
+
+        guardrail = bedrock.CfnGuardrail(
+            self,
+            "ContentGuardrail",
+            name=guardrail_cfg["name"],
+            description=(
+                "Content filters + PII for the Gavilan Library chatbot. No contextual "
+                "grounding (unsupported for chatbot use); grounding is enforced by the "
+                "system prompt."
+            ),
+            blocked_input_messaging=guardrail_cfg["blocked_input_messaging"],
+            blocked_outputs_messaging=guardrail_cfg["blocked_outputs_messaging"],
+            content_policy_config=bedrock.CfnGuardrail.ContentPolicyConfigProperty(
+                filters_config=content_filters,
+            ),
+            sensitive_information_policy_config=(
+                bedrock.CfnGuardrail.SensitiveInformationPolicyConfigProperty(
+                    pii_entities_config=pii_entities,
+                )
+            ),
+        )
+
+        # A numbered version is what the Lambda attaches at runtime. DRAFT would also work
+        # (the Converse guardrailVersion accepts DRAFT or a number), but a published version
+        # is immutable/stable, so pin the Lambda to one.
+        guardrail_version = bedrock.CfnGuardrailVersion(
+            self,
+            "ContentGuardrailVersion",
+            guardrail_identifier=guardrail.attr_guardrail_id,
+            description="Immutable version attached to the query Lambda at runtime.",
+        )
+
         # --- Query path: Lambda + HTTP API --------------------------------------------
 
         generation_model_arn = (
@@ -366,6 +420,13 @@ class GavilanChatbotStack(Stack):
                 resources=[generation_model_arn],
             )
         )
+        # Apply the guardrail on the Converse call (required in addition to InvokeModel).
+        query_lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["bedrock:ApplyGuardrail"],
+                resources=[guardrail.attr_guardrail_arn],
+            )
+        )
 
         query_lambda = _lambda.Function(
             self,
@@ -381,6 +442,10 @@ class GavilanChatbotStack(Stack):
                 "GENERATION_MODEL_ID": generation_cfg["model_id"],
                 "NUMBER_OF_RESULTS": str(retrieval_cfg["number_of_results"]),
                 "BEDROCK_REGION": self.region,
+                # Guardrail attached to the Converse call at runtime.
+                "GUARDRAIL_ID": guardrail.attr_guardrail_id,
+                "GUARDRAIL_VERSION": guardrail_version.attr_version,
+                "GUARDRAIL_TRACE": guardrail_cfg.get("trace", "enabled"),
             },
         )
         # The Lambda queries the KB at runtime, so it must not exist before the KB.
