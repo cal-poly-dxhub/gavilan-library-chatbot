@@ -1,0 +1,50 @@
+# Eval-harness infrastructure config.
+#
+# A SDK/boto3 operational tooling
+# stack. All values below are PLACEHOLDER / TBD until the AWS account and evaluator model
+# access.
+
+eval:
+  # AWS region where Bedrock evaluation jobs run. TBD: confirm the region once provisioned.
+  region: us-west-2
+
+  # IAM role Bedrock assumes to run the job. Needs read/write on the eval S3 bucket and
+  # access to the evaluator model. TBD: real role ARN.
+  role_arn: "arn:aws:iam::000000000000:role/TBD-bedrock-eval-role"
+
+  # S3 bucket for eval input (JSONL datasets) and Bedrock output (results). If browsed
+  # from a UI it needs CORS. TBD: real bucket name.
+  bucket: "gavilan-library-eval-TBD"
+
+  # Key prefixes within the bucket.
+  input_prefix: "eval/input"
+  output_prefix: "eval/output"
+
+  # LLM-as-judge evaluator model id. TBD: confirm model access in the account/region.
+  evaluator_model_id: "us.anthropic.claude-3-5-sonnet-20240620-v1:0"
+
+  # Bedrock evaluation application type for RAG evaluation.
+  application_type: "RagEvaluation"
+
+  # Retrieve-only evaluation: the eval job points at the live KB and runs Retrieve itself.
+  # Measures chunking/retrieval quality via
+  # Builtin.ContextCoverage + Builtin.ContextRelevance.
+  retrieve:
+    # KB whose retrieval quality is being evaluated. TBD: id of the deployed KB.
+    knowledge_base_id: "TBD-knowledge-base-id"
+    # How many chunks Retrieve returns per query.
+    number_of_results: 5
+    # overrideSearchType: HYBRID or SEMANTIC. v1 retrieval is semantic-only; HYBRID is the
+    # Phase 2 target, so this knob lets eval compare them without code changes.
+    search_type: "SEMANTIC"
+
+  # Retrieve-and-generate evaluation: the answer-quality evaluator. BRING-YOUR-OWN-INFERENCE
+  # Metrics: Correctness, Completeness, Faithfulness, Helpfulness, Harmfulness
+  # (+ CitationCoverage/CitationPrecision only when citations are captured).
+  generate:
+    # BYOI source id. MUST match output.knowledgeBaseIdentifier in every JSONL line and
+    # ragSourceIdentifier in the inferenceConfig. Human-chosen string.
+    rag_source_identifier: "gavilan-bot-v1"
+    # Deployed bot's HTTP API /query endpoint. The capture stage POSTs each question
+    # here. TBD: real URL once the bot is deployed (see capture_outputs.py).
+    bot_api_url: "https://TBD.execute-api.us-west-2.amazonaws.com/query"
