@@ -61,10 +61,12 @@
 
   /** The configured backend endpoint, or null if `data-api-url` is unset. */
   function apiUrl() {
+    // The fallback query is scoped to this widget's own script tag (its src ends in
+    // widget.js), so it can never bind to another embed's data-api-url tag on the host page.
     var el =
       CURRENT_SCRIPT ||
       (typeof document !== "undefined"
-        ? document.querySelector("script[data-api-url]")
+        ? document.querySelector('script[data-api-url][src*="widget.js"]')
         : null);
     var url = el && el.getAttribute ? el.getAttribute("data-api-url") : null;
     return url && url.trim() ? url.trim() : null;
@@ -402,6 +404,9 @@
     var input = doc.createElement("textarea");
     input.className = "composer__input";
     input.setAttribute("rows", "1");
+    // Advisory input cap so a user gets feedback instead of typing a wall of text. The real
+    // limit is the server-side length check; this is intentionally lower and UX-only.
+    input.setAttribute("maxlength", "1000");
     input.setAttribute("aria-label", "Type your question");
     input.setAttribute("placeholder", "Ask a question…");
     var send = doc.createElement("button");

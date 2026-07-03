@@ -246,4 +246,27 @@ test("a delayed 'waking up' hint backs a slow first response (no fake progress)"
   );
 });
 
+// --- input length cap (finding 2.6, widget half) ------------------------
+test("input has an advisory maxlength cap", () => {
+  assert.ok(
+    /setAttribute\(\s*"maxlength"\s*,\s*"1000"\s*\)/.test(SOURCE),
+    "the textarea sets an advisory maxlength (server-side is the real limit)"
+  );
+});
+
+// --- scoped fallback selector (finding 4.2) -----------------------------
+test("apiUrl fallback selector is scoped to the widget's own script tag", () => {
+  // The currentScript fallback must require src*="widget.js" so it can never bind to a
+  // foreign data-api-url tag on the host page.
+  assert.ok(
+    /querySelector\(\s*'script\[data-api-url\]\[src\*="widget\.js"\]'\s*\)/.test(SOURCE),
+    "fallback selector is scoped to the widget's own tag"
+  );
+  // The unscoped selector must be gone.
+  assert.ok(
+    !/querySelector\(\s*"script\[data-api-url\]"\s*\)/.test(SOURCE),
+    "no unscoped script[data-api-url] selector remains"
+  );
+});
+
 run();

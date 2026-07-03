@@ -30,7 +30,8 @@
 - [x] **Widget frontend** — vanilla JS, Shadow DOM isolation, self-injecting single file reading `data-api-url`. Mock extracted to `frontend/mock.js` (demo + tests only); `widget.js` production-clean. 18 tests.
 - [x] **Widget hosting** — S3 + CloudFront (OAC) in the same CDK stack; `BucketDeployment` uploads only `widget.js`; CfnOutput assembles the ready-to-paste `<script>` tag. 22 infra tests.
 - [x] **Guardrails** — Bedrock Guardrails (content filters + PII) wired into the Converse call via `guardrailConfig`. Grounding deliberately excluded (see below). Config-driven, blocked-response handling, per-request assessment logged. 30 tests.
-- [ ] **Fable 5 audit** — full-stack adversarial review, audit-only, produces `docs/review-findings.md`. Triage findings after.
+- [x] **Fable 5 audit** — full-stack adversarial review, audit-only, produces `docs/review-findings.md`. Triage findings after.
+- [x] **Fix audit items** - Resolve all the issues brought up by the audit
 - [ ] **Provide context** — sponsor URL list + blacklist (arrives ~July 19) into `config.yaml`; sponsor Q&A set into `eval/datasets/`.
 - [ ] **Iterate** (needs AWS account) — deploy, run retrieve-only eval, tune: FIXED_SIZE vs HIERARCHICAL chunking, SEMANTIC vs HYBRID search, prompt behavior. Eval-driven.
 - [ ] Fix the deploy-time landmines (`blocked-on-aws.md`) at first deploy

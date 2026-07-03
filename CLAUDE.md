@@ -101,3 +101,15 @@ Things learned the hard way. Read before repeating the same work.
   - `CfnIndex` creation is eventually-consistent; the KB may race the index becoming ACTIVE on first deploy. Fallback: a custom-resource index creator.
   - **CloudFront is slow to create AND destroy (~15-30 min each).** The widget distribution dominates `cdk deploy`/`destroy` wall-clock. Actual serving behavior (OAC read, cache, HTTPS redirect) is only verifiable at deploy.
   - **OAC + `auto_delete_objects` dependency cycle.** Do NOT add an explicit `distribution.node.add_dependency(bucket)`: the origin already references the bucket, and the explicit edge pulls in the bucket's auto-delete custom resource, which `DependsOn` the OAC bucket policy, which `DependsOn` the distribution -> a synth-blocking cycle. Surfaces in `Template.from_stack` (tests) even when plain `cdk synth` looks fine; keep infra tests in the loop.
+  - Config keys reach the from_asset(app/) Lambda ONLY as stack-set env vars 
+  (the bundle excludes config.yaml). A new config knob needs three touches - 
+  config.yaml, stack env-wiring, handler read - or it silently no-ops. 
+  Synth-time-only keys (throttle limits) are read by the stack directly and 
+  don't need the bridge.
+- Two non-obvious "don't "fix" these" traps: the OSS data-access policy names 
+  the cfn-exec role via a token-built ARN, NOT synthesizer.cloud_formation_
+  execution_role_arn (that accessor emits Fn::Sub text the plain-JSON policy 
+  won't resolve). And invoking a Claude model needs a us.-prefixed inference 
+  profile (bare model IDs are rejected), which requires InvokeModel* on the 
+  profile ARN plus foundation-model ARNs across routed regions, not the 
+  single-ARN on-demand grant.

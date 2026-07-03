@@ -25,6 +25,10 @@ Wiring comes from env vars set by the CDK stack.
     source uri are omitted from `sources` (they still inform the answer).
   - On empty retrieval, `sources` is [] and the system prompt instructs the model to say
     it does not have the information.
+  - When the request sets `include_full_context: true`, the response also carries
+    `full_context`: the full, un-deduped, un-truncated retrieved passages (`[{text, source}]`)
+    the model actually saw, for answer-quality eval. The widget never sets the flag, so its
+    responses are exactly the `{answer, sources}` shape above.
 """
 
 import base64
@@ -419,12 +423,9 @@ def _build_sources(chunks):
     return sources
 
 
-def _extract_query(event):
-    """Pull and validate the user query from an HTTP API (payload format 2.0) event body.
-
-    Returns a stripped, non-empty string, or None for anything invalid (missing body, bad
-    JSON, non-dict payload, or a missing / non-string / blank query). None yields the caller's
-    clean 400 - never a downstream 500 (finding 3.2)."""
+def _parse_body(event):
+    """The JSON object body of an HTTP API (payload format 2.0) event, or None if the body is
+    absent, not valid JSON, or not a JSON object."""
     body = event.get("body")
     if body is None:
         return None
@@ -434,15 +435,34 @@ def _extract_query(event):
         data = json.loads(body)
     except (ValueError, TypeError):
         return None
+    return data if isinstance(data, dict) else None
+
+
+def _extract_query(data):
+    """The validated user query from a parsed request body, or None for a missing / non-string
+    / blank query. None yields the caller's clean 400 - never a downstream 500 (finding 3.2)."""
     if not isinstance(data, dict):
         return None
     query = data.get("query") or data.get("question")
     # A non-string (e.g. {"query": 123} or {"query": {...}}) is truthy but would blow up inside
-    # boto3 as an opaque 500. Reject it here as a clean 400 instead (finding 3.2).
+    # boto3 as an opaque 500. Reject it here as a clean 400 instead.
     if not isinstance(query, str):
         return None
     query = query.strip()
     return query or None
+
+
+# Optional request flag: when true, /query additionally returns the full retrieved passages
+# (what the model actually saw). The answer-quality eval sets it; the widget never does.
+_FULL_CONTEXT_FLAG = "include_full_context"
+
+
+def _full_context(chunks):
+    """The retrieved passages exactly as they were fed into the model's <context>: full text
+    and source, in retrieval order, with no truncation and no per-source dedup (unlike the
+    public `sources`). Lets the answer-quality eval score faithfulness against what the model
+    actually saw, not the truncated/deduped excerpts."""
+    return [{"text": chunk["text"], "source": chunk.get("source")} for chunk in chunks]
 
 
 def _response(status_code, payload):
@@ -499,7 +519,8 @@ def _handle_warm():
 
 def _handle_query(event):
     """Query path (POST /query): validate -> input screen -> retrieve -> generate."""
-    query = _extract_query(event)
+    data = _parse_body(event)
+    query = _extract_query(data)
     if not query:
         return _response(400, {"error": "Missing 'query' in request body."})
     # Server-side size cap (finding 2.6): reject an oversized query BEFORE any retrieval or
@@ -510,6 +531,10 @@ def _handle_query(event):
             400,
             {"error": f"Query exceeds the maximum length of {MAX_QUERY_CHARS} characters."},
         )
+
+    # Opt-in eval payload: the full retrieved passages, added to the response only when the
+    # request explicitly asks (the widget never does, so its responses are unchanged).
+    include_full_context = bool(data and data.get(_FULL_CONTEXT_FLAG))
 
     # Everything past validation touches AWS; wrap it so any fault surfaces as a clean, staged
     # JSON error instead of an opaque 500 (finding 3.1). `stage` names the step that failed.
@@ -533,7 +558,10 @@ def _handle_query(event):
     # On an OUTPUT guardrail block the answer is the blocked message; don't attach library
     # sources to it (v1: just return the message, no re-retrieve or escalation).
     sources = [] if result["blocked"] else _build_sources(chunks)
-    return _response(200, {"answer": result["answer"], "sources": sources})
+    payload = {"answer": result["answer"], "sources": sources}
+    if include_full_context:
+        payload["full_context"] = _full_context(chunks)
+    return _response(200, payload)
 
 
 def lambda_handler(event, context):

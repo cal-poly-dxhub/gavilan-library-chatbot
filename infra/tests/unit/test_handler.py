@@ -324,6 +324,60 @@ def test_chunk_without_source_omitted_from_sources(monkeypatch):
     assert "A passage with no location." in _user_text(bedrock)
 
 
+# --- include_full_context flag (finding 2.4) -----------------------------------
+
+
+def test_default_response_omits_full_context_widget_path_unchanged(monkeypatch):
+    # THE regression that matters: without the flag (what the widget sends) the response is
+    # exactly {answer, sources} - no full_context key, byte-for-byte the shipped contract.
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
+    body = json.loads(resp["body"])
+    assert set(body.keys()) == {"answer", "sources"}
+    assert "full_context" not in body
+
+
+def test_flag_false_still_omits_full_context(monkeypatch):
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "hours?", "include_full_context": False})), None
+    )
+    assert "full_context" not in json.loads(resp["body"])
+
+
+def test_include_full_context_returns_untruncated_undeduped_passages(monkeypatch):
+    # With the flag, full_context is every retrieved passage in order - full text, no per-uri
+    # dedup, sourceless passages kept - unlike the truncated/deduped public `sources`.
+    long_text = "A" * 400  # exceeds the 300-char public excerpt cap
+    agent = FakeAgentRuntime(results=[
+        {"content": {"text": long_text}, "location": {"webLocation": {"url": "https://gav.edu/a"}}},
+        {"content": {"text": "second chunk, same page"}, "location": {"webLocation": {"url": "https://gav.edu/a"}}},
+        {"content": {"text": "chunk with no source"}},
+    ])
+    bedrock = FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "hours?", "include_full_context": True})), None
+    )
+    body = json.loads(resp["body"])
+
+    # Public sources: deduped to one uri, excerpt truncated to 300, sourceless chunk dropped.
+    assert len(body["sources"]) == 1
+    assert len(body["sources"][0]["excerpt"]) == 300
+
+    # full_context: all three passages, full text, in retrieval order, sourceless one included.
+    assert body["full_context"] == [
+        {"text": long_text, "source": "https://gav.edu/a"},
+        {"text": "second chunk, same page", "source": "https://gav.edu/a"},
+        {"text": "chunk with no source", "source": None},
+    ]
+
+
 def test_missing_query_returns_400(monkeypatch):
     # No client should be called when the body has no query (not even the input screen).
     monkeypatch.setattr(
