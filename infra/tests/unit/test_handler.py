@@ -170,6 +170,17 @@ def _payload_v2_event(body, is_base64=False):
     }
 
 
+def _warm_event():
+    """A GET /warm event (HTTP API payload format 2.0, no body)."""
+    return {
+        "version": "2.0",
+        "routeKey": "GET /warm",
+        "rawPath": "/warm",
+        "requestContext": {"http": {"method": "GET", "path": "/warm"}},
+        "isBase64Encoded": False,
+    }
+
+
 def _user_text(bedrock):
     """The text of the single user message sent to Converse."""
     return bedrock.converse_calls[0]["messages"][0]["content"][0]["text"]
@@ -545,3 +556,46 @@ def test_output_guardrail_assessment_is_logged(monkeypatch, capsys):
     payload = json.loads([ln for ln in logged.splitlines() if "guardrail_assessment" in ln][-1])
     assert payload["intervened"] is True
     assert payload["assessment"] == {"outputAssessment": {"gr-output-1": {}}}
+
+
+# --- Warm path (GET /warm): retrieval-only pre-warm (finding 1.3) ---------------
+
+
+def test_warm_path_retrieves_only_and_returns_warmed(monkeypatch):
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_warm_event(), None)
+
+    assert resp["statusCode"] == 200
+    assert json.loads(resp["body"]) == {"warmed": True}
+    # Retrieve ran once (to wake OSS); NO generation and NO input-screen guardrail call.
+    assert len(agent.calls) == 1
+    assert bedrock.converse_calls == []
+    assert bedrock.apply_guardrail_calls == []
+
+
+def test_warm_path_uses_a_fixed_throwaway_query(monkeypatch):
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    handler.lambda_handler(_warm_event(), None)
+
+    # The warm query is the module's fixed string, not any user input.
+    assert agent.calls[0]["retrievalQuery"]["text"] == handler._WARM_QUERY
+
+
+def test_query_path_still_dispatches_when_path_is_query(monkeypatch):
+    # Regression: a normal POST /query event routes to the real query path (retrieve+generate),
+    # not the warm path.
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "hours?"})), None
+    )
+
+    assert resp["statusCode"] == 200
+    assert "answer" in json.loads(resp["body"])
+    assert len(bedrock.converse_calls) == 1
+    assert len(bedrock.apply_guardrail_calls) == 1

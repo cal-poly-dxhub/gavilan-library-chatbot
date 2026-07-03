@@ -1,15 +1,17 @@
 """Query-path Lambda for the Gavilan Library Chatbot.
 
-Three steps:
-  0. _apply_input_guardrail() -> Bedrock `ApplyGuardrail` (source=INPUT) on the BARE user
-     query.
-  1. retrieve()  -> Bedrock Knowledge Base `Retrieve` for relevant chunks + their sources.
-  2. generate()  -> Bedrock Converse over those chunks, under the real system prompt
-     (app/system_prompt.md), with the OUTPUT guardrail (content filters, answer side only)
-     attached as a backstop.
+Fronted by an API Gateway HTTP API (payload format 2.0) with two routes on this one Lambda:
+  - POST /query -> the real query path (_handle_query):
+      0. _apply_input_guardrail() -> Bedrock `ApplyGuardrail` (source=INPUT) on the BARE
+         user query.
+      1. retrieve()  -> Bedrock Knowledge Base `Retrieve` for relevant chunks + sources.
+      2. generate()  -> Bedrock Converse over those chunks, under the real system prompt
+         (app/system_prompt.md), with the OUTPUT guardrail (content filters, answer side
+         only) attached as a backstop.
+  - GET /warm -> _handle_warm(): a retrieval-only pre-warm to wake OpenSearch Serverless
+      before the first real query (finding 1.3). No generation, no guardrail.
 
-Fronted by an API Gateway HTTP API (payload format 2.0). Wiring comes from env vars set
-by the CDK stack.
+Wiring comes from env vars set by the CDK stack.
 
 /query response JSON shape:
   {
@@ -76,6 +78,13 @@ CONTEXT_TAG = "context"
 
 # Max characters of a passage surfaced as a source excerpt in the response.
 _EXCERPT_CHARS = 300
+
+# Warm path (finding 1.3). The widget fires GET /warm on page load to wake the OpenSearch
+# Serverless collection before the first real query. WARM_PATH is matched against the request
+# path; _WARM_QUERY is a throwaway retrieval query (the goal is to spin OSS up, not to get
+# useful results).
+WARM_PATH = "/warm"
+_WARM_QUERY = "library hours"
 
 # The real system prompt is packaged with the Lambda: app/system_prompt.md lives inside
 # the from_asset(app/) bundle, next to this file. Read once at cold start.
@@ -395,7 +404,24 @@ def _response(status_code, payload):
     }
 
 
-def lambda_handler(event, context):
+def _request_path(event):
+    """Request path for an HTTP API (payload format 2.0) event, e.g. '/query' or '/warm'."""
+    http = (event.get("requestContext") or {}).get("http") or {}
+    return http.get("path") or event.get("rawPath") or ""
+
+
+def _handle_warm():
+    """Warm path (GET /warm): a single KB Retrieve to wake the OpenSearch Serverless
+    collection (which scales to zero after ~10min idle) before the student's first real
+    query. No generation and no guardrail input screen - there is no user query to screen,
+    and OSS scale-to-zero is the dominant cold-start cost, so warming retrieval is the whole
+    point (finding 1.3). The Bedrock Converse path is deliberately left cold."""
+    retrieve(_WARM_QUERY)
+    return _response(200, {"warmed": True})
+
+
+def _handle_query(event):
+    """Query path (POST /query): input screen -> retrieve -> generate."""
     query = _extract_query(event)
     if not query:
         return _response(400, {"error": "Missing 'query' in request body."})
@@ -414,3 +440,11 @@ def lambda_handler(event, context):
     # sources to it (v1: just return the message, no re-retrieve or escalation).
     sources = [] if result["blocked"] else _build_sources(chunks)
     return _response(200, {"answer": result["answer"], "sources": sources})
+
+
+def lambda_handler(event, context):
+    # Two clean routes on one Lambda: /warm (lightweight retrieval-only pre-warm) and
+    # everything else -> the real /query path.
+    if _request_path(event) == WARM_PATH:
+        return _handle_warm()
+    return _handle_query(event)

@@ -185,4 +185,65 @@ test("external source links open safely (noopener noreferrer)", () => {
   assert.ok(/noopener noreferrer/.test(SOURCE), "target=_blank links must be rel=noopener noreferrer");
 });
 
+// --- warm path (finding 1.3): fire-and-forget pre-warm ------------------
+test("warmUrl derives the sibling /warm route from the /query endpoint", () => {
+  assert.strictEqual(
+    widget.warmUrl("https://abc123.execute-api.us-west-2.amazonaws.com/query"),
+    "https://abc123.execute-api.us-west-2.amazonaws.com/warm"
+  );
+  // A trailing slash on /query is tolerated.
+  assert.strictEqual(
+    widget.warmUrl("https://abc123.execute-api.us-west-2.amazonaws.com/query/"),
+    "https://abc123.execute-api.us-west-2.amazonaws.com/warm"
+  );
+});
+
+test("warmUrl falls back to appending /warm for a non-/query base", () => {
+  assert.strictEqual(widget.warmUrl("https://x.test/api"), "https://x.test/api/warm");
+  assert.strictEqual(widget.warmUrl("https://x.test/api/"), "https://x.test/api/warm");
+});
+
+test("warmUrl returns null for unusable input", () => {
+  assert.strictEqual(widget.warmUrl(""), null);
+  assert.strictEqual(widget.warmUrl(null), null);
+  assert.strictEqual(widget.warmUrl(undefined), null);
+});
+
+test("widget fires a fire-and-forget GET /warm on load, derived from data-api-url", () => {
+  assert.ok(/warmBackend\(\)/.test(SOURCE), "warmBackend must be invoked on load");
+  assert.ok(
+    /fetch\(\s*url\s*,\s*\{\s*method:\s*"GET"\s*\}\s*\)/.test(SOURCE),
+    "the warm ping must be a GET"
+  );
+  assert.ok(
+    /\.then\(\s*noop\s*,\s*noop\s*\)/.test(SOURCE),
+    "warm result AND errors must be ignored (fire-and-forget)"
+  );
+  assert.ok(
+    /warmUrl\(\s*apiUrl\(\)\s*\)/.test(SOURCE),
+    "the /warm URL must derive from the same data-api-url base"
+  );
+});
+
+// --- honest loading state (finding 1.3) ---------------------------------
+test("request timeout is raised to the 30s API Gateway ceiling", () => {
+  assert.strictEqual(widget.CONFIG.requestTimeoutMs, 30000);
+});
+
+test("a delayed 'waking up' hint backs a slow first response (no fake progress)", () => {
+  assert.ok(typeof widget.CONFIG.wakingHintDelayMs === "number", "hint delay is configurable");
+  assert.ok(
+    widget.CONFIG.wakingHintDelayMs > 0 &&
+      widget.CONFIG.wakingHintDelayMs < widget.CONFIG.requestTimeoutMs,
+    "the hint must appear before the request would time out"
+  );
+  // A real element revealed on a timer, not a fake progress bar.
+  assert.ok(/typing__hint/.test(SOURCE), "the typing hint element exists");
+  assert.ok(/Waking up/i.test(SOURCE), "honest 'waking up' copy is present");
+  assert.ok(
+    /CONFIG\.wakingHintDelayMs/.test(SOURCE),
+    "the hint reveal is driven by the configured delay"
+  );
+});
+
 run();

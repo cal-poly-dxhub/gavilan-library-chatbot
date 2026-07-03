@@ -586,23 +586,37 @@ class GavilanChatbotStack(Stack):
         # HTTP API (API Gateway v2), NOT REST: ~71% cheaper for a Lambda-proxy job and we
         # need none of the REST-only features. CORS is permissive for now.
         # TODO: lock allow_origins to the library widget domain before launch.
+        # GET is allowed for the widget's fire-and-forget GET /warm ping (finding 1.3).
         http_api = apigwv2.HttpApi(
             self,
             "ChatbotHttpApi",
             api_name="gavilan-library-chatbot",
             cors_preflight=apigwv2.CorsPreflightOptions(
                 allow_origins=["*"],
-                allow_methods=[apigwv2.CorsHttpMethod.POST, apigwv2.CorsHttpMethod.OPTIONS],
+                allow_methods=[
+                    apigwv2.CorsHttpMethod.GET,
+                    apigwv2.CorsHttpMethod.POST,
+                    apigwv2.CorsHttpMethod.OPTIONS,
+                ],
                 allow_headers=["Content-Type"],
             ),
         )
-        # HttpLambdaIntegration defaults to payload format version 2.0.
+        # One Lambda integration, reused for both routes. HttpLambdaIntegration defaults to
+        # payload format version 2.0.
+        query_integration = apigwv2_integrations.HttpLambdaIntegration(
+            "QueryIntegration", query_lambda
+        )
         http_api.add_routes(
             path="/query",
             methods=[apigwv2.HttpMethod.POST],
-            integration=apigwv2_integrations.HttpLambdaIntegration(
-                "QueryIntegration", query_lambda
-            ),
+            integration=query_integration,
+        )
+        # Lightweight pre-warm route: the widget pings GET /warm on load to wake the OSS
+        # collection (retrieve-only) before the student's first query (finding 1.3).
+        http_api.add_routes(
+            path="/warm",
+            methods=[apigwv2.HttpMethod.GET],
+            integration=query_integration,
         )
 
         # --- Widget hosting: private S3 bucket + CloudFront (OAC) ----------------------

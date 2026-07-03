@@ -176,6 +176,28 @@ def test_post_query_route_exists():
     )
 
 
+def test_warm_route_exists():
+    # Finding 1.3: a lightweight GET /warm route for the widget's on-load pre-warm ping.
+    template = _template()
+    template.has_resource_properties(
+        "AWS::ApiGatewayV2::Route", {"RouteKey": "GET /warm"}
+    )
+
+
+def test_query_and_warm_are_the_only_routes_and_share_one_lambda_integration():
+    template = _template()
+    routes = template.find_resources("AWS::ApiGatewayV2::Route")
+    keys = {r["Properties"]["RouteKey"] for r in routes.values()}
+    assert keys == {"POST /query", "GET /warm"}, keys
+    # Both routes reuse a single Lambda integration (same integration id in each Target).
+    integrations = template.find_resources("AWS::ApiGatewayV2::Integration")
+    assert len(integrations) == 1, list(integrations)
+    (integration_id,) = integrations.keys()
+    for route in routes.values():
+        target = route["Properties"]["Target"]
+        assert integration_id in str(target), target
+
+
 def test_query_lambda_has_its_own_role_distinct_from_kb_role():
     template = _template()
     roles = template.find_resources("AWS::IAM::Role")
