@@ -23,6 +23,7 @@ from typing import Any, Dict
 
 from aws_cdk import (
     CfnOutput,
+    DefaultStackSynthesizer,
     Duration,
     RemovalPolicy,
     Stack,
@@ -33,6 +34,7 @@ from aws_cdk import (
     aws_cloudfront_origins as origins,
     aws_iam as iam,
     aws_lambda as _lambda,
+    aws_logs as logs,
     aws_opensearchserverless as oss,
     aws_s3 as s3,
     aws_s3_deployment as s3deploy,
@@ -64,6 +66,7 @@ class GavilanChatbotStack(Stack):
         hnsw = vs_cfg["hnsw"]
         web_cfg = config["data_source"]["web_crawler"]
         chunking_cfg = config["chunking"]
+        http_api_cfg = config["http_api"]
         request_cfg = config["request"]
         retrieval_cfg = config["retrieval"]
         generation_cfg = config["generation"]
@@ -103,11 +106,12 @@ class GavilanChatbotStack(Stack):
             ),
         )
 
-        # Network: allow public (non-VPC) access to the collection and its dashboard.
-        # Authorization is enforced by the data access policy + IAM below, NOT by network
-        # isolation. This is the AWS-recommended pattern for a Bedrock-backed collection
-        # serving public library-website content; VPC isolation is a compliance-only
-        # layer not needed here.
+        # Network: allow public (non-VPC) access to the collection endpoint only. Nothing in
+        # this system uses OpenSearch Dashboards (the KB talks to the collection API), so the
+        # dashboard endpoint is not exposed. Authorization is enforced by the data access
+        # policy + IAM below, NOT by network isolation. This is the AWS-recommended pattern for
+        # a Bedrock-backed collection serving public library-website content; VPC isolation is a
+        # compliance-only layer not needed here.
         network_policy = oss.CfnSecurityPolicy(
             self,
             "CollectionNetworkPolicy",
@@ -119,10 +123,6 @@ class GavilanChatbotStack(Stack):
                         "Rules": [
                             {
                                 "ResourceType": "collection",
-                                "Resource": [f"collection/{collection_name}"],
-                            },
-                            {
-                                "ResourceType": "dashboard",
                                 "Resource": [f"collection/{collection_name}"],
                             },
                         ],
@@ -172,10 +172,23 @@ class GavilanChatbotStack(Stack):
 
         # --- Data access policy -------------------------------------------------------
 
-        # Grants the KB role the index + collection data-plane actions it needs to create
-        # and populate the vector index. NOTE (deploy-time): the principal that actually
-        # creates the CfnIndex is the CloudFormation execution role, so on a real deploy
-        # that role must ALSO appear here (or the index create fails). Recorded in CLAUDE.md.
+        # Two principals get data-plane access to the collection:
+        #  - the KB execution role, at runtime, to populate and query the vector index; and
+        #  - the CloudFormation execution (cfn-exec) role, at deploy time, because IT - not the
+        #    KB role - is the principal that actually creates, replaces, and deletes the
+        #    CfnIndex through the OSS data plane. It therefore needs the full index lifecycle
+        #    (create/update/delete/describe), or `cdk deploy` (index create/replace) and
+        #    `cdk destroy` (index delete) fail with an authorization error.
+        # The cfn-exec role ARN is built from the bootstrap qualifier + Stack account/region
+        # tokens (json.dumps embeds the tokens as placeholders CDK resolves at synth).
+        bootstrap_qualifier = (
+            getattr(self.synthesizer, "bootstrap_qualifier", None)
+            or DefaultStackSynthesizer.DEFAULT_QUALIFIER
+        )
+        cfn_exec_role_arn = (
+            f"arn:{self.partition}:iam::{self.account}:role/"
+            f"cdk-{bootstrap_qualifier}-cfn-exec-role-{self.account}-{self.region}"
+        )
         data_access_policy = oss.CfnAccessPolicy(
             self,
             "CollectionDataAccessPolicy",
@@ -206,10 +219,23 @@ class GavilanChatbotStack(Stack):
                                 ],
                             },
                         ],
-                        # kb_role.role_arn is a token; json.dumps embeds it as a string
-                        # placeholder that CDK resolves into the real ARN at synth.
                         "Principal": [kb_role.role_arn],
-                    }
+                    },
+                    {
+                        "Rules": [
+                            {
+                                "ResourceType": "index",
+                                "Resource": [f"index/{collection_name}/*"],
+                                "Permission": [
+                                    "aoss:CreateIndex",
+                                    "aoss:UpdateIndex",
+                                    "aoss:DeleteIndex",
+                                    "aoss:DescribeIndex",
+                                ],
+                            },
+                        ],
+                        "Principal": [cfn_exec_role_arn],
+                    },
                 ]
             ),
         )
@@ -558,6 +584,16 @@ class GavilanChatbotStack(Stack):
             )
         )
 
+        # Explicit log group so retention is bounded and it is torn down with the stack,
+        # rather than the implicit never-expiring group Lambda would create on first invoke
+        # and leave orphaned on destroy.
+        query_log_group = logs.LogGroup(
+            self,
+            "QueryFunctionLogGroup",
+            retention=logs.RetentionDays.THREE_MONTHS,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
         query_lambda = _lambda.Function(
             self,
             "QueryFunction",
@@ -567,6 +603,7 @@ class GavilanChatbotStack(Stack):
             role=query_lambda_role,
             timeout=Duration.seconds(30),
             memory_size=256,
+            log_group=query_log_group,
             environment={
                 "KNOWLEDGE_BASE_ID": knowledge_base.attr_knowledge_base_id,
                 "GENERATION_MODEL_ID": generation_model_id,
@@ -623,6 +660,15 @@ class GavilanChatbotStack(Stack):
             path="/warm",
             methods=[apigwv2.HttpMethod.GET],
             integration=query_integration,
+        )
+        # Stage-level throttling on the default stage: the load-bearing cost-abuse control for
+        # this public, unauthenticated endpoint (it is why WAF was excluded). Applying it to the
+        # default route settings covers every route (/query and /warm); over the limit, API
+        # Gateway returns HTTP 429. Values come from config.
+        default_stage = http_api.default_stage.node.default_child
+        default_stage.default_route_settings = apigwv2.CfnStage.RouteSettingsProperty(
+            throttling_rate_limit=http_api_cfg["throttling_rate_limit"],
+            throttling_burst_limit=http_api_cfg["throttling_burst_limit"],
         )
 
         # --- Widget hosting: private S3 bucket + CloudFront (OAC) ----------------------

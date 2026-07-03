@@ -53,6 +53,14 @@ chunking:
 
 # --- Query path (Lambda + HTTP API) ---
 
+http_api:
+  # Stage-level request throttling, applied to EVERY route (/query and /warm). This is the
+  # load-bearing cost-abuse control for the public, unauthenticated endpoint that fans out to
+  # paid Bedrock calls - it is the stated reason WAF was excluded. Sized for a single library
+  # widget: a handful of requests/sec with a small burst. Clients get HTTP 429 over the limit.
+  throttling_rate_limit: 10     # steady-state requests per second across the stage
+  throttling_burst_limit: 20    # maximum burst (bucket capacity)
+
 request:
   # Max characters accepted for a user query (finding 2.6). Over this, the handler returns
   # HTTP 400 BEFORE any retrieval or guardrail call. This is the real server-side size control

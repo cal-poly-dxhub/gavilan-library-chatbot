@@ -1,4 +1,5 @@
 import copy
+import json
 import re
 
 import aws_cdk as core
@@ -8,6 +9,24 @@ from infra.config import load_config
 from infra.infra_stack import GavilanChatbotStack
 
 CONFIG = load_config()
+
+
+def _flatten_arn(value):
+    """Reconstruct an OSS policy string from a template value that may be a plain string or an
+    Fn::Join of literals + Ref/GetAtt tokens (role ARNs make the whole policy an Fn::Join).
+    Tokens are rendered as REF:/GETATT: markers so the JSON structure stays parseable."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        if "Fn::Join" in value:
+            return "".join(_flatten_arn(p) for p in value["Fn::Join"][1])
+        if "Fn::GetAtt" in value:
+            return "GETATT:" + value["Fn::GetAtt"][0]
+        if "Ref" in value:
+            return "REF:" + value["Ref"]
+    if isinstance(value, list):
+        return "".join(_flatten_arn(p) for p in value)
+    return str(value)
 
 
 def _template():
@@ -64,6 +83,51 @@ def test_vector_collection_and_policies_created():
     # Encryption + network policies.
     template.resource_count_is("AWS::OpenSearchServerless::SecurityPolicy", 2)
     template.resource_count_is("AWS::OpenSearchServerless::AccessPolicy", 1)
+
+
+def _oss_policy(template, policy_type):
+    """The parsed policy document of the single OSS SecurityPolicy of a given type."""
+    for res in template.find_resources("AWS::OpenSearchServerless::SecurityPolicy").values():
+        if res["Properties"]["Type"] == policy_type:
+            return json.loads(_flatten_arn(res["Properties"]["Policy"]))
+    raise AssertionError(f"no {policy_type} security policy")
+
+
+def test_network_policy_exposes_collection_only_not_dashboard():
+    # finding 1.7: nothing uses OpenSearch Dashboards, so only the collection endpoint is
+    # exposed to public access - no dashboard rule.
+    template = _template()
+    policy = _oss_policy(template, "network")
+    resource_types = {r["ResourceType"] for stmt in policy for r in stmt["Rules"]}
+    assert resource_types == {"collection"}, resource_types
+
+
+def test_data_access_policy_grants_deploy_role_full_index_lifecycle():
+    # finding 1.4: the CloudFormation cfn-exec role (which actually creates/replaces/deletes
+    # the CfnIndex) must be a principal with the full index lifecycle, or cdk deploy/destroy
+    # fail on an authorization error.
+    template = _template()
+    ap = _one(template, "AWS::OpenSearchServerless::AccessPolicy")
+    policy = json.loads(_flatten_arn(ap["Properties"]["Policy"]))
+
+    deploy_stmts = [
+        stmt
+        for stmt in policy
+        if any("cfn-exec-role" in p for p in stmt["Principal"])
+    ]
+    assert len(deploy_stmts) == 1, [s["Principal"] for s in policy]
+    lifecycle = {
+        perm
+        for rule in deploy_stmts[0]["Rules"]
+        if rule["ResourceType"] == "index"
+        for perm in rule["Permission"]
+    }
+    assert {
+        "aoss:CreateIndex",
+        "aoss:UpdateIndex",
+        "aoss:DeleteIndex",
+        "aoss:DescribeIndex",
+    } <= lifecycle, lifecycle
 
 
 def test_vector_index_uses_configured_dimensions():
@@ -219,6 +283,38 @@ def test_generation_inference_and_query_limit_wired_to_lambda_env():
             }
         ),
     )
+
+
+def test_http_api_stage_throttled_from_config():
+    # finding 1.5: stage-level throttling (rate + burst from config) is the load-bearing
+    # cost-abuse control, applied to the default route settings so it covers every route.
+    template = _template()
+    template.has_resource_properties(
+        "AWS::ApiGatewayV2::Stage",
+        {
+            "DefaultRouteSettings": {
+                "ThrottlingRateLimit": CONFIG["http_api"]["throttling_rate_limit"],
+                "ThrottlingBurstLimit": CONFIG["http_api"]["throttling_burst_limit"],
+            }
+        },
+    )
+
+
+def test_query_lambda_has_explicit_log_group_with_retention_and_destroy():
+    # finding 1.6: an explicit, bounded-retention log group torn down with the stack, that the
+    # query function actually writes to (not the implicit never-expiring, orphaned-on-destroy one).
+    template = _template()
+    (fn,) = template.find_resources(
+        "AWS::Lambda::Function", {"Properties": {"Handler": "handler.lambda_handler"}}
+    ).values()
+    log_group_ref = fn["Properties"]["LoggingConfig"]["LogGroup"]["Ref"]
+
+    log_groups = template.find_resources("AWS::Logs::LogGroup")
+    assert log_group_ref in log_groups, log_group_ref
+    query_lg = log_groups[log_group_ref]
+    # Bounded retention (3 months = 90 days) and destroyed with the stack.
+    assert query_lg["Properties"]["RetentionInDays"] == 90
+    assert query_lg.get("DeletionPolicy") == "Delete"
 
 
 def test_query_lambda_has_its_own_role_distinct_from_kb_role():
