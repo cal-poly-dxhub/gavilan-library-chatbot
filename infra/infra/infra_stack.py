@@ -16,6 +16,7 @@ All changeable knobs come from the repo-root config.yaml
 
 """
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Dict
@@ -332,57 +333,129 @@ class GavilanChatbotStack(Stack):
         # The data source cannot be created before the KB exists.
         web_data_source.add_dependency(knowledge_base)
 
-        # --- Bedrock Guardrail --------------------------------------------------------
+        # --- Bedrock Guardrails: input screen + output backstop -----------------------
 
-        # Content filters + PII ONLY. Contextual grounding is deliberately excluded (AWS:
-        # unsupported for chatbot use cases, needs guardContent tagging); the system prompt
-        # already enforces hard grounding. No denied topics / word filters / automated
-        # reasoning. All strengths, actions, and messages come from config.yaml.
-        content_filters = [
-            bedrock.CfnGuardrail.ContentFilterConfigProperty(
-                type=f["type"],
-                input_strength=f["input_strength"],
-                output_strength=f["output_strength"],
-            )
+        # Two guardrails (see docs/audit-resolutions.md 2.1).
+        #   INPUT guardrail  - applied via ApplyGuardrail(source=INPUT) on the bare query in
+        #                      the handler, before retrieval. Content filters + prompt-attack
+        #                      BLOCK; all PII ANONYMIZE (mask-and-proceed).
+        #   OUTPUT guardrail - attached to Converse. Content filters on the answer only
+        #                      (input strengths NONE so the <context> is untouched), no PII.
+
+        # Canonical definitions of each guardrail. These drive BOTH the CfnGuardrail props
+        # and the version-description hash, so the hash covers exactly what is deployed and
+        # any config change forces a new published version (finding 1.1).
+        input_filters_def = [
+            {
+                "type": f["type"],
+                "inputStrength": f["input_strength"],
+                "outputStrength": f["output_strength"],
+            }
             for f in guardrail_cfg["content_filters"]
         ]
-        # Flatten the per-action PII groups into one entity list (action applies to both
-        # input and output).
-        pii_entities = [
-            bedrock.CfnGuardrail.PiiEntityConfigProperty(type=entity, action=group["action"])
-            for group in guardrail_cfg["pii_entities"]
-            for entity in group["types"]
+        # Output guardrail: input side OFF (NONE) so the <context> in the user message is
+        # never screened; PROMPT_ATTACK is input-only and is dropped entirely.
+        output_filters_def = [
+            {"type": f["type"], "inputStrength": "NONE", "outputStrength": f["output_strength"]}
+            for f in guardrail_cfg["content_filters"]
+            if f["type"] != "PROMPT_ATTACK"
+        ]
+        # Input screen PII: every entity ANONYMIZE (mask), so a masked query always proceeds
+        # and the mask-vs-block decision is unambiguous.
+        input_pii_def = [
+            {"type": entity, "action": "ANONYMIZE"}
+            for entity in guardrail_cfg["pii_anonymize_entities"]
         ]
 
-        guardrail = bedrock.CfnGuardrail(
+        input_guardrail_def = {
+            "name": guardrail_cfg["input_name"],
+            "contentFilters": input_filters_def,
+            "piiEntities": input_pii_def,
+            "blockedInputMessaging": guardrail_cfg["blocked_input_messaging"],
+            "blockedOutputsMessaging": guardrail_cfg["blocked_outputs_messaging"],
+        }
+        output_guardrail_def = {
+            "name": guardrail_cfg["output_name"],
+            "contentFilters": output_filters_def,
+            "blockedInputMessaging": guardrail_cfg["blocked_input_messaging"],
+            "blockedOutputsMessaging": guardrail_cfg["blocked_outputs_messaging"],
+        }
+
+        def _config_hash(payload: Dict[str, Any]) -> str:
+            return hashlib.sha256(
+                json.dumps(payload, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:12]
+
+        def _content_filters(defs):
+            return [
+                bedrock.CfnGuardrail.ContentFilterConfigProperty(
+                    type=f["type"],
+                    input_strength=f["inputStrength"],
+                    output_strength=f["outputStrength"],
+                )
+                for f in defs
+            ]
+
+        input_guardrail = bedrock.CfnGuardrail(
             self,
-            "ContentGuardrail",
-            name=guardrail_cfg["name"],
+            "InputGuardrail",
+            name=input_guardrail_def["name"],
             description=(
-                "Content filters + PII for the Gavilan Library chatbot. No contextual "
-                "grounding (unsupported for chatbot use); grounding is enforced by the "
-                "system prompt."
+                "Input screen for the Gavilan Library chatbot, applied via "
+                "ApplyGuardrail(source=INPUT) on the bare user query before retrieval: "
+                "content filters + prompt-attack BLOCK, all PII ANONYMIZE."
             ),
-            blocked_input_messaging=guardrail_cfg["blocked_input_messaging"],
-            blocked_outputs_messaging=guardrail_cfg["blocked_outputs_messaging"],
+            blocked_input_messaging=input_guardrail_def["blockedInputMessaging"],
+            blocked_outputs_messaging=input_guardrail_def["blockedOutputsMessaging"],
             content_policy_config=bedrock.CfnGuardrail.ContentPolicyConfigProperty(
-                filters_config=content_filters,
+                filters_config=_content_filters(input_guardrail_def["contentFilters"]),
             ),
             sensitive_information_policy_config=(
                 bedrock.CfnGuardrail.SensitiveInformationPolicyConfigProperty(
-                    pii_entities_config=pii_entities,
+                    pii_entities_config=[
+                        bedrock.CfnGuardrail.PiiEntityConfigProperty(
+                            type=e["type"], action=e["action"]
+                        )
+                        for e in input_guardrail_def["piiEntities"]
+                    ],
                 )
             ),
         )
 
-        # A numbered version is what the Lambda attaches at runtime. DRAFT would also work
-        # (the Converse guardrailVersion accepts DRAFT or a number), but a published version
-        # is immutable/stable, so pin the Lambda to one.
-        guardrail_version = bedrock.CfnGuardrailVersion(
+        # Output backstop: content filters ONLY, output side. No sensitive-information policy
+        # (retrieved library info is public; masking the answer would re-break contact answers).
+        output_guardrail = bedrock.CfnGuardrail(
             self,
-            "ContentGuardrailVersion",
-            guardrail_identifier=guardrail.attr_guardrail_id,
-            description="Immutable version attached to the query Lambda at runtime.",
+            "OutputGuardrail",
+            name=output_guardrail_def["name"],
+            description=(
+                "Output backstop for the Gavilan Library chatbot, attached to Converse: "
+                "content filters on the generated answer only (input strengths NONE, no PII)."
+            ),
+            blocked_input_messaging=output_guardrail_def["blockedInputMessaging"],
+            blocked_outputs_messaging=output_guardrail_def["blockedOutputsMessaging"],
+            content_policy_config=bedrock.CfnGuardrail.ContentPolicyConfigProperty(
+                filters_config=_content_filters(output_guardrail_def["contentFilters"]),
+            ),
+        )
+
+        # Numbered, immutable versions the Lambda pins to. The description carries a content
+        # hash of the resolved guardrail config: CfnGuardrailVersion has no other property
+        # that changes when config.yaml changes, so without this a guardrail edit updates the
+        # DRAFT but never publishes a new version and the Lambda stays on the stale one
+        # (finding 1.1). Chose hashing over pinning to DRAFT: DRAFT is mutable with no
+        # immutability, rollback, or reproducibility.
+        input_guardrail_version = bedrock.CfnGuardrailVersion(
+            self,
+            "InputGuardrailVersion",
+            guardrail_identifier=input_guardrail.attr_guardrail_id,
+            description=f"input config-{_config_hash(input_guardrail_def)}",
+        )
+        output_guardrail_version = bedrock.CfnGuardrailVersion(
+            self,
+            "OutputGuardrailVersion",
+            guardrail_identifier=output_guardrail.attr_guardrail_id,
+            description=f"output config-{_config_hash(output_guardrail_def)}",
         )
 
         # --- Query path: Lambda + HTTP API --------------------------------------------
@@ -420,11 +493,15 @@ class GavilanChatbotStack(Stack):
                 resources=[generation_model_arn],
             )
         )
-        # Apply the guardrail on the Converse call (required in addition to InvokeModel).
+        # ApplyGuardrail on BOTH guardrails: the standalone input screen (source=INPUT) and
+        # the guardrail attached to the Converse call both require this action on their ARN.
         query_lambda_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["bedrock:ApplyGuardrail"],
-                resources=[guardrail.attr_guardrail_arn],
+                resources=[
+                    input_guardrail.attr_guardrail_arn,
+                    output_guardrail.attr_guardrail_arn,
+                ],
             )
         )
 
@@ -442,9 +519,12 @@ class GavilanChatbotStack(Stack):
                 "GENERATION_MODEL_ID": generation_cfg["model_id"],
                 "NUMBER_OF_RESULTS": str(retrieval_cfg["number_of_results"]),
                 "BEDROCK_REGION": self.region,
-                # Guardrail attached to the Converse call at runtime.
-                "GUARDRAIL_ID": guardrail.attr_guardrail_id,
-                "GUARDRAIL_VERSION": guardrail_version.attr_version,
+                # Input screen (ApplyGuardrail source=INPUT, pre-retrieval) + output backstop
+                # (attached to Converse). Each pins to its own published numbered version.
+                "INPUT_GUARDRAIL_ID": input_guardrail.attr_guardrail_id,
+                "INPUT_GUARDRAIL_VERSION": input_guardrail_version.attr_version,
+                "OUTPUT_GUARDRAIL_ID": output_guardrail.attr_guardrail_id,
+                "OUTPUT_GUARDRAIL_VERSION": output_guardrail_version.attr_version,
                 "GUARDRAIL_TRACE": guardrail_cfg.get("trace", "enabled"),
             },
         )
