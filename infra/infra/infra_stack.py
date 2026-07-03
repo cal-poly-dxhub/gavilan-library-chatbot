@@ -460,10 +460,7 @@ class GavilanChatbotStack(Stack):
 
         # --- Query path: Lambda + HTTP API --------------------------------------------
 
-        generation_model_arn = (
-            f"arn:{self.partition}:bedrock:{self.region}"
-            f"::foundation-model/{generation_cfg['model_id']}"
-        )
+        generation_model_id = generation_cfg["model_id"]
 
         # The Lambda gets its OWN execution role, DISTINCT from the KB execution role.
         # Basic execution (CloudWatch Logs) via the managed policy; Bedrock permissions
@@ -486,13 +483,68 @@ class GavilanChatbotStack(Stack):
                 resources=[knowledge_base.attr_knowledge_base_arn],
             )
         )
-        # Invoke the generation model (Converse maps to the InvokeModel action).
-        query_lambda_role.add_to_policy(
-            iam.PolicyStatement(
-                actions=["bedrock:InvokeModel"],
-                resources=[generation_model_arn],
+        # Invoke the generation model (Converse maps to bedrock:InvokeModel*). Modern Claude
+        # models are invoked through a CROSS-REGION INFERENCE PROFILE (a geographic-prefixed
+        # id like "us.anthropic..."), which needs a different IAM shape than a bare on-demand
+        # foundation-model id (finding 1.2). Branch on the id form so a bare id still works:
+        #   - profile: InvokeModel* on the account+region-scoped inference-profile ARN PLUS
+        #     the foundation-model ARNs in the source region (this stack's region) and every
+        #     destination region the profile routes to; then read access to profile metadata.
+        #   - bare id: InvokeModel on the single region-scoped foundation-model ARN.
+        # Account/region come from Stack tokens (self.account/self.region), so nothing is
+        # hardcoded and one-click deploy stays region-agnostic.
+        _GEO_PREFIXES = ("us", "eu", "apac", "us-gov")
+        _head = generation_model_id.split(".", 1)[0]
+        is_inference_profile = "." in generation_model_id and _head in _GEO_PREFIXES
+
+        if is_inference_profile:
+            # Underlying foundation-model id = profile id minus the geographic prefix.
+            base_model_id = generation_model_id.split(".", 1)[1]
+            inference_profile_arn = (
+                f"arn:{self.partition}:bedrock:{self.region}:{self.account}"
+                f":inference-profile/{generation_model_id}"
             )
-        )
+            # Source region = this stack's region. Destination regions the profile routes to
+            # cannot be enumerated without hardcoding, so use a region wildcard on the same
+            # (single) model id - the AWS-recommended grant for cross-region inference.
+            source_region_model_arn = (
+                f"arn:{self.partition}:bedrock:{self.region}::foundation-model/{base_model_id}"
+            )
+            routed_region_model_arn = (
+                f"arn:{self.partition}:bedrock:*::foundation-model/{base_model_id}"
+            )
+            query_lambda_role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=["bedrock:InvokeModel*"],
+                    resources=[
+                        inference_profile_arn,
+                        source_region_model_arn,
+                        routed_region_model_arn,
+                    ],
+                )
+            )
+            # Resolve the profile's metadata/routing at runtime. ListInferenceProfiles has no
+            # resource-level scoping (must be "*"); GetInferenceProfile is read-only metadata.
+            query_lambda_role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=[
+                        "bedrock:GetInferenceProfile",
+                        "bedrock:ListInferenceProfiles",
+                    ],
+                    resources=["*"],
+                )
+            )
+        else:
+            generation_model_arn = (
+                f"arn:{self.partition}:bedrock:{self.region}"
+                f"::foundation-model/{generation_model_id}"
+            )
+            query_lambda_role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=["bedrock:InvokeModel"],
+                    resources=[generation_model_arn],
+                )
+            )
         # ApplyGuardrail on BOTH guardrails: the standalone input screen (source=INPUT) and
         # the guardrail attached to the Converse call both require this action on their ARN.
         query_lambda_role.add_to_policy(
@@ -516,7 +568,7 @@ class GavilanChatbotStack(Stack):
             memory_size=256,
             environment={
                 "KNOWLEDGE_BASE_ID": knowledge_base.attr_knowledge_base_id,
-                "GENERATION_MODEL_ID": generation_cfg["model_id"],
+                "GENERATION_MODEL_ID": generation_model_id,
                 "NUMBER_OF_RESULTS": str(retrieval_cfg["number_of_results"]),
                 "BEDROCK_REGION": self.region,
                 # Input screen (ApplyGuardrail source=INPUT, pre-retrieval) + output backstop

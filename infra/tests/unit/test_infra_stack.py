@@ -22,6 +22,39 @@ def _one(template, res_type):
     return res
 
 
+def _join_literals(value):
+    """Concatenate the string fragments of an ARN, whether it is a plain string or an
+    Fn::Join of literals + Ref tokens (the token dicts are dropped)."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and "Fn::Join" in value:
+        return "".join(p for p in value["Fn::Join"][1] if isinstance(p, str))
+    return ""
+
+
+def _join_refs(value):
+    """The set of Ref token names (e.g. AWS::AccountId) inside an Fn::Join ARN."""
+    refs = set()
+    if isinstance(value, dict) and "Fn::Join" in value:
+        for p in value["Fn::Join"][1]:
+            if isinstance(p, dict) and "Ref" in p:
+                refs.add(p["Ref"])
+    return refs
+
+
+def _query_role_statements(template):
+    """The IAM policy statements attached to the query Lambda's execution role."""
+    (fn,) = template.find_resources(
+        "AWS::Lambda::Function", {"Properties": {"Handler": "handler.lambda_handler"}}
+    ).values()
+    role_id = fn["Properties"]["Role"]["Fn::GetAtt"][0]
+    statements = []
+    for pol in template.find_resources("AWS::IAM::Policy").values():
+        if any(r.get("Ref") == role_id for r in pol["Properties"].get("Roles", [])):
+            statements.extend(pol["Properties"]["PolicyDocument"]["Statement"])
+    return statements
+
+
 def test_vector_collection_and_policies_created():
     template = _template()
     template.has_resource_properties(
@@ -171,7 +204,9 @@ def test_query_lambda_has_its_own_role_distinct_from_kb_role():
     assert "lambda.amazonaws.com" in assumed_services(roles[query_role_id])
     assert query_role_id != kb_roles[0]
 
-    # The query role grants Retrieve + InvokeModel but NOT the KB's aoss actions.
+    # The query role grants Retrieve + InvokeModel* (InvokeModel* because the generation
+    # model is invoked through a cross-region inference profile, see finding 1.2) but NOT the
+    # KB's aoss actions.
     template.has_resource_properties(
         "AWS::IAM::Policy",
         assertions.Match.object_like(
@@ -183,7 +218,7 @@ def test_query_lambda_has_its_own_role_distinct_from_kb_role():
                                 {"Action": "bedrock:Retrieve"}
                             ),
                             assertions.Match.object_like(
-                                {"Action": "bedrock:InvokeModel"}
+                                {"Action": "bedrock:InvokeModel*"}
                             ),
                         ]
                     )
@@ -191,6 +226,92 @@ def test_query_lambda_has_its_own_role_distinct_from_kb_role():
                 "Roles": [{"Ref": query_role_id}],
             }
         ),
+    )
+
+
+# --- Generation model grant: cross-region inference profile (finding 1.2) -------
+
+
+def test_generation_grant_uses_inference_profile_arns():
+    template = _template()
+    profile_id = CONFIG["generation"]["model_id"]  # us.anthropic...
+    assert profile_id.startswith("us."), "test assumes a us. inference-profile id in config"
+    base_id = profile_id.split(".", 1)[1]  # anthropic... (geo prefix stripped)
+
+    invoke = [s for s in _query_role_statements(template) if s.get("Action") == "bedrock:InvokeModel*"]
+    assert len(invoke) == 1, invoke
+    resources = invoke[0]["Resource"]
+    # Exactly three ARNs: the inference profile + a source-region and a routed-region model.
+    assert isinstance(resources, list) and len(resources) == 3, resources
+
+    literals = [_join_literals(r) for r in resources]
+    refs = [_join_refs(r) for r in resources]
+
+    # 1) inference-profile ARN: account + region scoped, keeps the geo-prefixed profile id.
+    profile = [(lit, rf) for lit, rf in zip(literals, refs) if "inference-profile/" in lit]
+    assert len(profile) == 1, literals
+    prof_lit, prof_refs = profile[0]
+    assert prof_lit.endswith(f":inference-profile/{profile_id}"), prof_lit
+    assert {"AWS::Partition", "AWS::Region", "AWS::AccountId"} <= prof_refs, prof_refs
+
+    # 2/3) foundation-model ARNs: the BASE model id (geo prefix stripped), empty account.
+    fms = [(lit, rf) for lit, rf in zip(literals, refs) if "foundation-model/" in lit]
+    assert len(fms) == 2, literals
+    for fm_lit, fm_refs in fms:
+        assert fm_lit.endswith(f"foundation-model/{base_id}"), fm_lit
+        assert f"foundation-model/{profile_id}" not in fm_lit  # NOT the geo-prefixed id
+        assert "AWS::AccountId" not in fm_refs, fm_lit  # foundation-model ARNs have no account
+
+    # One FM ARN pins this stack's region (source); the other is region-wildcard (destinations).
+    source = [lit for lit, rf in fms if "AWS::Region" in rf]
+    wildcard = [lit for lit, rf in fms if "AWS::Region" not in rf and ":bedrock:*::" in lit]
+    assert len(source) == 1, fms
+    assert len(wildcard) == 1, fms
+
+
+def test_generation_grant_includes_inference_profile_read_access():
+    template = _template()
+    read = [
+        s for s in _query_role_statements(template)
+        if isinstance(s.get("Action"), list)
+        and set(s["Action"]) == {"bedrock:GetInferenceProfile", "bedrock:ListInferenceProfiles"}
+    ]
+    assert len(read) == 1, "expected a single GetInferenceProfile/ListInferenceProfiles statement"
+    # ListInferenceProfiles has no resource-level scoping, so this statement must be "*".
+    assert read[0]["Resource"] == "*"
+
+
+def test_query_role_has_no_bare_invoke_model_with_profile_config():
+    # With a profile id, the grant is InvokeModel* only - never a bare on-demand InvokeModel
+    # statement on the query role (the KB role's InvokeModel on the embedding model is separate).
+    template = _template()
+    bare = [s for s in _query_role_statements(template) if s.get("Action") == "bedrock:InvokeModel"]
+    assert bare == [], bare
+
+
+def test_bare_on_demand_model_id_falls_back_to_single_foundation_model_grant():
+    # Backward-compat branch: a bare id (no geo prefix) grants InvokeModel on ONE region-scoped
+    # foundation-model ARN, with no inference-profile ARN and no profile-read statement.
+    mutated = copy.deepcopy(CONFIG)
+    mutated["generation"]["model_id"] = "anthropic.claude-3-5-haiku-20241022-v1:0"
+    app = core.App()
+    stack = GavilanChatbotStack(app, "BareModelStack", config=mutated)
+    template = assertions.Template.from_stack(stack)
+    stmts = _query_role_statements(template)
+
+    invoke = [s for s in stmts if s.get("Action") == "bedrock:InvokeModel"]
+    assert len(invoke) == 1, invoke
+    resource = invoke[0]["Resource"]
+    # A single resource renders as a scalar Fn::Join, not a list.
+    assert not isinstance(resource, list), resource
+    lit = _join_literals(resource)
+    assert "inference-profile" not in lit, lit
+    assert lit.endswith("::foundation-model/anthropic.claude-3-5-haiku-20241022-v1:0"), lit
+    # No inference-profile machinery on the bare-id path.
+    assert not any(s.get("Action") == "bedrock:InvokeModel*" for s in stmts)
+    assert not any(
+        isinstance(s.get("Action"), list) and "bedrock:GetInferenceProfile" in s["Action"]
+        for s in stmts
     )
 
 
