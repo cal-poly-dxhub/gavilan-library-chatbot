@@ -198,6 +198,29 @@ def test_query_and_warm_are_the_only_routes_and_share_one_lambda_integration():
         assert integration_id in str(target), target
 
 
+def test_generation_inference_and_query_limit_wired_to_lambda_env():
+    # Findings 3.4 + 2.6: the inference knobs and query length cap reach the Lambda from
+    # config.yaml (so edits take effect at runtime, not just on paper).
+    template = _template()
+    template.has_resource_properties(
+        "AWS::Lambda::Function",
+        assertions.Match.object_like(
+            {
+                "Handler": "handler.lambda_handler",
+                "Environment": {
+                    "Variables": assertions.Match.object_like(
+                        {
+                            "GENERATION_MAX_TOKENS": str(CONFIG["generation"]["max_tokens"]),
+                            "GENERATION_TEMPERATURE": str(CONFIG["generation"]["temperature"]),
+                            "MAX_QUERY_CHARS": str(CONFIG["request"]["max_query_chars"]),
+                        }
+                    )
+                },
+            }
+        ),
+    )
+
+
 def test_query_lambda_has_its_own_role_distinct_from_kb_role():
     template = _template()
     roles = template.find_resources("AWS::IAM::Role")

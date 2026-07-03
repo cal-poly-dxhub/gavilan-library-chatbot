@@ -53,6 +53,14 @@ chunking:
 
 # --- Query path (Lambda + HTTP API) ---
 
+request:
+  # Max characters accepted for a user query (finding 2.6). Over this, the handler returns
+  # HTTP 400 BEFORE any retrieval or guardrail call. This is the real server-side size control
+  # (the widget maxlength is advisory UX only); the platform limits (API GW 10MB / Lambda 6MB)
+  # are far too high to guard against cost-amplifying huge pastes. A library FAQ question is
+  # short, so 2000 chars is already generous.
+  max_query_chars: 2000
+
 retrieval:
   # Number of KB chunks to retrieve per query and feed to generation.
   number_of_results: 5
@@ -61,6 +69,11 @@ generation:
   # Bedrock-hosted Claude model for answer generation, invoked via a CROSS-REGION INFERENCE
   # PROFILE.
   model_id: us.anthropic.claude-3-5-haiku-20241022-v1:0
+  # Converse inference knobs (finding 3.4). A factual FAQ bot wants short, direct, low-variance
+  # answers: cap the output length and keep temperature low. Range picked per the audit
+  # (max_tokens ~500-700, temperature 0-0.3).
+  max_tokens: 600
+  temperature: 0.2
 
 # --- Bedrock Guardrails ---
 #

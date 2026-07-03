@@ -33,6 +33,9 @@ os.environ.setdefault("KNOWLEDGE_BASE_ID", "KB123456")
 os.environ.setdefault("GENERATION_MODEL_ID", "anthropic.claude-3-5-haiku-20241022-v1:0")
 os.environ.setdefault("BEDROCK_REGION", "us-west-2")
 os.environ.setdefault("NUMBER_OF_RESULTS", "5")
+os.environ.setdefault("GENERATION_MAX_TOKENS", "600")
+os.environ.setdefault("GENERATION_TEMPERATURE", "0.2")
+os.environ.setdefault("MAX_QUERY_CHARS", "2000")
 # Guardrail wiring (as the CDK stack would set it): a separate input screen and output backstop.
 os.environ.setdefault("INPUT_GUARDRAIL_ID", "gr-input-1")
 os.environ.setdefault("INPUT_GUARDRAIL_VERSION", "3")
@@ -191,6 +194,22 @@ def _retrieved_query(agent):
     return agent.calls[0]["retrievalQuery"]["text"]
 
 
+class _Boom(Exception):
+    """A stand-in for an AWS/runtime fault (ThrottlingException, ValidationException, etc.)."""
+
+
+def _raise_boom(*args, **kwargs):
+    raise _Boom("simulated AWS failure")
+
+
+def _last_json_log(capsys, event_name):
+    """The last stdout line carrying a given structured-log event, parsed."""
+    out = capsys.readouterr().out
+    lines = [ln for ln in out.splitlines() if event_name in ln]
+    assert lines, f"expected a {event_name!r} log line; got:\n{out}"
+    return json.loads(lines[-1])
+
+
 def test_real_system_prompt_loaded_from_file():
     # The real prompt is loaded from app/system_prompt.md, not a placeholder string.
     assert handler.SYSTEM_PROMPT.startswith("<role>")
@@ -319,6 +338,75 @@ def test_missing_query_returns_400(monkeypatch):
     resp = handler.lambda_handler(event, None)
     assert resp["statusCode"] == 400
     assert "error" in json.loads(resp["body"])
+
+
+# --- Input validation: type + length (findings 3.2, 2.6) -----------------------
+
+
+def test_non_string_query_returns_400_not_500(monkeypatch):
+    # {"query": 123} is truthy JSON but not a string: a clean 400, never a downstream 500
+    # (finding 3.2). No AWS call is made.
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": 123})), None)
+
+    assert resp["statusCode"] == 400
+    assert "error" in json.loads(resp["body"])
+    assert bedrock.apply_guardrail_calls == []
+    assert agent.calls == []
+
+
+def test_blank_whitespace_query_returns_400(monkeypatch):
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "   "})), None)
+
+    assert resp["statusCode"] == 400
+    assert bedrock.apply_guardrail_calls == []
+
+
+def test_query_is_stripped_before_screening(monkeypatch):
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    handler.lambda_handler(_payload_v2_event(json.dumps({"query": "  hours?  "})), None)
+
+    # The stripped query is what gets screened and retrieved, not the padded raw value.
+    assert bedrock.apply_guardrail_calls[0]["content"] == [{"text": {"text": "hours?"}}]
+    assert _retrieved_query(agent) == "hours?"
+
+
+def test_over_length_query_returns_400_before_any_aws_call(monkeypatch):
+    # finding 2.6: an oversized query is rejected (400) BEFORE any retrieval or guardrail call.
+    monkeypatch.setattr(handler, "MAX_QUERY_CHARS", 10)
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "a" * 11})), None
+    )
+
+    assert resp["statusCode"] == 400
+    assert "error" in json.loads(resp["body"])
+    # No guardrail screen, no retrieval, no generation - the whole point of the early cap.
+    assert bedrock.apply_guardrail_calls == []
+    assert agent.calls == []
+    assert bedrock.converse_calls == []
+
+
+def test_query_exactly_at_the_limit_is_allowed(monkeypatch):
+    # Strictly greater than the cap is rejected; exactly at the cap is fine.
+    monkeypatch.setattr(handler, "MAX_QUERY_CHARS", 10)
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "a" * 10})), None
+    )
+
+    assert resp["statusCode"] == 200
 
 
 def test_base64_encoded_body(monkeypatch):
@@ -539,23 +627,63 @@ def test_output_guardrail_block_returns_blocked_message(monkeypatch):
     assert body["sources"] == []
 
 
-def test_output_guardrail_assessment_is_logged(monkeypatch, capsys):
+def test_converse_sets_inference_config_from_config(monkeypatch):
+    # finding 3.4: Converse carries an inferenceConfig with the configured maxTokens/temperature.
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
+
+    ic = bedrock.converse_calls[0]["inferenceConfig"]
+    assert ic["maxTokens"] == handler.GENERATION_MAX_TOKENS
+    assert ic["temperature"] == handler.GENERATION_TEMPERATURE
+    # sane bounds for a factual FAQ bot: bounded output, low variance.
+    assert isinstance(ic["maxTokens"], int) and ic["maxTokens"] > 0
+    assert 0.0 <= ic["temperature"] <= 1.0
+
+
+def test_output_guardrail_assessment_is_logged_reduced(monkeypatch, capsys):
+    # finding 3.3: the OUTPUT guardrail log carries types/actions/counts + stopReason only,
+    # NEVER the raw model output or matched text from the Converse trace.
+    raw_output = "RAW MODEL ANSWER THAT MUST NOT BE LOGGED"
+    trace = {
+        "guardrail": {
+            # modelOutput carries the raw generated answer - must not be logged verbatim.
+            "modelOutput": [raw_output],
+            # Real Converse shape: outputAssessments is a map of guardrail-id -> LIST.
+            "outputAssessments": {
+                "gr-output-1": [
+                    {
+                        "contentPolicy": {
+                            "filters": [
+                                {"type": "HATE", "confidence": "HIGH", "action": "BLOCKED"}
+                            ]
+                        }
+                    }
+                ]
+            },
+        }
+    }
     agent = FakeAgentRuntime()
     bedrock = FakeBedrockRuntime(
-        stop_reason="guardrail_intervened",
-        trace={"guardrail": {"outputAssessment": {"gr-output-1": {}}}},
+        answer="blocked message", stop_reason="guardrail_intervened", trace=trace
     )
     _wire(monkeypatch, agent, bedrock)
 
     handler.lambda_handler(_payload_v2_event(json.dumps({"query": "x"})), None)
 
-    logged = capsys.readouterr().out
-    # A single structured assessment line, with the outcome, on every generation.
-    assert "guardrail_assessment" in logged
-    assert "guardrail_intervened" in logged
-    payload = json.loads([ln for ln in logged.splitlines() if "guardrail_assessment" in ln][-1])
+    line = None
+    for ln in capsys.readouterr().out.splitlines():
+        if "guardrail_assessment" in ln:
+            line = ln
+    assert line is not None
+    payload = json.loads(line)
     assert payload["intervened"] is True
-    assert payload["assessment"] == {"outputAssessment": {"gr-output-1": {}}}
+    assert payload["stop_reason"] == "guardrail_intervened"
+    # The content filter type + action survives (the tuning signal)...
+    assert {"type": "HATE", "action": "BLOCKED"} in payload["assessment"]["content_filters"]
+    # ...but the raw model output is nowhere in the log line.
+    assert raw_output not in line
 
 
 # --- Warm path (GET /warm): retrieval-only pre-warm (finding 1.3) ---------------
@@ -599,3 +727,69 @@ def test_query_path_still_dispatches_when_path_is_query(monkeypatch):
     assert "answer" in json.loads(resp["body"])
     assert len(bedrock.converse_calls) == 1
     assert len(bedrock.apply_guardrail_calls) == 1
+
+
+# --- Exception handling: clean, staged errors (finding 3.1) ---------------------
+
+
+def _assert_clean_error(resp, capsys, expected_stage):
+    assert resp["statusCode"] == 502
+    body = json.loads(resp["body"])
+    assert "error" in body and "answer" not in body  # a clean JSON error, not a partial answer
+    rec = _last_json_log(capsys, "query_failed")
+    assert rec["stage"] == expected_stage
+    assert "_Boom" in rec["error"]  # type + message, not a raw traceback
+
+
+def test_input_guardrail_failure_returns_clean_staged_error(monkeypatch, capsys):
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    monkeypatch.setattr(bedrock, "apply_guardrail", _raise_boom)
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
+
+    _assert_clean_error(resp, capsys, "input_guardrail")
+    # Nothing downstream of the failed stage ran.
+    assert agent.calls == []
+    assert bedrock.converse_calls == []
+
+
+def test_retrieve_failure_returns_clean_staged_error(monkeypatch, capsys):
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    monkeypatch.setattr(agent, "retrieve", _raise_boom)
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
+
+    _assert_clean_error(resp, capsys, "retrieve")
+    # The input screen ran (clean); generation never did.
+    assert len(bedrock.apply_guardrail_calls) == 1
+    assert bedrock.converse_calls == []
+
+
+def test_generate_failure_returns_clean_staged_error(monkeypatch, capsys):
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    monkeypatch.setattr(bedrock, "converse", _raise_boom)
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
+
+    _assert_clean_error(resp, capsys, "generate")
+    # Retrieval did run (the failure was at generation).
+    assert len(agent.calls) == 1
+
+
+def test_warm_failure_returns_clean_error_not_opaque(monkeypatch, capsys):
+    # finding 3.1: /warm shouldn't be the one raw route left. A retrieve fault -> clean 502,
+    # not an opaque unhandled 500. The widget ignores it anyway (fire-and-forget).
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    monkeypatch.setattr(agent, "retrieve", _raise_boom)
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_warm_event(), None)
+
+    assert resp["statusCode"] == 502
+    body = json.loads(resp["body"])
+    assert "error" in body and body.get("warmed") is None
+    rec = _last_json_log(capsys, "query_failed")
+    assert rec["stage"] == "warm"

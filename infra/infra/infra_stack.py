@@ -64,6 +64,7 @@ class GavilanChatbotStack(Stack):
         hnsw = vs_cfg["hnsw"]
         web_cfg = config["data_source"]["web_crawler"]
         chunking_cfg = config["chunking"]
+        request_cfg = config["request"]
         retrieval_cfg = config["retrieval"]
         generation_cfg = config["generation"]
         guardrail_cfg = config["guardrail"]
@@ -571,6 +572,11 @@ class GavilanChatbotStack(Stack):
                 "GENERATION_MODEL_ID": generation_model_id,
                 "NUMBER_OF_RESULTS": str(retrieval_cfg["number_of_results"]),
                 "BEDROCK_REGION": self.region,
+                # Generation inference knobs (finding 3.4) + server-side query length cap
+                # (finding 2.6), wired from config.yaml so edits reach runtime.
+                "GENERATION_MAX_TOKENS": str(generation_cfg["max_tokens"]),
+                "GENERATION_TEMPERATURE": str(generation_cfg["temperature"]),
+                "MAX_QUERY_CHARS": str(request_cfg["max_query_chars"]),
                 # Input screen (ApplyGuardrail source=INPUT, pre-retrieval) + output backstop
                 # (attached to Converse). Each pins to its own published numbered version.
                 "INPUT_GUARDRAIL_ID": input_guardrail.attr_guardrail_id,
