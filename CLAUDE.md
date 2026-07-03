@@ -66,8 +66,11 @@ the KB `field_mapping` (defined once in `config.yaml` under `vector_store.fields
   stack as the backend (OAC has a cross-stack cyclical-dependency problem; one-click install
   wants one deploy). The stack outputs a ready-to-paste embed tag
   (`<script src="https://{cloudfront}/widget.js" data-api-url="https://{api}/query" defer></script>`)
-  plus the raw CloudFront domain and `/query` URL. Guardrails, WAF, and auth are NOT wired
-  yet. Structure:
+  plus the raw CloudFront domain and `/query` URL. It ALSO defines a Bedrock guardrail
+  (`CfnGuardrail` + `CfnGuardrailVersion`, content filters + PII, built from `config.yaml`)
+  and grants the query role `bedrock:ApplyGuardrail`. WAF and auth are NOT wired (WAF
+  excluded for v1: HTTP API can't take it directly, thin threat surface, throttling handles
+  cost-abuse; see below). Structure:
   - `app.py` — CDK app entrypoint; loads `config.yaml` and passes it to the stack
   - `infra/infra_stack.py` — the stack (`GavilanChatbotStack`); reads all knobs from config
   - `infra/config.py` — `load_config()`; resolves the repo-root `config.yaml` from `__file__`
@@ -96,7 +99,44 @@ the KB `field_mapping` (defined once in `config.yaml` under `vector_store.fields
     `sources` is deduplicated by uri, in retrieval order; passages with no resolvable source
     uri are omitted from `sources` (they still inform the answer); on empty retrieval
     `sources` is `[]` and the prompt tells the model to say it does not have the info.
-- `eval/` — eval harness (empty; planned): Q&A set + retrieval/faithfulness scoring
+  - **Contextual grounding is NOT usable here, and it was deliberately excluded.** AWS docs
+    state grounding does not support conversational/chatbot use cases; it also requires
+    `guardContent` message-tagging in Converse (a documented silent-failure trap: once any
+    guardContent block is present, grounding evaluates ONLY tagged blocks). The system prompt's
+    hard-grounding covers v1. If eval later shows the prompt isn't holding, revisit via the
+    standalone `ApplyGuardrail` API, not inline Converse tagging.
+  - **WAF cannot attach to HTTP API (v2).** WAF only attaches to REST API / CloudFront / ALB /
+    AppSync. Getting WAF on this API would require fronting it with a second CloudFront
+    distribution. Excluded for v1 (thin threat surface; API Gateway throttling handles the real
+    cost-abuse risk, native + free). Revisit only on a compliance mandate.
+  - **Guardrail needs `bedrock:ApplyGuardrail`** on the guardrail ARN alongside `InvokeModel`,
+    or it silently fails at runtime. The Lambda pins to a published numbered guardrail version;
+    live policy/message edits require a new version (or pointing the Lambda at `DRAFT`).
+- `eval/` — Bedrock RAG eval harness. SDK/boto3 operational tooling (NOT CDK); runs on
+  demand when an AWS account exists, against already-deployed infra. Coded + 43 tests, but
+  cannot RUN offline (retrieve-only needs account + deployed KB; generation eval also needs
+  the deployed bot).
+  - `dataset_loader.py` — reads human-authored Q&A CSV (columns: question, reference_answer,
+    optional source/notes) into `QAPair`s. reference_answer is the expected end-to-end ANSWER
+    (Bedrock `referenceResponses`), not expected passages.
+  - `runner.py` — shared, type-agnostic job runner both eval types reuse: upload JSONL to S3,
+    build/submit `create_evaluation_job`, poll to terminal status, locate results. Pure
+    `build_create_job_request()` is unit-tested offline.
+  - `format_retrieve.py` — retrieve-only formatter (chunking/retrieval evaluator). Points at
+    the live KB; metrics `Builtin.ContextCoverage` + `Builtin.ContextRelevance`.
+  - `format_generate.py` — retrieve-and-generate formatter (answer-quality evaluator,
+    BRING-YOUR-OWN-INFERENCE). Defines `CapturedOutput`/`RetrievedPassage`/`Citation` types;
+    metrics Correctness/Completeness/Faithfulness/Helpfulness/Harmfulness + citation metrics
+    only when citations present. Retrieved-passages key isolated as `RETRIEVED_PASSAGES_KEY`
+    (`retrievedPassages` vs `retrievedResults` unresolved offline; confirm at first R&G run).
+  - `capture_outputs.py` — STUB (`NotImplementedError`). Once the bot is deployed, POSTs each
+    question to the bot's `/query` endpoint and maps the response to `CapturedOutput`.
+  - `run_retrieve_eval.py` / `run_generate_eval.py` — entrypoints (load CSV -> format ->
+    upload -> submit); argparse CLIs.
+  - `eval_config.yaml` — eval-infra config (bucket, evaluator model, region, role, KB id,
+    `retrieve`/`generate` sections), SEPARATE from root `config.yaml`; TBD until account.
+  - `datasets/sample_qa.csv` — placeholder sample.
+  - `tests/` — offline unit tests; boto3 stubbed in sys.modules.
 - `frontend/` — embeddable JS widget (Shadow DOM, vanilla JS, dependency-free).
   - `widget.js` — the ONLY file shipped to users. Production-clean: it contains just
     the real request path and NO mock code, mock data, or mock branching. It reads its

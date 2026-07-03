@@ -24,6 +24,8 @@ AWS-native:
 
 ## Architecture
 
+![Architecture diagram](docs/architecture_diagram.png)
+
 Full design, decisions, and rationale: [`docs/architecture.md`](docs/architecture.md).
 
 ## Status
