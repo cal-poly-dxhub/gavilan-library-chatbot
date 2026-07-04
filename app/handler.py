@@ -9,7 +9,7 @@ Fronted by an API Gateway HTTP API (payload format 2.0) with two routes on this 
          (app/system_prompt.md), with the OUTPUT guardrail (content filters, answer side
          only) attached as a backstop.
   - GET /warm -> _handle_warm(): a retrieval-only pre-warm to wake OpenSearch Serverless
-      before the first real query (finding 1.3). No generation, no guardrail.
+      before the first real query. No generation, no guardrail.
 
 Wiring comes from env vars set by the CDK stack.
 
@@ -44,19 +44,18 @@ GENERATION_MODEL_ID = os.environ["GENERATION_MODEL_ID"]
 REGION = os.environ.get("BEDROCK_REGION") or os.environ.get("AWS_REGION")
 NUMBER_OF_RESULTS = int(os.environ.get("NUMBER_OF_RESULTS", "5"))
 
-# Generation inference knobs (finding 3.4), wired from config.yaml by the stack. Defaults are
-# a safety net for local runs without the env set; config.yaml is the source of truth.
+# Generation inference knobs, wired from config.yaml by the stack. Defaults are a safety net
+# for local runs without the env set; config.yaml is the source of truth.
 GENERATION_MAX_TOKENS = int(os.environ.get("GENERATION_MAX_TOKENS", "600"))
 GENERATION_TEMPERATURE = float(os.environ.get("GENERATION_TEMPERATURE", "0.2"))
 
-# Max characters accepted for a user query (finding 2.6). Over this -> HTTP 400, BEFORE any
-# retrieval or guardrail call. The real server-side size control; the widget maxlength is only
-# advisory UX, and the platform limits (API GW 10MB / Lambda 6MB) are far too high to protect.
+# Max characters accepted for a user query. Over this -> HTTP 400, BEFORE any retrieval or
+# guardrail call. The real server-side size control; the widget maxlength is only advisory UX,
+# and the platform limits (API GW 10MB / Lambda 6MB) are far too high to protect.
 MAX_QUERY_CHARS = int(os.environ.get("MAX_QUERY_CHARS", "2000"))
 
-# Two Bedrock guardrails, set by the CDK stack from config.yaml (see docs/audit-resolutions.md
-# 2.1). Either pair may be unset locally, in which case that screen is skipped rather than
-# failing:
+# Two Bedrock guardrails, set by the CDK stack from config.yaml. Either pair may be unset
+# locally, in which case that screen is skipped rather than failing:
 #   INPUT  - screened on the bare user query BEFORE retrieval via the ApplyGuardrail API
 #            (source=INPUT). PII is masked-and-proceeds; content/prompt-attack is blocked.
 #   OUTPUT - attached to the Converse call as a backstop on the generated answer only.
@@ -93,8 +92,8 @@ CONTEXT_TAG = "context"
 # Max characters of a passage surfaced as a source excerpt in the response.
 _EXCERPT_CHARS = 300
 
-# Warm path (finding 1.3). The widget fires GET /warm on page load to wake the OpenSearch
-# Serverless collection before the first real query. WARM_PATH is matched against the request
+# Warm path. The widget fires GET /warm on page load to wake the OpenSearch Serverless
+# collection before the first real query. WARM_PATH is matched against the request
 # path; _WARM_QUERY is a throwaway retrieval query (the goal is to spin OSS up, not to get
 # useful results).
 WARM_PATH = "/warm"
@@ -248,8 +247,8 @@ def _classify_input_assessment(response):
 def _reduce_assessments(assessments):
     """Privacy-safe summary of guardrail assessments for logging: policy/entity TYPES +
     actions + counts only, NEVER the raw matched text (item["match"] is the very PII/content
-    the guardrail exists to keep out of plaintext logs - finding 3.3). Shared by the input
-    screen and the output-backstop logging."""
+    the guardrail exists to keep out of plaintext logs). Shared by the input screen and the
+    output-backstop logging."""
     content_filters = []
     topics_blocked = 0
     words_blocked = 0
@@ -281,8 +280,8 @@ def _reduce_assessments(assessments):
 
 def _converse_trace_assessments(trace):
     """Collect the guardrail assessment objects out of a Converse response trace.guardrail,
-    ignoring modelOutput and any other raw-text fields (finding 3.3). inputAssessment is a
-    map of guardrail-id -> assessment; outputAssessments is a map of guardrail-id -> list of
+    ignoring modelOutput and any other raw-text fields. inputAssessment is a map of
+    guardrail-id -> assessment; outputAssessments is a map of guardrail-id -> list of
     assessments (verified against the installed bedrock-runtime Converse model)."""
     guardrail = (trace or {}).get("guardrail") or {}
     collected = []
@@ -360,7 +359,7 @@ def _log_guardrail_assessment(response):
     """Structured, PII-safe log of the OUTPUT guardrail outcome on every generation, so
     interventions are measurable for later tuning. Logs stopReason + a REDUCED assessment
     (types/actions/counts), never the raw trace - trace.guardrail carries modelOutput and
-    matched text, which must not land in plaintext logs (finding 3.3). -> CloudWatch Logs."""
+    matched text, which must not land in plaintext logs. -> CloudWatch Logs."""
     stop_reason = response.get("stopReason")
     print(
         json.dumps(
@@ -390,8 +389,8 @@ def generate(query, chunks):
         "modelId": GENERATION_MODEL_ID,
         "system": [{"text": SYSTEM_PROMPT}],
         "messages": [{"role": "user", "content": [{"text": user_text}]}],
-        # Short, direct, low-variance answers for a factual FAQ bot (finding 3.4). Verified
-        # key names/nesting against the installed bedrock-runtime Converse model.
+        # Short, direct, low-variance answers for a factual FAQ bot. The maxTokens/temperature
+        # key names and nesting match the bedrock-runtime Converse inferenceConfig shape.
         "inferenceConfig": {
             "maxTokens": GENERATION_MAX_TOKENS,
             "temperature": GENERATION_TEMPERATURE,
@@ -440,7 +439,7 @@ def _parse_body(event):
 
 def _extract_query(data):
     """The validated user query from a parsed request body, or None for a missing / non-string
-    / blank query. None yields the caller's clean 400 - never a downstream 500 (finding 3.2)."""
+    / blank query. None yields the caller's clean 400 - never a downstream 500."""
     if not isinstance(data, dict):
         return None
     query = data.get("query") or data.get("question")
@@ -481,10 +480,10 @@ _UPSTREAM_ERROR_MESSAGE = (
 
 
 def _error_response(stage, exc):
-    """Log a structured {event, stage, error} record and return a clean JSON error (finding
-    3.1). 502: an upstream Bedrock/OSS dependency failed. Logs the exception type + message
-    (not a raw traceback, and not the user query) so the failing stage is diagnosable without
-    leaking a stack trace to the caller."""
+    """Log a structured {event, stage, error} record and return a clean JSON error. 502: an
+    upstream Bedrock/OSS dependency failed. Logs the exception type + message (not a raw
+    traceback, and not the user query) so the failing stage is diagnosable without leaking a
+    stack trace to the caller."""
     print(
         json.dumps(
             {
@@ -509,7 +508,7 @@ def _handle_warm():
     collection (which scales to zero after ~10min idle) before the student's first real
     query. No generation and no guardrail input screen - there is no user query to screen,
     and OSS scale-to-zero is the dominant cold-start cost, so warming retrieval is the whole
-    point (finding 1.3). The Bedrock Converse path is deliberately left cold."""
+    point. The Bedrock Converse path is deliberately left cold."""
     try:
         retrieve(_WARM_QUERY)
     except Exception as exc:  # noqa: BLE001 - warm is fire-and-forget; return a clean error
@@ -523,9 +522,8 @@ def _handle_query(event):
     query = _extract_query(data)
     if not query:
         return _response(400, {"error": "Missing 'query' in request body."})
-    # Server-side size cap (finding 2.6): reject an oversized query BEFORE any retrieval or
-    # guardrail call. This is a clean 400, distinct from a guardrail block (a 200 carrying the
-    # block message).
+    # Server-side size cap: reject an oversized query BEFORE any retrieval or guardrail call.
+    # This is a clean 400, distinct from a guardrail block (a 200 carrying the block message).
     if len(query) > MAX_QUERY_CHARS:
         return _response(
             400,
@@ -537,14 +535,13 @@ def _handle_query(event):
     include_full_context = bool(data and data.get(_FULL_CONTEXT_FLAG))
 
     # Everything past validation touches AWS; wrap it so any fault surfaces as a clean, staged
-    # JSON error instead of an opaque 500 (finding 3.1). `stage` names the step that failed.
-    # No retry logic in v1.
+    # JSON error instead of an opaque 500. `stage` names the step that failed. No retry logic.
     stage = "input_guardrail"
     try:
         # Screen the bare query BEFORE retrieval. A content-filter / prompt-attack hit is
-        # blocked here and returns immediately - no retrieval, no generation, no Bedrock spend
-        # (finding 2.3). PII is masked and we proceed silently on the masked text (finding
-        # 2.1); the retrieved <context> is never screened, so contact facts survive.
+        # blocked here and returns immediately - no retrieval, no generation, no Bedrock spend.
+        # PII is masked and we proceed silently on the masked text; the retrieved <context> is
+        # never screened, so contact facts survive.
         decision, screened_query = _apply_input_guardrail(query)
         if decision == "block":
             return _response(200, {"answer": screened_query, "sources": []})

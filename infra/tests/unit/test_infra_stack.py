@@ -94,8 +94,8 @@ def _oss_policy(template, policy_type):
 
 
 def test_network_policy_exposes_collection_only_not_dashboard():
-    # finding 1.7: nothing uses OpenSearch Dashboards, so only the collection endpoint is
-    # exposed to public access - no dashboard rule.
+    # Nothing uses OpenSearch Dashboards, so only the collection endpoint is exposed to public
+    # access - no dashboard rule.
     template = _template()
     policy = _oss_policy(template, "network")
     resource_types = {r["ResourceType"] for stmt in policy for r in stmt["Rules"]}
@@ -103,9 +103,9 @@ def test_network_policy_exposes_collection_only_not_dashboard():
 
 
 def test_data_access_policy_grants_deploy_role_full_index_lifecycle():
-    # finding 1.4: the CloudFormation cfn-exec role (which actually creates/replaces/deletes
-    # the CfnIndex) must be a principal with the full index lifecycle, or cdk deploy/destroy
-    # fail on an authorization error.
+    # The CloudFormation cfn-exec role (which actually creates/replaces/deletes the CfnIndex)
+    # must be a principal with the full index lifecycle, or cdk deploy/destroy fail on an
+    # authorization error.
     template = _template()
     ap = _one(template, "AWS::OpenSearchServerless::AccessPolicy")
     policy = json.loads(_flatten_arn(ap["Properties"]["Policy"]))
@@ -241,7 +241,7 @@ def test_post_query_route_exists():
 
 
 def test_warm_route_exists():
-    # Finding 1.3: a lightweight GET /warm route for the widget's on-load pre-warm ping.
+    # A lightweight GET /warm route for the widget's on-load pre-warm ping.
     template = _template()
     template.has_resource_properties(
         "AWS::ApiGatewayV2::Route", {"RouteKey": "GET /warm"}
@@ -286,8 +286,8 @@ def test_generation_inference_and_query_limit_wired_to_lambda_env():
 
 
 def test_http_api_stage_throttled_from_config():
-    # finding 1.5: stage-level throttling (rate + burst from config) is the load-bearing
-    # cost-abuse control, applied to the default route settings so it covers every route.
+    # Stage-level throttling (rate + burst from config) is the load-bearing cost-abuse
+    # control, applied to the default route settings so it covers every route.
     template = _template()
     template.has_resource_properties(
         "AWS::ApiGatewayV2::Stage",
@@ -301,8 +301,8 @@ def test_http_api_stage_throttled_from_config():
 
 
 def test_query_lambda_has_explicit_log_group_with_retention_and_destroy():
-    # finding 1.6: an explicit, bounded-retention log group torn down with the stack, that the
-    # query function actually writes to (not the implicit never-expiring, orphaned-on-destroy one).
+    # An explicit, bounded-retention log group torn down with the stack, that the query
+    # function actually writes to (not the implicit never-expiring, orphaned-on-destroy one).
     template = _template()
     (fn,) = template.find_resources(
         "AWS::Lambda::Function", {"Properties": {"Handler": "handler.lambda_handler"}}
@@ -345,9 +345,8 @@ def test_query_lambda_has_its_own_role_distinct_from_kb_role():
     assert "lambda.amazonaws.com" in assumed_services(roles[query_role_id])
     assert query_role_id != kb_roles[0]
 
-    # The query role grants Retrieve + InvokeModel* (InvokeModel* because the generation
-    # model is invoked through a cross-region inference profile, see finding 1.2) but NOT the
-    # KB's aoss actions.
+    # The query role grants Retrieve + InvokeModel* (InvokeModel* because the generation model
+    # is invoked through a cross-region inference profile) but NOT the KB's aoss actions.
     template.has_resource_properties(
         "AWS::IAM::Policy",
         assertions.Match.object_like(
@@ -370,7 +369,7 @@ def test_query_lambda_has_its_own_role_distinct_from_kb_role():
     )
 
 
-# --- Generation model grant: cross-region inference profile (finding 1.2) -------
+# --- Generation model grant: cross-region inference profile ---------------------
 
 
 def test_generation_grant_uses_inference_profile_arns():
@@ -589,7 +588,7 @@ def test_output_guardrail_is_output_only_content_filters_with_no_pii():
     for f in filters.values():
         assert f["InputStrength"] == "NONE"
 
-    # No PII policy at all: masking the answer would re-break contact answers (finding 2.1).
+    # No PII policy at all: masking the answer would re-break contact answers.
     assert "SensitiveInformationPolicyConfig" not in props
 
 
@@ -619,8 +618,8 @@ def test_two_guardrail_versions_wired_to_query_lambda():
 
 
 def test_guardrail_version_description_is_a_config_content_hash():
-    # Finding 1.1: the version description must be a content hash of the resolved guardrail
-    # config, not a fixed literal, so any config change publishes a new immutable version.
+    # The version description must be a content hash of the resolved guardrail config, not a
+    # fixed literal, so any config change publishes a new immutable version.
     template = _template()
     descs = _version_descriptions(template)
     assert len(descs) == 2
@@ -631,9 +630,9 @@ def test_guardrail_version_description_is_a_config_content_hash():
 
 
 def test_guardrail_config_change_forces_new_version_description():
-    # The core of finding 1.1: editing the guardrail config changes the version description
-    # (the ONLY property that changes), which is what forces CloudFormation to publish a new
-    # numbered version rather than silently no-op'ing and leaving the Lambda on the stale one.
+    # Editing the guardrail config changes the version description (the ONLY property that
+    # changes), which is what forces CloudFormation to publish a new numbered version rather
+    # than silently no-op'ing and leaving the Lambda on the stale one.
     base_descs = _version_descriptions(_template())
 
     mutated = copy.deepcopy(CONFIG)

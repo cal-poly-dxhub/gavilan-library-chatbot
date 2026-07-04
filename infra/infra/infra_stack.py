@@ -362,7 +362,7 @@ class GavilanChatbotStack(Stack):
 
         # --- Bedrock Guardrails: input screen + output backstop -----------------------
 
-        # Two guardrails (see docs/audit-resolutions.md 2.1).
+        # Two guardrails:
         #   INPUT guardrail  - applied via ApplyGuardrail(source=INPUT) on the bare query in
         #                      the handler, before retrieval. Content filters + prompt-attack
         #                      BLOCK; all PII ANONYMIZE (mask-and-proceed).
@@ -371,7 +371,7 @@ class GavilanChatbotStack(Stack):
 
         # Canonical definitions of each guardrail. These drive BOTH the CfnGuardrail props
         # and the version-description hash, so the hash covers exactly what is deployed and
-        # any config change forces a new published version (finding 1.1).
+        # any config change forces a new published version.
         input_filters_def = [
             {
                 "type": f["type"],
@@ -469,9 +469,9 @@ class GavilanChatbotStack(Stack):
         # Numbered, immutable versions the Lambda pins to. The description carries a content
         # hash of the resolved guardrail config: CfnGuardrailVersion has no other property
         # that changes when config.yaml changes, so without this a guardrail edit updates the
-        # DRAFT but never publishes a new version and the Lambda stays on the stale one
-        # (finding 1.1). Chose hashing over pinning to DRAFT: DRAFT is mutable with no
-        # immutability, rollback, or reproducibility.
+        # DRAFT but never publishes a new version and the Lambda stays on the stale one.
+        # Hashing is used rather than pinning to DRAFT, which is mutable with no immutability,
+        # rollback, or reproducibility.
         input_guardrail_version = bedrock.CfnGuardrailVersion(
             self,
             "InputGuardrailVersion",
@@ -513,7 +513,7 @@ class GavilanChatbotStack(Stack):
         # Invoke the generation model (Converse maps to bedrock:InvokeModel*). Modern Claude
         # models are invoked through a CROSS-REGION INFERENCE PROFILE (a geographic-prefixed
         # id like "us.anthropic..."), which needs a different IAM shape than a bare on-demand
-        # foundation-model id (finding 1.2). Branch on the id form so a bare id still works:
+        # foundation-model id. Branch on the id form so a bare id still works:
         #   - profile: InvokeModel* on the account+region-scoped inference-profile ARN PLUS
         #     the foundation-model ARNs in the source region (this stack's region) and every
         #     destination region the profile routes to; then read access to profile metadata.
@@ -609,8 +609,8 @@ class GavilanChatbotStack(Stack):
                 "GENERATION_MODEL_ID": generation_model_id,
                 "NUMBER_OF_RESULTS": str(retrieval_cfg["number_of_results"]),
                 "BEDROCK_REGION": self.region,
-                # Generation inference knobs (finding 3.4) + server-side query length cap
-                # (finding 2.6), wired from config.yaml so edits reach runtime.
+                # Generation inference knobs + server-side query length cap, wired from
+                # config.yaml so edits reach runtime.
                 "GENERATION_MAX_TOKENS": str(generation_cfg["max_tokens"]),
                 "GENERATION_TEMPERATURE": str(generation_cfg["temperature"]),
                 "MAX_QUERY_CHARS": str(request_cfg["max_query_chars"]),
@@ -629,7 +629,7 @@ class GavilanChatbotStack(Stack):
         # HTTP API (API Gateway v2), NOT REST: ~71% cheaper for a Lambda-proxy job and we
         # need none of the REST-only features. CORS is permissive for now.
         # TODO: lock allow_origins to the library widget domain before launch.
-        # GET is allowed for the widget's fire-and-forget GET /warm ping (finding 1.3).
+        # GET is allowed for the widget's fire-and-forget GET /warm ping.
         http_api = apigwv2.HttpApi(
             self,
             "ChatbotHttpApi",
@@ -655,7 +655,7 @@ class GavilanChatbotStack(Stack):
             integration=query_integration,
         )
         # Lightweight pre-warm route: the widget pings GET /warm on load to wake the OSS
-        # collection (retrieve-only) before the student's first query (finding 1.3).
+        # collection (retrieve-only) before the student's first query.
         http_api.add_routes(
             path="/warm",
             methods=[apigwv2.HttpMethod.GET],

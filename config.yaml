@@ -62,8 +62,8 @@ http_api:
   throttling_burst_limit: 20    # maximum burst (bucket capacity)
 
 request:
-  # Max characters accepted for a user query (finding 2.6). Over this, the handler returns
-  # HTTP 400 BEFORE any retrieval or guardrail call. This is the real server-side size control
+  # Max characters accepted for a user query. Over this, the handler returns HTTP 400 BEFORE
+  # any retrieval or guardrail call. This is the real server-side size control
   # (the widget maxlength is advisory UX only); the platform limits (API GW 10MB / Lambda 6MB)
   # are far too high to guard against cost-amplifying huge pastes. A library FAQ question is
   # short, so 2000 chars is already generous.
@@ -77,15 +77,15 @@ generation:
   # Bedrock-hosted Claude model for answer generation, invoked via a CROSS-REGION INFERENCE
   # PROFILE.
   model_id: us.anthropic.claude-3-5-haiku-20241022-v1:0
-  # Converse inference knobs (finding 3.4). A factual FAQ bot wants short, direct, low-variance
-  # answers: cap the output length and keep temperature low. Range picked per the audit
-  # (max_tokens ~500-700, temperature 0-0.3).
+  # Converse inference knobs. A factual FAQ bot wants short, direct, low-variance answers: cap
+  # the output length and keep temperature low. Sensible ranges: max_tokens ~500-700,
+  # temperature 0-0.3.
   max_tokens: 600
   temperature: 0.2
 
 # --- Bedrock Guardrails ---
 #
-# TWO guardrails are built from this config (see docs/audit-resolutions.md 2.1):
+# TWO guardrails are built from this config:
 #
 #   INPUT screen  - run via the standalone ApplyGuardrail API (source=INPUT) on the BARE
 #                   user query, BEFORE retrieval. Content filters + PROMPT_ATTACK BLOCK the
@@ -96,7 +96,7 @@ generation:
 #                   content filters on the output side (input strengths forced to NONE so
 #                   the retrieved <context> is never screened), and NO PII policy at all
 #                   (retrieved library info is public; masking the answer would re-break
-#                   contact/hours/location answers - the exact bug finding 2.1 fixes).
+#                   contact/hours/location answers).
 
 guardrail:
   # Two distinct guardrail resources are created with these names.

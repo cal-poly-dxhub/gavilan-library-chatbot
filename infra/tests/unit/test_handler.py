@@ -3,7 +3,7 @@
 boto3 is mocked (the client getters are monkeypatched), so no live AWS is touched.
 Events use the API Gateway HTTP API payload format 2.0 structure.
 
-Guardrail flow under test (see docs/audit-resolutions.md 2.1):
+Guardrail flow under test:
   - INPUT screen: ApplyGuardrail(source=INPUT) on the bare query BEFORE retrieval. PII is
     masked and we proceed on the masked text; a content-filter/prompt-attack hit blocks and
     returns immediately with no retrieval or generation.
@@ -324,7 +324,7 @@ def test_chunk_without_source_omitted_from_sources(monkeypatch):
     assert "A passage with no location." in _user_text(bedrock)
 
 
-# --- include_full_context flag (finding 2.4) -----------------------------------
+# --- include_full_context flag -------------------------------------------------
 
 
 def test_default_response_omits_full_context_widget_path_unchanged(monkeypatch):
@@ -398,8 +398,8 @@ def test_missing_query_returns_400(monkeypatch):
 
 
 def test_non_string_query_returns_400_not_500(monkeypatch):
-    # {"query": 123} is truthy JSON but not a string: a clean 400, never a downstream 500
-    # (finding 3.2). No AWS call is made.
+    # {"query": 123} is truthy JSON but not a string: a clean 400, never a downstream 500.
+    # No AWS call is made.
     agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
     _wire(monkeypatch, agent, bedrock)
 
@@ -433,7 +433,7 @@ def test_query_is_stripped_before_screening(monkeypatch):
 
 
 def test_over_length_query_returns_400_before_any_aws_call(monkeypatch):
-    # finding 2.6: an oversized query is rejected (400) BEFORE any retrieval or guardrail call.
+    # An oversized query is rejected (400) BEFORE any retrieval or guardrail call.
     monkeypatch.setattr(handler, "MAX_QUERY_CHARS", 10)
     agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
     _wire(monkeypatch, agent, bedrock)
@@ -682,7 +682,7 @@ def test_output_guardrail_block_returns_blocked_message(monkeypatch):
 
 
 def test_converse_sets_inference_config_from_config(monkeypatch):
-    # finding 3.4: Converse carries an inferenceConfig with the configured maxTokens/temperature.
+    # Converse carries an inferenceConfig with the configured maxTokens/temperature.
     agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
     _wire(monkeypatch, agent, bedrock)
 
@@ -697,8 +697,8 @@ def test_converse_sets_inference_config_from_config(monkeypatch):
 
 
 def test_output_guardrail_assessment_is_logged_reduced(monkeypatch, capsys):
-    # finding 3.3: the OUTPUT guardrail log carries types/actions/counts + stopReason only,
-    # NEVER the raw model output or matched text from the Converse trace.
+    # The OUTPUT guardrail log carries types/actions/counts + stopReason only, NEVER the raw
+    # model output or matched text from the Converse trace.
     raw_output = "RAW MODEL ANSWER THAT MUST NOT BE LOGGED"
     trace = {
         "guardrail": {
@@ -740,7 +740,7 @@ def test_output_guardrail_assessment_is_logged_reduced(monkeypatch, capsys):
     assert raw_output not in line
 
 
-# --- Warm path (GET /warm): retrieval-only pre-warm (finding 1.3) ---------------
+# --- Warm path (GET /warm): retrieval-only pre-warm -----------------------------
 
 
 def test_warm_path_retrieves_only_and_returns_warmed(monkeypatch):
@@ -783,7 +783,7 @@ def test_query_path_still_dispatches_when_path_is_query(monkeypatch):
     assert len(bedrock.apply_guardrail_calls) == 1
 
 
-# --- Exception handling: clean, staged errors (finding 3.1) ---------------------
+# --- Exception handling: clean, staged errors -----------------------------------
 
 
 def _assert_clean_error(resp, capsys, expected_stage):
@@ -834,8 +834,8 @@ def test_generate_failure_returns_clean_staged_error(monkeypatch, capsys):
 
 
 def test_warm_failure_returns_clean_error_not_opaque(monkeypatch, capsys):
-    # finding 3.1: /warm shouldn't be the one raw route left. A retrieve fault -> clean 502,
-    # not an opaque unhandled 500. The widget ignores it anyway (fire-and-forget).
+    # /warm shouldn't be the one raw route left. A retrieve fault -> clean 502, not an opaque
+    # unhandled 500. The widget ignores it anyway (fire-and-forget).
     agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
     monkeypatch.setattr(agent, "retrieve", _raise_boom)
     _wire(monkeypatch, agent, bedrock)

@@ -40,8 +40,8 @@
   var CONFIG = {
     // Abort a hung request after this long. Aligned to API Gateway's hard 30s integration
     // cap: past 30s the gateway kills the request anyway, so the browser should outlive the
-    // backend right up to that ceiling rather than aborting early (finding 1.3). A cold
-    // first query (OpenSearch scale-to-zero wake + generation) can take 15-25s.
+    // backend right up to that ceiling rather than aborting early. A cold first query
+    // (OpenSearch scale-to-zero wake + generation) can take 15-25s.
     requestTimeoutMs: 30000,
     // After this long with no response, the typing indicator gains an honest "waking up"
     // note so a slow first query doesn't look frozen.
@@ -686,7 +686,7 @@
 
   if (!IS_COMMONJS && typeof document !== "undefined") {
     // Fire the pre-warm as early as the deferred script runs, so the OSS cold start overlaps
-    // with the user reading the page rather than their first query (finding 1.3).
+    // with the user reading the page rather than their first query.
     warmBackend();
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", function () { mount(); });

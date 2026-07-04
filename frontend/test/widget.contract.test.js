@@ -185,7 +185,7 @@ test("external source links open safely (noopener noreferrer)", () => {
   assert.ok(/noopener noreferrer/.test(SOURCE), "target=_blank links must be rel=noopener noreferrer");
 });
 
-// --- warm path (finding 1.3): fire-and-forget pre-warm ------------------
+// --- warm path: fire-and-forget pre-warm --------------------------------
 test("warmUrl derives the sibling /warm route from the /query endpoint", () => {
   assert.strictEqual(
     widget.warmUrl("https://abc123.execute-api.us-west-2.amazonaws.com/query"),
@@ -225,7 +225,7 @@ test("widget fires a fire-and-forget GET /warm on load, derived from data-api-ur
   );
 });
 
-// --- honest loading state (finding 1.3) ---------------------------------
+// --- honest loading state -----------------------------------------------
 test("request timeout is raised to the 30s API Gateway ceiling", () => {
   assert.strictEqual(widget.CONFIG.requestTimeoutMs, 30000);
 });
@@ -246,7 +246,7 @@ test("a delayed 'waking up' hint backs a slow first response (no fake progress)"
   );
 });
 
-// --- input length cap (finding 2.6, widget half) ------------------------
+// --- advisory input length cap ------------------------------------------
 test("input has an advisory maxlength cap", () => {
   assert.ok(
     /setAttribute\(\s*"maxlength"\s*,\s*"1000"\s*\)/.test(SOURCE),
@@ -254,7 +254,7 @@ test("input has an advisory maxlength cap", () => {
   );
 });
 
-// --- scoped fallback selector (finding 4.2) -----------------------------
+// --- scoped fallback selector -------------------------------------------
 test("apiUrl fallback selector is scoped to the widget's own script tag", () => {
   // The currentScript fallback must require src*="widget.js" so it can never bind to a
   // foreign data-api-url tag on the host page.
