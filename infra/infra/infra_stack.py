@@ -599,7 +599,11 @@ class GavilanChatbotStack(Stack):
             "QueryFunction",
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="handler.lambda_handler",
-            code=_lambda.Code.from_asset(str(_APP_DIR)),
+            # Ship only the handler and the system prompt; keep __pycache__ / stray
+            # files out of the bundle so the asset hash tracks real source changes.
+            code=_lambda.Code.from_asset(
+                str(_APP_DIR), exclude=["*", "!handler.py", "!system_prompt.md"]
+            ),
             role=query_lambda_role,
             timeout=Duration.seconds(30),
             memory_size=256,
@@ -760,4 +764,10 @@ class GavilanChatbotStack(Stack):
             "ChatbotApiUrl",
             value=query_url,
             description="HTTP API POST /query endpoint the widget calls.",
+        )
+        CfnOutput(
+            self,
+            "KnowledgeBaseId",
+            value=knowledge_base.attr_knowledge_base_id,
+            description="Bedrock Knowledge Base id (for eval/eval_config.yaml).",
         )

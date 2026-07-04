@@ -90,13 +90,6 @@ Ingestion side (OSS collection + security/data-access policies -> `CfnIndex` -> 
 - **Fallback:** None needed — just wait. Behavior (OAC read, caching, HTTPS redirect) is only verifiable once it finishes (Phase 3.7).
 - **Source:** `blocked-on-aws.md` (CloudFront slow create/destroy), `CLAUDE.md` Lessons (CloudFront slow ~15-30 min), `architecture.md` Verified.
 
-### 2.4 Lambda asset bundles `__pycache__` (**still live — not fixed**)
-- **What:** `Code.from_asset(str(_APP_DIR))` in `infra/infra/infra_stack.py:602` grabs the whole `app/` dir. Test-run bytecode caches (`__pycache__`) and any stray files ship to Lambda. **Verified: there is no `exclude` on that asset.**
-- **When it surfaces:** At synth/deploy asset bundling. Not fatal — the Lambda still runs — but ships junk and can bust the asset hash.
-- **How you'll know:** Larger-than-expected asset; `__pycache__` present in the deployed bundle.
-- **Fallback:** Add an asset exclude so only `handler.py` + `system_prompt.md` bundle, e.g. `Code.from_asset(str(_APP_DIR), exclude=["__pycache__", "*.pyc"])`. **[VERIFY EXACT SYNTAX]** against `aws-cdk-lib==2.260.0` `AssetOptions` before applying. Cheap to fix before first deploy; do it in Phase 1 if time allows.
-- **Source:** `blocked-on-aws.md` (Lambda asset bundles `__pycache__`), verified live at `infra/infra/infra_stack.py:602`.
-
 ### 2.5 Crawler scope / filter values unvalidated at synth
 - **What:** `scope`, `exclusion_filters`, `inclusion_filters` are plain strings, not enum-checked at synth. A typo synths green and fails at deploy.
 - **When it surfaces:** At `AWS::Bedrock::DataSource` (WEB) creation.
@@ -112,14 +105,6 @@ Ingestion side (OSS collection + security/data-access policies -> `CfnIndex` -> 
 
 ### 2.7 Confirm NextGen at deploy
 See Phase 1.6 — this is the deploy-time confirmation point. Check the provisioned collection is NextGen (scale-to-zero), not Classic. (`blocked-on-aws.md`.)
-
-### 2.8 Capture stack outputs
-After deploy, record the CfnOutputs (verified in `infra/infra/infra_stack.py:746-763`):
-- `WidgetEmbedTag` — paste-ready `<script>` snippet.
-- `WidgetCdnDomain` — CloudFront domain serving `widget.js`.
-- `ChatbotApiUrl` — the `POST /query` URL (`{api_endpoint}/query`).
-- **Note:** There is **no CfnOutput for the Knowledge Base id.** It's needed for `eval/eval_config.yaml` (Phase 3.5). Retrieve it from the Bedrock console or the Lambda's `KNOWLEDGE_BASE_ID` env var (set from `knowledge_base.attr_knowledge_base_id`). Consider adding a KB-id output.
-- **Source:** verified at `infra/infra/infra_stack.py:608, 746-763`.
 
 ---
 

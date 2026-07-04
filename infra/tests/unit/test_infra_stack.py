@@ -506,6 +506,7 @@ def test_stack_outputs_ready_to_paste_embed_tag():
     assert "WidgetEmbedTag" in outputs, list(outputs)
     assert "WidgetCdnDomain" in outputs
     assert "ChatbotApiUrl" in outputs
+    assert "KnowledgeBaseId" in outputs
 
     # The embed tag is a full <script ... data-api-url="..." defer></script> snippet,
     # assembled from the CloudFront domain and the API endpoint via Fn::Join. Check the
