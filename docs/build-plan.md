@@ -41,7 +41,7 @@
 - [x] **API Gateway throttling** — stage-level rate/burst (10rps/20burst) from config, covers all routes (audit 1.5). The real cost-abuse protection; replaces WAF for v1
 - [x] **Comment sweep** — stripped change-narration from docstrings across handler/stack/tests/config, two passes, comments-only (tests unchanged)
 - [x] **CLAUDE.md trim** — cut ~55% (repo-layout narrative → terse map, rationale → one-liners), lessons hand-added
-- [~] **Deploy runbook** (`docs/deploy-runbook.md`) — in progress: before/during/after deploy-day sequence with per-landmine verify + fallback
+- [X] **Deploy runbook** (`docs/deploy-runbook.md`) — in progress: before/during/after deploy-day sequence with per-landmine verify + fallback
 - [ ] **Provide context** (gated ~July 19) — sponsor seed URLs + blacklist into `config.yaml`; sponsor Q&A set into `eval/datasets/`. Authoring our own Q&A set was rejected (would guess wrong and bias the eval); wait for theirs
 - [ ] **First deploy** — work through `deploy-runbook.md`: region availability check, bootstrap with aoss perms, model-access enablement, then stand up
 - [ ] **Deploy-time landmines** (`blocked-on-aws.md`) — surface at first deploy: data-access/aoss principal, CfnIndex race, crawler values, NextGen confirm, source-URI extraction, CloudFront timing, `__pycache__` bundling
