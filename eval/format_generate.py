@@ -2,9 +2,17 @@
 
 The answer-quality evaluator. Unlike retrieve-only (which points at the live KB), this
 uses BRING-YOUR-OWN-INFERENCE: it scores OUR bot's actual outputs, not the KB's built-in
-RetrieveAndGenerate. 
+RetrieveAndGenerate.
 
-
+NAMING CAVEAT (retrieved-passages key): the JSONL key that holds the retrieved passages under
+each conversation turn's `output` is unresolved offline. `retrievedPassages` and
+`retrievedResults` are both plausible names for that OUTER key - they appear in different
+Bedrock docs/APIs, and since the inner list is `retrievalResults`, the two candidate names also
+collide across the outer/inner positions. It cannot be pinned down without a live
+retrieve-and-generate job. It is isolated as the single constant RETRIEVED_PASSAGES_KEY below
+(currently "retrievedPassages", wrapping an inner "retrievalResults" list) so there is exactly
+one place to change: confirm it at the first real R&G run, and if the job rejects the record,
+switch the constant to the other candidate before trusting faithfulness/citation scores.
 """
 
 from __future__ import annotations

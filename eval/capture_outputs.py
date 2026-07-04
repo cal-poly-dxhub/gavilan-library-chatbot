@@ -24,15 +24,17 @@ def capture_outputs(
 
     Intended real implementation (once the bot is deployed):
       1. Read the bot endpoint from config["generate"]["bot_api_url"].
-      2. For each QAPair, POST {"query": pair.question} to that /query endpoint
-         (http_client is injectable for testing; default to a real HTTP client).
+      2. For each QAPair, POST {"query": pair.question, "include_full_context": true} to that
+         /query endpoint (http_client is injectable for testing; default to a real HTTP
+         client). The include_full_context flag makes the response carry the full retrieved
+         passages the model saw; without it the response exposes only truncated, per-uri-
+         deduped source excerpts, which would under-represent what faithfulness is scored on.
       3. Parse the bot's JSON response into a CapturedOutput:
-           - answer    <- the generated answer text
-           - passages  <- the retrieved chunks (text + optional name/metadata)
-           - citations <- the bot's citations if present, else None
-         The exact response shape MUST be confirmed against the deployed Lambda's
-         response body before mapping; today's handler returns only a placeholder answer
-         and does not yet expose retrieved passages or citations.
+           - answer    <- response["answer"] (the generated answer text)
+           - passages  <- response["full_context"] (the full, un-deduped, un-truncated
+                          retrieved passages: [{text, source}])
+           - citations <- None (the handler does not emit citations)
+         Confirm the exact response field shape against the deployed Lambda before mapping.
       4. Return the list aligned 1:1 with `pairs`.
 
     Raises:

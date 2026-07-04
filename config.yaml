@@ -53,27 +53,61 @@ chunking:
 
 # --- Query path (Lambda + HTTP API) ---
 
+http_api:
+  # Stage-level request throttling, applied to EVERY route (/query and /warm). This is the
+  # load-bearing cost-abuse control for the public, unauthenticated endpoint that fans out to
+  # paid Bedrock calls - it is the stated reason WAF was excluded. Sized for a single library
+  # widget: a handful of requests/sec with a small burst. Clients get HTTP 429 over the limit.
+  throttling_rate_limit: 10     # steady-state requests per second across the stage
+  throttling_burst_limit: 20    # maximum burst (bucket capacity)
+
+request:
+  # Max characters accepted for a user query. Over this, the handler returns HTTP 400 BEFORE
+  # any retrieval or guardrail call. This is the real server-side size control
+  # (the widget maxlength is advisory UX only); the platform limits (API GW 10MB / Lambda 6MB)
+  # are far too high to guard against cost-amplifying huge pastes. A library FAQ question is
+  # short, so 2000 chars is already generous.
+  max_query_chars: 2000
+
 retrieval:
   # Number of KB chunks to retrieve per query and feed to generation.
   number_of_results: 5
 
 generation:
-  # Bedrock-hosted Claude model for answer generation. PLACEHOLDER: architecture.md lists
-  # this as "Haiku, TBD" pending DxHub/sponsor confirmation. Synth does not validate the id.
-  model_id: anthropic.claude-3-5-haiku-20241022-v1:0
+  # Bedrock-hosted Claude model for answer generation, invoked via a CROSS-REGION INFERENCE
+  # PROFILE.
+  model_id: us.anthropic.claude-3-5-haiku-20241022-v1:0
+  # Converse inference knobs. A factual FAQ bot wants short, direct, low-variance answers: cap
+  # the output length and keep temperature low. Sensible ranges: max_tokens ~500-700,
+  # temperature 0-0.3.
+  max_tokens: 600
+  temperature: 0.2
 
 # --- Bedrock Guardrails ---
 #
-# Content filters + PII only. Contextual grounding is DELIBERATELY excluded: AWS states it
-# does not support conversational/chatbot use cases and needs fragile guardContent tagging;
-# our system prompt already enforces hard grounding. No denied topics / word filters /
-# automated reasoning either. Tune strengths/actions/messages here, not in code.
+# TWO guardrails are built from this config:
+#
+#   INPUT screen  - run via the standalone ApplyGuardrail API (source=INPUT) on the BARE
+#                   user query, BEFORE retrieval. Content filters + PROMPT_ATTACK BLOCK the
+#                   request; PII is ANONYMIZE (mask) so the query is masked-and-proceeds
+#                   silently rather than blocked. Blocked queries never reach retrieval or
+#                   generation (no Bedrock spend on abuse).
+#   OUTPUT backstop - attached to the Converse call. Screens the generated ANSWER only:
+#                   content filters on the output side (input strengths forced to NONE so
+#                   the retrieved <context> is never screened), and NO PII policy at all
+#                   (retrieved library info is public; masking the answer would re-break
+#                   contact/hours/location answers).
+
 guardrail:
-  name: gavilan-library-guardrail
-  # Attach behavior for the Converse call: enabled | disabled | enabled_full.
+  # Two distinct guardrail resources are created with these names.
+  input_name: gavilan-library-input-guardrail
+  output_name: gavilan-library-output-guardrail
+  # Converse guardrail trace behavior for the OUTPUT backstop: enabled | disabled | enabled_full.
   trace: enabled
-  # Content filters. strength: NONE | LOW | MEDIUM | HIGH, applied to input AND output.
-  # PROMPT_ATTACK is INPUT-only (AWS requires its output strength to be NONE).
+  # Content filters. strength: NONE | LOW | MEDIUM | HIGH.
+  #   - INPUT guardrail uses these strengths as written (only its input side is exercised).
+  #   - OUTPUT guardrail uses output_strength with input forced to NONE, and drops
+  #     PROMPT_ATTACK (which is input-only; AWS requires its output strength to be NONE).
   content_filters:
     - type: HATE
       input_strength: HIGH
@@ -93,22 +127,25 @@ guardrail:
     - type: PROMPT_ATTACK
       input_strength: HIGH
       output_strength: NONE   # INPUT only
-  # Sensitive information (PII). action applies to both input and output.
-  #   ANONYMIZE = mask/redact (replace with the entity type, e.g. {EMAIL}).
-  #   BLOCK     = block the whole request/response and return the blocked message.
-  pii_entities:
-    - action: ANONYMIZE
-      types: [EMAIL, PHONE, NAME, ADDRESS, USERNAME, AGE]
-    - action: BLOCK
-      types:
-        - PASSWORD
-        - US_SOCIAL_SECURITY_NUMBER
-        - CREDIT_DEBIT_CARD_NUMBER
-        - CREDIT_DEBIT_CARD_CVV
-        - PIN
-        - INTERNATIONAL_BANK_ACCOUNT_NUMBER
-        - SWIFT_CODE
-        - DRIVER_ID
-  # Friendly, student-facing blocked messages (match the bot's tone).
+  # Sensitive information (PII) for the INPUT screen. ALL entities ANONYMIZE (mask/redact,
+  # e.g. an email becomes {EMAIL}); none BLOCK, so a masked query always proceeds. The
+  # OUTPUT guardrail carries no PII policy.
+  pii_anonymize_entities:
+    - EMAIL
+    - PHONE
+    - NAME
+    - ADDRESS
+    - USERNAME
+    - AGE
+    - PASSWORD
+    - US_SOCIAL_SECURITY_NUMBER
+    - CREDIT_DEBIT_CARD_NUMBER
+    - CREDIT_DEBIT_CARD_CVV
+    - PIN
+    - INTERNATIONAL_BANK_ACCOUNT_NUMBER
+    - SWIFT_CODE
+    - DRIVER_ID
+  # Friendly, student-facing blocked messages (match the bot's tone). The INPUT screen
+  # returns blocked_input_messaging; the Converse OUTPUT backstop returns blocked_outputs_messaging.
   blocked_input_messaging: "I can't help with that request. I'm here for questions about the Gavilan College Library, like hours, checkouts, and finding materials."
   blocked_outputs_messaging: "I'm not able to provide a response to that. Try asking about library hours, services, or materials, or reach out to a librarian for more help."

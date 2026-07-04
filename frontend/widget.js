@@ -38,7 +38,14 @@
   // no knowledge of that and ships only the real path.
   // -------------------------------------------------------------------------
   var CONFIG = {
-    requestTimeoutMs: 20000,   // abort a hung request after this long
+    // Abort a hung request after this long. Aligned to API Gateway's hard 30s integration
+    // cap: past 30s the gateway kills the request anyway, so the browser should outlive the
+    // backend right up to that ceiling rather than aborting early. A cold first query
+    // (OpenSearch scale-to-zero wake + generation) can take 15-25s.
+    requestTimeoutMs: 30000,
+    // After this long with no response, the typing indicator gains an honest "waking up"
+    // note so a slow first query doesn't look frozen.
+    wakingHintDelayMs: 4000,
     title: "Library Help",
     launcherLabel: "Ask the Library",
     greeting:
@@ -54,10 +61,12 @@
 
   /** The configured backend endpoint, or null if `data-api-url` is unset. */
   function apiUrl() {
+    // The fallback query is scoped to this widget's own script tag (its src ends in
+    // widget.js), so it can never bind to another embed's data-api-url tag on the host page.
     var el =
       CURRENT_SCRIPT ||
       (typeof document !== "undefined"
-        ? document.querySelector("script[data-api-url]")
+        ? document.querySelector('script[data-api-url][src*="widget.js"]')
         : null);
     var url = el && el.getAttribute ? el.getAttribute("data-api-url") : null;
     return url && url.trim() ? url.trim() : null;
@@ -131,6 +140,35 @@
     }
     return { answer: answer, sources: sources };
   }
+
+  /**
+   * Derive the sibling /warm URL from the configured /query endpoint. data-api-url points
+   * at the /query route, so /warm is its sibling. Returns null for an unusable input.
+   */
+  function warmUrl(url) {
+    if (typeof url !== "string" || !url) return null;
+    if (/\/query\/?$/.test(url)) return url.replace(/\/query\/?$/, "/warm");
+    // Fallback: treat the value as a base and hang /warm off it.
+    return url.replace(/\/+$/, "") + "/warm";
+  }
+
+  /**
+   * Fire-and-forget pre-warm. Pings GET /warm on load to wake the retrieval/OpenSearch path
+   * (which scales to zero after idle) before the student's first real query. We never read
+   * the result and swallow every failure (network, CORS, abort): warming is best-effort and
+   * must never affect the UI. Deliberately warms ONLY retrieval, not generation.
+   */
+  function warmBackend() {
+    var url = warmUrl(apiUrl());
+    if (!url || typeof fetch === "undefined") return;
+    try {
+      fetch(url, { method: "GET" }).then(noop, noop);
+    } catch (e) {
+      /* ignore: best-effort only */
+    }
+  }
+
+  function noop() {}
 
   // =========================================================================
   // ==========================  END API LAYER  ==============================
@@ -254,6 +292,9 @@
     ".typing .dot:nth-child(3) { animation-delay: .4s; }",
     "@keyframes gv-blink { 0%, 80%, 100% { opacity: .3; } 40% { opacity: 1; } }",
     "@media (prefers-reduced-motion: reduce) { .typing .dot { animation: none; } }",
+    // honest slow-start hint (shown only after a delay under the typing dots)
+    ".typing__hint { margin-top: 6px; font-size: 12.5px; color: var(--muted); }",
+    ".typing__hint[hidden] { display: none; }",
     // retry
     ".retry {",
     "  margin-top: 8px; appearance: none; border: 1px solid currentColor;",
@@ -363,6 +404,9 @@
     var input = doc.createElement("textarea");
     input.className = "composer__input";
     input.setAttribute("rows", "1");
+    // Advisory input cap so a user gets feedback instead of typing a wall of text. The real
+    // limit is the server-side length check; this is intentionally lower and UX-only.
+    input.setAttribute("maxlength", "1000");
     input.setAttribute("aria-label", "Type your question");
     input.setAttribute("placeholder", "Ask a question…");
     var send = doc.createElement("button");
@@ -473,10 +517,33 @@
         typing.appendChild(dot);
       }
       bubble.appendChild(typing);
+
+      // Honest slow-start note: a first query after idle can spend 15-25s waking the
+      // backend (OpenSearch scale-to-zero), which would otherwise look frozen. After a
+      // short delay, reveal a plain "waking up" line - no fake progress bar.
+      var hint = doc.createElement("div");
+      hint.className = "typing__hint";
+      hint.hidden = true;
+      hint.textContent = "Waking up the library assistant. This can take a moment…";
+      bubble.appendChild(hint);
+
       wrap.appendChild(bubble);
       thread.appendChild(wrap);
       scrollToBottom();
-      return wrap;
+
+      var hintTimer = setTimeout(function () {
+        hint.hidden = false;
+        scrollToBottom();
+      }, CONFIG.wakingHintDelayMs);
+
+      // Handle: remove the indicator and cancel the pending hint in one call.
+      return {
+        el: wrap,
+        done: function () {
+          if (hintTimer) { clearTimeout(hintTimer); hintTimer = null; }
+          if (wrap.parentNode) wrap.parentNode.removeChild(wrap);
+        }
+      };
     }
 
     function appendError(question) {
@@ -518,17 +585,17 @@
       state.lastQuestion = text;
       appendUserMessage(text);
       setPending(true);
-      var typingEl = showTyping();
+      var typing = showTyping();
 
       sendQuery(text).then(
         function (result) {
-          if (typingEl.parentNode) typingEl.parentNode.removeChild(typingEl);
+          typing.done();
           appendBotMessage(result.answer, result.sources);
           setPending(false);
           focusInput();
         },
         function (err) {
-          if (typingEl.parentNode) typingEl.parentNode.removeChild(typingEl);
+          typing.done();
           appendError(text);
           setPending(false);
           focusInput();
@@ -618,6 +685,9 @@
   var IS_COMMONJS = typeof module !== "undefined" && module.exports;
 
   if (!IS_COMMONJS && typeof document !== "undefined") {
+    // Fire the pre-warm as early as the deferred script runs, so the OSS cold start overlaps
+    // with the user reading the page rather than their first query.
+    warmBackend();
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", function () { mount(); });
     } else {
@@ -631,6 +701,7 @@
       mount: mount,
       sendQuery: sendQuery,
       normalizeResponse: normalizeResponse,
+      warmUrl: warmUrl,
       safeHttpUrl: safeHttpUrl,
       displayUrl: displayUrl,
       CONFIG: CONFIG,

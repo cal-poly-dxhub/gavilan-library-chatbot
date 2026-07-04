@@ -6,173 +6,85 @@ RAG chatbot for Gavilan College Library. Answers operational student questions (
 
 ## Stack
 
-- **RAG:** Amazon Bedrock Managed Knowledge Base (Web Crawler connector → OpenSearch Serverless NextGen vector store)
-- **Generation:** Bedrock-hosted Claude via `Retrieve` + own generate call (NOT `RetrieveAndGenerate` — full system-prompt control required)
-- **Backend:** Lambda + API Gateway (Python)
-- **Infra:** AWS CDK (Python) — everything declared as code, nothing built by hand
+- **RAG:** Amazon Bedrock Managed Knowledge Base (Web Crawler connector -> OpenSearch Serverless NextGen vector store)
+- **Generation:** Bedrock-hosted Claude via `Retrieve` + own generate call (NOT `RetrieveAndGenerate`; full system-prompt control required)
+- **Backend:** Lambda + HTTP API (API Gateway v2), Python
+- **Infra:** AWS CDK (Python), L1 `Cfn*` constructs; everything as code
 - **Guardrails:** Bedrock Guardrails (content + PII)
-- **Config:** `config.yaml` — model IDs, chunking, reranking, thresholds live here, not in code
-- **Frontend:** custom JS widget
+- **Config:** `config.yaml` at repo root; single source of truth for changeable knobs
+- **Frontend:** vanilla JS widget (Shadow DOM, dependency-free)
 
 ## Read the docs before design work
 
-Architecture and rationale are in `docs/`:
-- `docs/architecture.md` — stack decisions, phases, data flow, verified facts
-
-When a task touches architecture or a "why was X chosen" question, read these first. Do not re-derive or contradict decisions recorded there.
+Architecture, decisions, and rationale are in `docs/architecture.md`. When a task touches architecture or a "why was X chosen" question, read it first. Do not re-derive or contradict decisions recorded there.
 
 ## Commands
 
-The CDK app lives in `infra/`. The `cdk` CLI is installed globally. All infra commands
-run from `infra/` with the project virtualenv active.
+CDK app lives in `infra/`. All infra commands run from `infra/` with the venv active.
 
 First-time setup (from `infra/`):
-- `python3 -m venv .venv` (already created by `cdk init`)
 - `source .venv/bin/activate`
 - `python -m pip install -r requirements.txt -r requirements-dev.txt`
 
-Then, from `infra/` with the venv active:
-- Infra synth (offline, no creds): `cdk synth`
-- Infra tests: `python -m pytest`
-- Infra deploy: `cdk deploy` (needs AWS creds — company account, pending)
-- Infra teardown: `cdk destroy` (IMPORTANT: also removes the OSS collection; deleting the KB alone does not)
+Then (from `infra/`, venv active):
+- Synth (offline, no creds): `cdk synth`
+- Tests: `python -m pytest`
+- Deploy: `cdk deploy` (needs AWS creds; account pending)
+- Teardown: `cdk destroy` (also removes the OSS collection; deleting the KB alone does not)
 
 Pinned: `aws-cdk-lib==2.260.0`, CDK CLI `2.1129.0`.
 
-- Handler unit tests (`tests/unit/test_handler.py`) stub `boto3` in `sys.modules` and
-  monkeypatch the client getters, so they need no boto3 install and no live AWS.
+Handler unit tests stub `boto3` in `sys.modules` and monkeypatch the client getters, so they need no boto3 install and no live AWS.
 
-## Knowledge Base / vector store facts
+## Vector store invariant
 
-Vector index field names. These MUST stay identical between the `CfnIndex` mappings and
-the KB `field_mapping` (defined once in `config.yaml` under `vector_store.fields`):
+Vector index field names MUST stay identical between the `CfnIndex` mappings and the KB `field_mapping` (defined once in `config.yaml` under `vector_store.fields`):
 - vector field: `bedrock-knowledge-base-default-vector` (knn_vector, 1024 dims = Titan Text Embeddings v2, faiss/hnsw/l2)
 - text field: `AMAZON_BEDROCK_TEXT_CHUNK`
 - metadata field: `AMAZON_BEDROCK_METADATA`
 - index name: `bedrock-knowledge-base-default-index`
 
+## `/query` contract (widget builds against this)
+
+`POST /query` response shape:
+`{ "answer": "<text>", "sources": [ {"uri": "<page url>", "excerpt": "<snippet>"} ] }`
+
+`sources` is deduplicated by uri, in retrieval order; passages with no resolvable source uri are omitted (they still inform the answer); on empty retrieval `sources` is `[]`.
+
+Prompt/handler contract: the prompt expects retrieved passages inside `<context>` tags; the handler wraps chunks in exactly that tag (`handler.CONTEXT_TAG == "context"`). User message is the `<context>` block followed by `Question: <query>`. The system prompt is passed via the Converse `system` parameter, never concatenated into the user message.
+
 ## Repo layout
 
-- `infra/` — CDK Python app (created by `cdk init`). The stack provisions the full
-  ingestion side plus the query path: OpenSearch Serverless collection +
-  encryption/network security policies, KB execution IAM role, data access policy, vector
-  index, the `AWS::Bedrock::KnowledgeBase` (VECTOR, OSS storage), the
-  `AWS::Bedrock::DataSource` (type WEB, FIXED_SIZE chunking), a query-path Lambda with its
-  OWN execution role, and an HTTP API (API Gateway v2) with a `POST /query` route.
-  It ALSO hosts the widget: a private S3 bucket (block-all-public, bucket-owner-enforced)
-  fronted by a CloudFront distribution using **OAC** (`origins.S3BucketOrigin.with_origin_access_control`,
-  NOT OAI/S3Origin), with a `BucketDeployment` uploading ONLY `frontend/widget.js` (never
-  `mock.js`/`demo.html`) and invalidating `/widget.js` on deploy. Hosting is in the SAME
-  stack as the backend (OAC has a cross-stack cyclical-dependency problem; one-click install
-  wants one deploy). The stack outputs a ready-to-paste embed tag
-  (`<script src="https://{cloudfront}/widget.js" data-api-url="https://{api}/query" defer></script>`)
-  plus the raw CloudFront domain and `/query` URL. It ALSO defines a Bedrock guardrail
-  (`CfnGuardrail` + `CfnGuardrailVersion`, content filters + PII, built from `config.yaml`)
-  and grants the query role `bedrock:ApplyGuardrail`. WAF and auth are NOT wired (WAF
-  excluded for v1: HTTP API can't take it directly, thin threat surface, throttling handles
-  cost-abuse; see below). Structure:
-  - `app.py` — CDK app entrypoint; loads `config.yaml` and passes it to the stack
-  - `infra/infra_stack.py` — the stack (`GavilanChatbotStack`); reads all knobs from config
-  - `infra/config.py` — `load_config()`; resolves the repo-root `config.yaml` from `__file__`
-  - `infra/__init__.py` — package marker
-  - `tests/unit/test_infra_stack.py` — stack assertion tests
-  - `tests/unit/test_handler.py` — handler unit tests (boto3 stubbed, payload-2.0 events)
-  - `requirements.txt` — pinned `aws-cdk-lib==2.260.0`, `constructs`, `PyYAML`
-  - `requirements-dev.txt` — `pytest`
-  - `cdk.json` — toolkit config (`app: python3 app.py`)
-  - `.venv/` — virtualenv (gitignored)
-- `app/` — Lambda code. `handler.py`: HTTP API (payload format 2.0) entrypoint with two
-  separate steps - `retrieve()` (KB `Retrieve`, NOT RetrieveAndGenerate; returns
-  `{text, source}` per chunk) and `generate()` (Bedrock Converse). Wiring comes from env
-  vars set by the stack. boto3 is provided by the Lambda runtime (not vendored, not a dev dep).
-  - `system_prompt.md` - the real, finalized system prompt (the Gavilan Library assistant
-    role, scope, grounding, handoff, textbook flow, tone, fixed rules). Read once at cold
-    start via `Path(__file__).parent`, and passed to Converse via the `system` parameter
-    (never concatenated into the user message). It is packaged with the Lambda because the
-    stack uses `Code.from_asset(app/)`, which bundles the whole directory (verified in the
-    synthesized asset).
-  - Prompt/handler contract: the prompt expects retrieved passages inside `<context>` tags,
-    and the handler wraps chunks in exactly that tag (`handler.CONTEXT_TAG == "context"`).
-    The user message is the `<context>` block followed by `Question: <query>`.
-  - **`POST /query` response JSON shape** (the frontend builds against this):
-    `{ "answer": "<text>", "sources": [ {"uri": "<page url>", "excerpt": "<snippet>"} ] }`.
-    `sources` is deduplicated by uri, in retrieval order; passages with no resolvable source
-    uri are omitted from `sources` (they still inform the answer); on empty retrieval
-    `sources` is `[]` and the prompt tells the model to say it does not have the info.
-  - **Contextual grounding is NOT usable here, and it was deliberately excluded.** AWS docs
-    state grounding does not support conversational/chatbot use cases; it also requires
-    `guardContent` message-tagging in Converse (a documented silent-failure trap: once any
-    guardContent block is present, grounding evaluates ONLY tagged blocks). The system prompt's
-    hard-grounding covers v1. If eval later shows the prompt isn't holding, revisit via the
-    standalone `ApplyGuardrail` API, not inline Converse tagging.
-  - **WAF cannot attach to HTTP API (v2).** WAF only attaches to REST API / CloudFront / ALB /
-    AppSync. Getting WAF on this API would require fronting it with a second CloudFront
-    distribution. Excluded for v1 (thin threat surface; API Gateway throttling handles the real
-    cost-abuse risk, native + free). Revisit only on a compliance mandate.
-  - **Guardrail needs `bedrock:ApplyGuardrail`** on the guardrail ARN alongside `InvokeModel`,
-    or it silently fails at runtime. The Lambda pins to a published numbered guardrail version;
-    live policy/message edits require a new version (or pointing the Lambda at `DRAFT`).
-- `eval/` — Bedrock RAG eval harness. SDK/boto3 operational tooling (NOT CDK); runs on
-  demand when an AWS account exists, against already-deployed infra. Coded + 43 tests, but
-  cannot RUN offline (retrieve-only needs account + deployed KB; generation eval also needs
-  the deployed bot).
-  - `dataset_loader.py` — reads human-authored Q&A CSV (columns: question, reference_answer,
-    optional source/notes) into `QAPair`s. reference_answer is the expected end-to-end ANSWER
-    (Bedrock `referenceResponses`), not expected passages.
-  - `runner.py` — shared, type-agnostic job runner both eval types reuse: upload JSONL to S3,
-    build/submit `create_evaluation_job`, poll to terminal status, locate results. Pure
-    `build_create_job_request()` is unit-tested offline.
-  - `format_retrieve.py` — retrieve-only formatter (chunking/retrieval evaluator). Points at
-    the live KB; metrics `Builtin.ContextCoverage` + `Builtin.ContextRelevance`.
-  - `format_generate.py` — retrieve-and-generate formatter (answer-quality evaluator,
-    BRING-YOUR-OWN-INFERENCE). Defines `CapturedOutput`/`RetrievedPassage`/`Citation` types;
-    metrics Correctness/Completeness/Faithfulness/Helpfulness/Harmfulness + citation metrics
-    only when citations present. Retrieved-passages key isolated as `RETRIEVED_PASSAGES_KEY`
-    (`retrievedPassages` vs `retrievedResults` unresolved offline; confirm at first R&G run).
-  - `capture_outputs.py` — STUB (`NotImplementedError`). Once the bot is deployed, POSTs each
-    question to the bot's `/query` endpoint and maps the response to `CapturedOutput`.
-  - `run_retrieve_eval.py` / `run_generate_eval.py` — entrypoints (load CSV -> format ->
-    upload -> submit); argparse CLIs.
-  - `eval_config.yaml` — eval-infra config (bucket, evaluator model, region, role, KB id,
-    `retrieve`/`generate` sections), SEPARATE from root `config.yaml`; TBD until account.
-  - `datasets/sample_qa.csv` — placeholder sample.
-  - `tests/` — offline unit tests; boto3 stubbed in sys.modules.
-- `frontend/` — embeddable JS widget (Shadow DOM, vanilla JS, dependency-free).
-  - `widget.js` — the ONLY file shipped to users. Production-clean: it contains just
-    the real request path and NO mock code, mock data, or mock branching. It reads its
-    backend endpoint from its own `<script>` tag's `data-api-url` attribute (the one swap
-    point) and POSTs `{ query }` to that URL, rendering the `{ answer, sources }` contract.
-    Until `data-api-url` is set it shows a graceful "not connected yet" message.
-  - `mock.js` — dev-only backend stand-in, used ONLY by `demo.html` and the tests; it is
-    never shipped. In the browser it transparently monkeypatches `window.fetch` to answer
-    requests to the widget's `data-api-url` with canned responses (and a "trigger error"
-    backdoor -> HTTP 500 to exercise the error state); in Node it exports `mockQuery`. The
-    dependency direction is one-way: demo + tests reference the mock; `widget.js` never
-    does and has no awareness it exists.
-  - `demo.html` — offline dev harness (hostile-CSS Shadow DOM isolation test). Loads
-    `mock.js` before `widget.js` (defer preserves order) so the widget's normal fetch is
-    intercepted with no backend.
-  - `test/widget.contract.test.js` — zero-dependency Node tests (`node
-    test/widget.contract.test.js`): response-contract normalization + URL sanitizer in
-    widget.js, mock routing/shape in mock.js, and a static scan asserting widget.js stays
-    production-clean (no mock/backdoor/canned-source references).
-- `config.yaml` — declarative settings at the repo root; single source of truth for
-  changeable knobs (embedding model, vector store names/fields, crawler seed URLs +
-  filters + scope + rate limits, chunking, `retrieval.number_of_results`,
-  `generation.model_id`). The CDK app reads it at synth time via `infra/config.py`
-  (resolved relative to `__file__`, so cwd does not matter). Edit values here rather than
-  hardcoding in the stack.
-- `docs/` — design docs (`architecture.md`)
+- `infra/` - CDK Python app. Provisions ingestion (OSS collection + security policies, KB role, data-access policy, `CfnIndex`, `AWS::Bedrock::KnowledgeBase`, `AWS::Bedrock::DataSource` type WEB) and the query path (Lambda + own role, HTTP API with `POST /query`). Also hosts the widget (private S3 + CloudFront OAC, `BucketDeployment` of `frontend/widget.js` only) in the SAME stack (OAC cross-stack cyclical dependency), and defines the Bedrock guardrail (`CfnGuardrail` + `CfnGuardrailVersion`). Outputs a paste-ready embed tag + CloudFront domain + `/query` URL.
+  - `app.py` - CDK entrypoint; loads `config.yaml`, passes to stack
+  - `infra/infra_stack.py` - the stack (`GavilanChatbotStack`)
+  - `infra/config.py` - `load_config()`; resolves repo-root `config.yaml` from `__file__`
+  - `tests/unit/` - `test_infra_stack.py` (Template.from_stack assertions), `test_handler.py` (boto3 stubbed, payload-2.0 events)
+- `app/` - Lambda. `handler.py`: HTTP API (payload 2.0) entrypoint; `retrieve()` (KB `Retrieve`, returns `{text, source}` per chunk) then `generate()` (Bedrock Converse). Wiring from env vars set by the stack. boto3 provided by the runtime.
+  - `system_prompt.md` - finalized system prompt; read once at cold start, passed via Converse `system`. Packaged via `Code.from_asset(app/)`.
+- `eval/` - Bedrock RAG eval harness (boto3 tooling, NOT CDK). Runs on demand against deployed infra; cannot run offline. Retrieve-only formatter (chunking eval) + retrieve-and-generate formatter (answer quality, bring-your-own-inference). `capture_outputs.py` is a STUB until the bot is deployed. Separate `eval_config.yaml`.
+- `frontend/` - embeddable widget. `widget.js` is the ONLY file shipped (production-clean, no mock code); reads its endpoint from its `<script>` tag's `data-api-url`, POSTs `{query}`, renders `{answer, sources}`. `mock.js` (dev-only fetch stub) + `demo.html` (offline harness) + `test/widget.contract.test.js` (zero-dep Node tests) never ship; dependency direction is one-way (widget never references the mock).
+- `config.yaml` - declarative settings at repo root; embedding model, vector store names/fields, crawler seeds/filters/scope/rate limits, chunking, `retrieval.number_of_results`, `generation.model_id`. CDK reads it at synth via `infra/config.py`. Edit values here, do not hardcode in the stack.
+- `docs/` - design docs (`architecture.md`).
+
+## Excluded-for-v1 decisions (rationale in architecture.md; do not reintroduce)
+
+- **Contextual grounding EXCLUDED.** AWS doesn't support it for conversational chatbots; requires fragile `guardContent` message-tagging (silent-failure trap). The system prompt handles grounding. Revisit via standalone `ApplyGuardrail`, not inline Converse tagging.
+- **WAF EXCLUDED.** WAF can't attach to HTTP API v2 (would need a second CloudFront fronting the API). Thin threat surface; API Gateway throttling is the real cost-abuse control. Revisit only on a compliance mandate.
+- **`generative-ai-cdk-constructs` Bedrock L2s EXCLUDED (deprecated).** That is WHY the stack is L1 `Cfn*`. Do not reintroduce.
+
+## Guardrail note
+
+Needs `bedrock:ApplyGuardrail` on the guardrail ARN alongside `InvokeModel`, or it silently fails at runtime. The Lambda pins to a published numbered guardrail version; live policy/message edits require a new version.
 
 ## Hard rules
 
 - **Do not touch Git.** Never commit or do anything related to GitHub.
 - **Behavior lives in the system prompt, not routing code** (v1). Textbook clarifying questions and out-of-scope handling are prompt instructions, not Lambda branches.
 
-
 ## Writing style
 
-Avoid em dashes (—); use " - " or parentheses instead.
+Avoid em dashes; use " - " or parentheses instead.
 
 ## When testing
 
@@ -182,33 +94,22 @@ Never hide failures. Show all test results, including failures, in full.
 
 Things learned the hard way. Read before repeating the same work.
 
-- **Verify CDK construct APIs against the installed package, not memory.** The Bedrock/OSS
-  construct surface is in flux and training data is stale. For `aws-cdk-lib==2.260.0`,
-  introspecting the installed package settled several points that live docs got wrong:
-  `CfnIndex` takes structured `mappings`/`settings` (not an `index_body` blob);
-  `VectorKnowledgeBaseConfigurationProperty` has no `type` (the `type` is on
-  `KnowledgeBaseConfigurationProperty`); `CfnIndex.MethodProperty` uses
-  `name`/`engine`/`space_type`/`parameters`.
-- **HTTP API v2 is in `aws-cdk-lib` core as of 2.260.0.** `HttpApi` +
-  `CorsPreflightOptions` live in `aws_cdk.aws_apigatewayv2` and `HttpLambdaIntegration` in
-  `aws_cdk.aws_apigatewayv2_integrations`. The old `aws-cdk.aws-apigatewayv2-alpha` /
-  `-integrations-alpha` packages are gone (import fails) and are NOT needed. Decision:
-  HTTP API, not REST (~71% cheaper for a Lambda-proxy job, no REST-only features needed).
-  `HttpLambdaIntegration` defaults to payload format version 2.0.
-- **Deploy-time gaps `cdk synth` cannot catch (no surprises later):**
-  - The CDK/CloudFormation execution role needs `aoss:` permissions to create the index at
-    deploy time (the default bootstrap role has `es:*`, not `aoss:*`). It must also appear
-    as a Principal in the data access policy, since CloudFormation, not the KB role, is the
-    principal that actually creates `CfnIndex`. Today the policy names only the KB role.
-  - `CfnIndex` creation is eventually-consistent; the KB may race the index becoming ACTIVE
-    on first real deploy. Fallback if it does: a custom-resource index creator.
-  - **CloudFront is slow to create AND destroy (~15-30 min each).** The widget distribution
-    dominates `cdk deploy`/`cdk destroy` wall-clock time. The distribution's actual serving
-    behavior (OAC read of the S3 object, cache, HTTPS redirect) is only verifiable at deploy,
-    not by `cdk synth`.
-  - **OAC + `auto_delete_objects` dependency cycle.** Do NOT add an explicit
-    `distribution.node.add_dependency(bucket)`: the origin already references the bucket, and
-    the explicit edge pulls in the bucket's auto-delete custom resource, which `DependsOn` the
-    OAC bucket policy, which `DependsOn` the distribution -> a synth-blocking cycle. The bug
-    surfaces in `Template.from_stack` (tests) even when a plain `cdk synth` looks fine, so keep
-    the infra tests in the loop.
+- **Verify CDK construct APIs against the installed package, not memory.** The Bedrock/OSS construct surface is in flux and training data is stale. For `aws-cdk-lib==2.260.0`, introspecting the installed package settled several points live docs got wrong: `CfnIndex` takes structured `mappings`/`settings` (not an `index_body` blob); `VectorKnowledgeBaseConfigurationProperty` has no `type` (the `type` is on `KnowledgeBaseConfigurationProperty`); `CfnIndex.MethodProperty` uses `name`/`engine`/`space_type`/`parameters`.
+- **HTTP API v2 is in `aws-cdk-lib` core as of 2.260.0.** `HttpApi` + `CorsPreflightOptions` live in `aws_cdk.aws_apigatewayv2`, `HttpLambdaIntegration` in `aws_cdk.aws_apigatewayv2_integrations`. The old `-alpha` packages are gone (import fails) and are NOT needed. HTTP API not REST (~71% cheaper for a Lambda-proxy job). `HttpLambdaIntegration` defaults to payload format 2.0.
+- **Deploy-time gaps `cdk synth` cannot catch:**
+  - The CloudFormation execution role needs `aoss:` permissions to create the index at deploy time (default bootstrap role has `es:*`, not `aoss:*`). It must also appear as a Principal in the data-access policy, since CloudFormation (not the KB role) is the principal that creates `CfnIndex`. Today the policy names only the KB role.
+  - `CfnIndex` creation is eventually-consistent; the KB may race the index becoming ACTIVE on first deploy. Fallback: a custom-resource index creator.
+  - **CloudFront is slow to create AND destroy (~15-30 min each).** The widget distribution dominates `cdk deploy`/`destroy` wall-clock. Actual serving behavior (OAC read, cache, HTTPS redirect) is only verifiable at deploy.
+  - **OAC + `auto_delete_objects` dependency cycle.** Do NOT add an explicit `distribution.node.add_dependency(bucket)`: the origin already references the bucket, and the explicit edge pulls in the bucket's auto-delete custom resource, which `DependsOn` the OAC bucket policy, which `DependsOn` the distribution -> a synth-blocking cycle. Surfaces in `Template.from_stack` (tests) even when plain `cdk synth` looks fine; keep infra tests in the loop.
+  - Config keys reach the from_asset(app/) Lambda ONLY as stack-set env vars 
+  (the bundle excludes config.yaml). A new config knob needs three touches - 
+  config.yaml, stack env-wiring, handler read - or it silently no-ops. 
+  Synth-time-only keys (throttle limits) are read by the stack directly and 
+  don't need the bridge.
+- Two non-obvious "don't "fix" these" traps: the OSS data-access policy names 
+  the cfn-exec role via a token-built ARN, NOT synthesizer.cloud_formation_
+  execution_role_arn (that accessor emits Fn::Sub text the plain-JSON policy 
+  won't resolve). And invoking a Claude model needs a us.-prefixed inference 
+  profile (bare model IDs are rejected), which requires InvokeModel* on the 
+  profile ARN plus foundation-model ARNs across routed regions, not the 
+  single-ARN on-demand grant.
