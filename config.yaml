@@ -15,6 +15,18 @@ vector_store:
   # names are derived from this (<name>-enc / -net / -data).
   collection_name: gavilan-library-kb
   index_name: bedrock-knowledge-base-default-index
+  # OpenSearch Serverless NextGen: the collection belongs to a collection group, and the
+  # group's capacity limits drive scale-to-zero. min_* = 0 lets the group idle to zero OCU,
+  # killing the ~$350/mo Classic always-on floor; max_* caps burst (small is plenty for a
+  # low-traffic library bot). The stack forces StandbyReplicas ENABLED (NextGen rejects
+  # DISABLED) and Generation NEXTGEN. Without this group the collection provisions as CLASSIC.
+  # Names must be lowercase and <= 32 chars.
+  collection_group:
+    name: gavilan-library-kb-grp
+    min_indexing_ocu: 0
+    min_search_ocu: 0
+    max_indexing_ocu: 2
+    max_search_ocu: 2
   # Field names MUST stay identical between the index mappings and the KB field mapping.
   # These are the Bedrock console defaults, kept for compatibility.
   fields:
