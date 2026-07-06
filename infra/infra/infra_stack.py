@@ -63,6 +63,7 @@ class GavilanChatbotStack(Stack):
         kb_cfg = config["knowledge_base"]
         vs_cfg = config["vector_store"]
         fields = vs_cfg["fields"]
+        hnsw = vs_cfg["hnsw"]
         web_cfg = config["data_source"]["web_crawler"]
         chunking_cfg = config["chunking"]
         http_api_cfg = config["http_api"]
@@ -73,7 +74,6 @@ class GavilanChatbotStack(Stack):
 
         kb_name = kb_cfg["name"]
         collection_name = vs_cfg["collection_name"]
-        collection_group_cfg = vs_cfg["collection_group"]
         index_name = vs_cfg["index_name"]
         vector_field = fields["vector"]
         text_field = fields["text"]
@@ -132,46 +132,16 @@ class GavilanChatbotStack(Stack):
             ),
         )
 
-        # --- NextGen collection group -------------------------------------------------
-
-        # A NextGen (scale-to-zero) collection MUST belong to a collection group. The group's
-        # capacity limits are what enable scale-to-zero: min OCU = 0 lets it idle to zero,
-        # killing the ~$350/mo Classic always-on OCU floor. A collection with no group
-        # provisions as CLASSIC (the bug this fixes). Notes on the fixed values:
-        #  - standby_replicas MUST be "ENABLED"; NextGen groups reject "DISABLED" with a
-        #    ValidationException, so it is not a config knob.
-        #  - generation="NEXTGEN" selects the NextGen generation (the prop exists in
-        #    aws-cdk-lib 2.260.0; a bare group is not assumed to imply NextGen).
-        #  - ServerlessVectorAcceleration auto-enables on NextGen vector collections, so
-        #    vector_options is intentionally left unset on the collection.
-        collection_group = oss.CfnCollectionGroup(
-            self,
-            "VectorCollectionGroup",
-            name=collection_group_cfg["name"],
-            standby_replicas="ENABLED",
-            generation="NEXTGEN",
-            capacity_limits=oss.CfnCollectionGroup.CapacityLimitsProperty(
-                min_indexing_capacity_in_ocu=collection_group_cfg["min_indexing_ocu"],
-                min_search_capacity_in_ocu=collection_group_cfg["min_search_ocu"],
-                max_indexing_capacity_in_ocu=collection_group_cfg["max_indexing_ocu"],
-                max_search_capacity_in_ocu=collection_group_cfg["max_search_ocu"],
-            ),
-            description="NextGen scale-to-zero group for the Gavilan Library vector collection.",
-        )
-
         collection = oss.CfnCollection(
             self,
             "VectorCollection",
             name=collection_name,
             type="VECTORSEARCH",
-            # Belonging to the NextGen group is what makes this collection NextGen, not Classic.
-            collection_group_name=collection_group_cfg["name"],
             description="Vector store for the Gavilan Library Bedrock Knowledge Base.",
         )
-        # The collection cannot be created before its security policies or its group exist.
+        # The collection cannot be created before its security policies exist.
         collection.add_dependency(encryption_policy)
         collection.add_dependency(network_policy)
-        collection.add_dependency(collection_group)
 
         # --- Knowledge Base execution role --------------------------------------------
 
@@ -275,17 +245,6 @@ class GavilanChatbotStack(Stack):
         # knn_vector field at the configured dimension (Titan v2 = 1024), plus a text
         # chunk field and a stored (non-indexed) metadata field. Field names come from
         # config and MUST match the KB field_mapping below.
-        #
-        # NextGen uses a SIMPLIFIED vector index API: declare only {type: knn_vector,
-        # dimension} and NextGen auto-configures the k-NN method internally (HNSW, 32x
-        # compression, Euclidean/l2 distance by default - which matches the Bedrock console
-        # default this index replaces). The Classic `method` block is REJECTED at deploy time
-        # on a NextGen collection: `engine` fails with "[illegal_argument_exception] Field
-        # parameter 'engine' is not supported" (engine and mode are unsupported on NextGen).
-        # Do NOT reintroduce a method/engine block here. `space_type` is intentionally omitted:
-        # aws-cdk-lib 2.260.0's PropertyMappingProperty has no top-level SpaceType (it can only
-        # be set inside the method block, which NextGen doesn't want), and NextGen defaults to
-        # l2 - the metric this store uses anyway - so the default is correct.
         vector_index = oss.CfnIndex(
             self,
             "VectorIndex",
@@ -296,6 +255,15 @@ class GavilanChatbotStack(Stack):
                     vector_field: oss.CfnIndex.PropertyMappingProperty(
                         type="knn_vector",
                         dimension=kb_cfg["vector_dimension"],
+                        method=oss.CfnIndex.MethodProperty(
+                            name="hnsw",
+                            engine=hnsw["engine"],
+                            space_type=hnsw["space_type"],
+                            parameters=oss.CfnIndex.ParametersProperty(
+                                ef_construction=hnsw["ef_construction"],
+                                m=hnsw["m"],
+                            ),
+                        ),
                     ),
                     text_field: oss.CfnIndex.PropertyMappingProperty(type="text"),
                     metadata_field: oss.CfnIndex.PropertyMappingProperty(
