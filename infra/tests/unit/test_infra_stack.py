@@ -76,13 +76,42 @@ def _query_role_statements(template):
 
 def test_vector_collection_and_policies_created():
     template = _template()
+    # The collection must reference the NextGen collection group by name, or it provisions as
+    # CLASSIC (always-on OCU floor) instead of NextGen (scale-to-zero).
     template.has_resource_properties(
         "AWS::OpenSearchServerless::Collection",
-        {"Name": CONFIG["vector_store"]["collection_name"], "Type": "VECTORSEARCH"},
+        {
+            "Name": CONFIG["vector_store"]["collection_name"],
+            "Type": "VECTORSEARCH",
+            "CollectionGroupName": CONFIG["vector_store"]["collection_group"]["name"],
+        },
     )
     # Encryption + network policies.
     template.resource_count_is("AWS::OpenSearchServerless::SecurityPolicy", 2)
     template.resource_count_is("AWS::OpenSearchServerless::AccessPolicy", 1)
+
+
+def test_nextgen_collection_group_scale_to_zero():
+    # The collection group is what makes the collection NextGen (scale-to-zero). StandbyReplicas
+    # MUST be ENABLED (NextGen rejects DISABLED), Generation MUST be NEXTGEN, and min OCU = 0 is
+    # what lets the group idle to zero and kill the ~$350/mo Classic always-on floor.
+    template = _template()
+    cg = CONFIG["vector_store"]["collection_group"]
+    template.resource_count_is("AWS::OpenSearchServerless::CollectionGroup", 1)
+    template.has_resource_properties(
+        "AWS::OpenSearchServerless::CollectionGroup",
+        {
+            "Name": cg["name"],
+            "StandbyReplicas": "ENABLED",
+            "Generation": "NEXTGEN",
+            "CapacityLimits": {
+                "MinIndexingCapacityInOcu": 0,
+                "MinSearchCapacityInOcu": 0,
+                "MaxIndexingCapacityInOcu": cg["max_indexing_ocu"],
+                "MaxSearchCapacityInOcu": cg["max_search_ocu"],
+            },
+        },
+    )
 
 
 def _oss_policy(template, policy_type):

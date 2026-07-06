@@ -74,6 +74,7 @@ class GavilanChatbotStack(Stack):
 
         kb_name = kb_cfg["name"]
         collection_name = vs_cfg["collection_name"]
+        collection_group_cfg = vs_cfg["collection_group"]
         index_name = vs_cfg["index_name"]
         vector_field = fields["vector"]
         text_field = fields["text"]
@@ -132,16 +133,46 @@ class GavilanChatbotStack(Stack):
             ),
         )
 
+        # --- NextGen collection group -------------------------------------------------
+
+        # A NextGen (scale-to-zero) collection MUST belong to a collection group. The group's
+        # capacity limits are what enable scale-to-zero: min OCU = 0 lets it idle to zero,
+        # killing the ~$350/mo Classic always-on OCU floor. A collection with no group
+        # provisions as CLASSIC (the bug this fixes). Notes on the fixed values:
+        #  - standby_replicas MUST be "ENABLED"; NextGen groups reject "DISABLED" with a
+        #    ValidationException, so it is not a config knob.
+        #  - generation="NEXTGEN" selects the NextGen generation (the prop exists in
+        #    aws-cdk-lib 2.260.0; a bare group is not assumed to imply NextGen).
+        #  - ServerlessVectorAcceleration auto-enables on NextGen vector collections, so
+        #    vector_options is intentionally left unset on the collection.
+        collection_group = oss.CfnCollectionGroup(
+            self,
+            "VectorCollectionGroup",
+            name=collection_group_cfg["name"],
+            standby_replicas="ENABLED",
+            generation="NEXTGEN",
+            capacity_limits=oss.CfnCollectionGroup.CapacityLimitsProperty(
+                min_indexing_capacity_in_ocu=collection_group_cfg["min_indexing_ocu"],
+                min_search_capacity_in_ocu=collection_group_cfg["min_search_ocu"],
+                max_indexing_capacity_in_ocu=collection_group_cfg["max_indexing_ocu"],
+                max_search_capacity_in_ocu=collection_group_cfg["max_search_ocu"],
+            ),
+            description="NextGen scale-to-zero group for the Gavilan Library vector collection.",
+        )
+
         collection = oss.CfnCollection(
             self,
             "VectorCollection",
             name=collection_name,
             type="VECTORSEARCH",
+            # Belonging to the NextGen group is what makes this collection NextGen, not Classic.
+            collection_group_name=collection_group_cfg["name"],
             description="Vector store for the Gavilan Library Bedrock Knowledge Base.",
         )
-        # The collection cannot be created before its security policies exist.
+        # The collection cannot be created before its security policies or its group exist.
         collection.add_dependency(encryption_policy)
         collection.add_dependency(network_policy)
+        collection.add_dependency(collection_group)
 
         # --- Knowledge Base execution role --------------------------------------------
 
