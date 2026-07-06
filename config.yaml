@@ -76,7 +76,7 @@ retrieval:
 generation:
   # Bedrock-hosted Claude model for answer generation, invoked via a CROSS-REGION INFERENCE
   # PROFILE.
-  model_id: us.anthropic.claude-3-5-haiku-20241022-v1:0
+  model_id: us.anthropic.claude-sonnet-4-6
   # Converse inference knobs. A factual FAQ bot wants short, direct, low-variance answers: cap
   # the output length and keep temperature low. Sensible ranges: max_tokens ~500-700,
   # temperature 0-0.3.

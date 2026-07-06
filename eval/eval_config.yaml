@@ -5,10 +5,10 @@
 # access.
 
 eval:
-  # AWS region where Bedrock evaluation jobs run. Must be set to the region the stack
-  # deploys into (the same one chosen for KB + Web Crawler + OSS NextGen). Left unset on
-  # purpose so a wrong-region run fails loudly instead of silently using a default.
-  region: REGION_TBD
+  # AWS region where Bedrock evaluation jobs run. Must match the region the stack deploys
+  # into (the same one chosen for KB + Web Crawler + OSS NextGen). Set to the confirmed
+  # deploy region us-west-2, where the generation model's inference profile is served.
+  region: us-west-2
 
   # IAM role Bedrock assumes to run the job. Needs read/write on the eval S3 bucket and
   # access to the evaluator model. TBD: real role ARN.
