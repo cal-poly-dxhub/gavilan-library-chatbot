@@ -63,7 +63,6 @@ class GavilanChatbotStack(Stack):
         kb_cfg = config["knowledge_base"]
         vs_cfg = config["vector_store"]
         fields = vs_cfg["fields"]
-        hnsw = vs_cfg["hnsw"]
         web_cfg = config["data_source"]["web_crawler"]
         chunking_cfg = config["chunking"]
         http_api_cfg = config["http_api"]
@@ -276,6 +275,17 @@ class GavilanChatbotStack(Stack):
         # knn_vector field at the configured dimension (Titan v2 = 1024), plus a text
         # chunk field and a stored (non-indexed) metadata field. Field names come from
         # config and MUST match the KB field_mapping below.
+        #
+        # NextGen uses a SIMPLIFIED vector index API: declare only {type: knn_vector,
+        # dimension} and NextGen auto-configures the k-NN method internally (HNSW, 32x
+        # compression, Euclidean/l2 distance by default - which matches the Bedrock console
+        # default this index replaces). The Classic `method` block is REJECTED at deploy time
+        # on a NextGen collection: `engine` fails with "[illegal_argument_exception] Field
+        # parameter 'engine' is not supported" (engine and mode are unsupported on NextGen).
+        # Do NOT reintroduce a method/engine block here. `space_type` is intentionally omitted:
+        # aws-cdk-lib 2.260.0's PropertyMappingProperty has no top-level SpaceType (it can only
+        # be set inside the method block, which NextGen doesn't want), and NextGen defaults to
+        # l2 - the metric this store uses anyway - so the default is correct.
         vector_index = oss.CfnIndex(
             self,
             "VectorIndex",
@@ -286,15 +296,6 @@ class GavilanChatbotStack(Stack):
                     vector_field: oss.CfnIndex.PropertyMappingProperty(
                         type="knn_vector",
                         dimension=kb_cfg["vector_dimension"],
-                        method=oss.CfnIndex.MethodProperty(
-                            name="hnsw",
-                            engine=hnsw["engine"],
-                            space_type=hnsw["space_type"],
-                            parameters=oss.CfnIndex.ParametersProperty(
-                                ef_construction=hnsw["ef_construction"],
-                                m=hnsw["m"],
-                            ),
-                        ),
                     ),
                     text_field: oss.CfnIndex.PropertyMappingProperty(type="text"),
                     metadata_field: oss.CfnIndex.PropertyMappingProperty(

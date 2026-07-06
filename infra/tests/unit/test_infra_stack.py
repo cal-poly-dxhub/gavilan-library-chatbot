@@ -177,6 +177,23 @@ def test_vector_index_uses_configured_dimensions():
     )
 
 
+def test_vector_index_has_no_classic_method_or_engine():
+    # NextGen collections REJECT the Classic `method`/`engine` block at deploy time
+    # ("Field parameter 'engine' is not supported"). has_resource_properties above is a subset
+    # match and would pass even if a stray method block existed, so assert the vector field
+    # mapping directly: it must carry ONLY Type + Dimension, with no Method/Engine/SpaceType.
+    template = _template()
+    index = _one(template, "AWS::OpenSearchServerless::Index")
+    vector_field = CONFIG["vector_store"]["fields"]["vector"]
+    field_mapping = index["Properties"]["Mappings"]["Properties"][vector_field]
+    assert field_mapping == {
+        "Type": "knn_vector",
+        "Dimension": CONFIG["knowledge_base"]["vector_dimension"],
+    }, field_mapping
+    assert "Method" not in field_mapping, field_mapping
+    assert "Engine" not in field_mapping, field_mapping
+
+
 def test_knowledge_base_field_mapping_matches_index():
     template = _template()
     fields = CONFIG["vector_store"]["fields"]

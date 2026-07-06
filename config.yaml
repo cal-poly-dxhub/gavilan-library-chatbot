@@ -33,12 +33,11 @@ vector_store:
     vector: bedrock-knowledge-base-default-vector
     text: AMAZON_BEDROCK_TEXT_CHUNK
     metadata: AMAZON_BEDROCK_METADATA
-  # knn (HNSW) index parameters.
-  hnsw:
-    engine: faiss
-    space_type: l2
-    ef_construction: 512
-    m: 16
+  # No knn/HNSW tuning block: this collection is NextGen, whose simplified vector index API
+  # auto-configures the k-NN method internally (HNSW, 32x compression, Euclidean/l2 distance
+  # by default). NextGen REJECTS the Classic `engine` parameter at deploy time, so faiss/
+  # ef_construction/m are neither set nor needed. The index declares only {knn_vector,
+  # dimension} - see the CfnIndex in infra_stack.py.
 
 data_source:
   web_crawler:
