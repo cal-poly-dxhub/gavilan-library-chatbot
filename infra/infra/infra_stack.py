@@ -18,13 +18,19 @@ All changeable knobs come from the repo-root config.yaml
 
 import hashlib
 import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
+import jsii
 from aws_cdk import (
+    AssetHashType,
+    BundlingOptions,
     CfnOutput,
     DefaultStackSynthesizer,
     Duration,
+    ILocalBundling,
     RemovalPolicy,
     Stack,
     aws_apigatewayv2 as apigwv2,
@@ -32,6 +38,8 @@ from aws_cdk import (
     aws_bedrock as bedrock,
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as origins,
+    aws_events as events,
+    aws_events_targets as events_targets,
     aws_iam as iam,
     aws_lambda as _lambda,
     aws_logs as logs,
@@ -47,6 +55,50 @@ _APP_DIR = Path(__file__).resolve().parents[2] / "app"
 # Repo-root frontend/ directory. Only widget.js is uploaded (mock.js / demo.html are
 # dev-only and must never ship to production).
 _FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
+
+# Repo-root scraper/ directory: the scraper Lambda's source (scraper.py + lambda_function.py)
+# and its requirements.txt (the deps built into the Lambda layer below).
+_SCRAPER_DIR = Path(__file__).resolve().parents[2] / "scraper"
+
+# The scraper Lambda's architecture and the MATCHING manylinux wheel tag. trafilatura pulls in
+# lxml and regex - compiled C extensions - so the layer must contain Linux (x86_64) wheels, not
+# the macOS wheels a plain `pip install` produces on a dev Mac. Keep these two in lockstep.
+_LAMBDA_PYTHON = _lambda.Runtime.PYTHON_3_13
+_LAMBDA_ARCH = _lambda.Architecture.X86_64
+_MANYLINUX_TAG = "manylinux2014_x86_64"
+_LAMBDA_PY_TAG = "3.13"
+
+
+@jsii.implements(ILocalBundling)
+class _PipManylinuxLayerBundler:
+    """Builds the scraper's deps as a Lambda layer using prebuilt manylinux wheels via
+    `pip --platform ... --only-binary=:all:` - NO Docker, NO compiler. This is AWS's documented
+    method for compiled deps (lxml/regex): --platform + --only-binary forces pip to download the
+    Linux wheel matching the Lambda architecture instead of building a macOS binary that would
+    fail at runtime with an ELF/Mach-O error.
+
+    Returns False on any failure so CDK falls back to the BundlingOptions Docker `image`/`command`
+    (the required fallback if a transitive dep ever lacks a manylinux wheel).
+    """
+
+    def try_bundle(self, output_dir: str, *, image=None, **_kwargs) -> bool:
+        try:
+            subprocess.run(
+                [
+                    sys.executable, "-m", "pip", "install",
+                    "-r", str(_SCRAPER_DIR / "requirements.txt"),
+                    "--platform", _MANYLINUX_TAG,
+                    "--python-version", _LAMBDA_PY_TAG,
+                    "--implementation", "cp",
+                    "--only-binary=:all:",
+                    "--target", str(Path(output_dir) / "python"),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            return True
+        except Exception:  # no local pip / missing wheel -> let CDK try Docker bundling
+            return False
 
 
 class GavilanChatbotStack(Stack):
@@ -65,6 +117,7 @@ class GavilanChatbotStack(Stack):
         fields = vs_cfg["fields"]
         hnsw = vs_cfg["hnsw"]
         chunking_cfg = config["chunking"]
+        scraper_cfg = config["scraper"]
         http_api_cfg = config["http_api"]
         request_cfg = config["request"]
         retrieval_cfg = config["retrieval"]
@@ -368,6 +421,111 @@ class GavilanChatbotStack(Stack):
         )
         # The data source cannot be created before the KB exists.
         s3_data_source.add_dependency(knowledge_base)
+
+        # --- Scraper Lambda: feeds the S3 source bucket + triggers ingestion -----------
+
+        # Dependency LAYER: trafilatura + lxml + regex + httpx as manylinux x86_64 wheels. Built
+        # locally with pip --platform (no Docker); Docker bundling is the fallback if a wheel is
+        # ever missing. asset_hash_type=OUTPUT so the hash tracks the built layer, not the source
+        # dir (which carries .venv/tests). See _PipManylinuxLayerBundler.
+        scraper_deps_layer = _lambda.LayerVersion(
+            self,
+            "ScraperDepsLayer",
+            description="trafilatura/lxml/regex/httpx (manylinux x86_64) for the scraper Lambda.",
+            compatible_runtimes=[_LAMBDA_PYTHON],
+            compatible_architectures=[_LAMBDA_ARCH],
+            code=_lambda.Code.from_asset(
+                str(_SCRAPER_DIR),
+                asset_hash_type=AssetHashType.OUTPUT,
+                exclude=["*", "!requirements.txt"],
+                bundling=BundlingOptions(
+                    image=_LAMBDA_PYTHON.bundling_image,
+                    local=_PipManylinuxLayerBundler(),
+                    # Docker fallback: inside the Linux bundling image, a plain install yields
+                    # correct Linux wheels natively. platform pins x86_64 even on an ARM Mac.
+                    command=[
+                        "bash",
+                        "-c",
+                        "pip install -r requirements.txt --target /asset-output/python",
+                    ],
+                    platform="linux/amd64",
+                ),
+            ),
+        )
+
+        # Its OWN execution role: basic logs + narrow S3 write + narrow StartIngestionJob.
+        scraper_lambda_role = iam.Role(
+            self,
+            "ScraperFunctionRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            description="Execution role for the scraper Lambda (scrape -> S3 -> start ingestion).",
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AWSLambdaBasicExecutionRole"
+                )
+            ],
+        )
+        # Upload markdown + metadata sidecars into the KB source bucket (objects only, one bucket).
+        scraper_lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:PutObject"],
+                resources=[source_bucket.arn_for_objects("*")],
+            )
+        )
+        # Trigger ingestion of the fresh content on the specific KB (StartIngestionJob is scoped
+        # to the knowledge-base ARN; it covers that KB's data sources).
+        scraper_lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["bedrock:StartIngestionJob"],
+                resources=[knowledge_base.attr_knowledge_base_arn],
+            )
+        )
+
+        scraper_log_group = logs.LogGroup(
+            self,
+            "ScraperFunctionLogGroup",
+            retention=logs.RetentionDays.THREE_MONTHS,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        scraper_lambda = _lambda.Function(
+            self,
+            "ScraperFunction",
+            runtime=_LAMBDA_PYTHON,
+            architecture=_LAMBDA_ARCH,
+            handler="lambda_function.handler",
+            # Ship only the two source files; deps come from the layer, boto3 from the runtime.
+            code=_lambda.Code.from_asset(
+                str(_SCRAPER_DIR),
+                exclude=["*", "!scraper.py", "!lambda_function.py"],
+            ),
+            layers=[scraper_deps_layer],
+            role=scraper_lambda_role,
+            # ~16+ pages fetched + parsed sequentially (trafilatura is CPU-ish), then uploaded.
+            timeout=Duration.minutes(5),
+            memory_size=512,
+            log_group=scraper_log_group,
+            environment={
+                "SEED_URLS": json.dumps(scraper_cfg["seed_urls"]),
+                "SCRAPE_TIMEOUT_SECONDS": str(scraper_cfg.get("timeout_seconds", 20)),
+                "SCRAPER_USER_AGENT": scraper_cfg.get("user_agent", ""),
+                "SOURCE_BUCKET": source_bucket.bucket_name,
+                "KNOWLEDGE_BASE_ID": knowledge_base.attr_knowledge_base_id,
+                "DATA_SOURCE_ID": s3_data_source.attr_data_source_id,
+            },
+        )
+        # Needs the KB + data source (it calls StartIngestionJob on them at runtime).
+        scraper_lambda.node.add_dependency(s3_data_source)
+
+        # Weekly re-scrape on a maintenance-window schedule (cron from config.yaml, UTC). Keeps
+        # the KB fresh as the library site changes. EventBridge adds the invoke permission.
+        events.Rule(
+            self,
+            "ScraperSchedule",
+            description="Scheduled re-scrape of the Gavilan library site to refresh KB content.",
+            schedule=events.Schedule.expression(scraper_cfg["schedule_cron"]),
+            targets=[events_targets.LambdaFunction(scraper_lambda)],
+        )
 
         # --- Bedrock Guardrails: input screen + output backstop -----------------------
 

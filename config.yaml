@@ -72,6 +72,10 @@ scraper:
   output_dir: ./scraper_output
   timeout_seconds: 20
   user_agent: "GavilanLibraryScraper/1.0 (+https://www.gavilan.edu/library/)"
+  # EventBridge schedule for the automated re-scrape Lambda (maintenance window). Standard
+  # EventBridge cron, UTC. Default: weekly, Sunday 10:00 UTC (~2-3am Pacific), a low-traffic
+  # window. Change cadence here. (output_dir is local-run only; the Lambda uploads to S3.)
+  schedule_cron: "cron(0 10 ? * SUN *)"
 
 chunking:
   # v1 uses managed FIXED_SIZE chunking (architecture.md Phase 1). Phase 2 moves to

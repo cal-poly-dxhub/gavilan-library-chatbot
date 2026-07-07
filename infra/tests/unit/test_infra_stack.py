@@ -30,7 +30,10 @@ def _flatten_arn(value):
 
 
 def _template():
-    app = core.App()
+    # Skip asset bundling: the scraper deps layer bundles (pip --platform / Docker) at real synth,
+    # which needs no Docker for tests and would be slow/network-bound. The resources still
+    # synthesize with placeholder assets, which is all these property assertions inspect.
+    app = core.App(context={"aws:cdk:bundling-stacks": []})
     stack = GavilanChatbotStack(app, "GavilanChatbotStack", config=CONFIG)
     return assertions.Template.from_stack(stack)
 
@@ -519,6 +522,76 @@ def test_kb_role_can_read_source_bucket():
         # bucket ARN is a GetAtt; objects ARN is a Join of [GetAtt, "/*"].
         blob = json.dumps(r)
         assert "KnowledgeBaseSourceBucket" in blob, r
+
+
+# --- Scraper Lambda: deps layer, function, IAM, EventBridge schedule ----------------------------
+
+def _scraper_function(template):
+    """The scraper Lambda, identified by its handler (distinct from the query function)."""
+    funcs = template.find_resources(
+        "AWS::Lambda::Function",
+        {"Properties": {"Handler": "lambda_function.handler"}},
+    )
+    assert len(funcs) == 1, list(funcs)
+    return next(iter(funcs.values()))
+
+
+def test_scraper_lambda_has_deps_layer_and_arch():
+    template = _template()
+    # A LayerVersion carries the manylinux deps; the function uses it on x86_64 (matching the
+    # wheel platform tag), with a multi-minute timeout and a few hundred MB of memory. (Another
+    # LayerVersion - the AWS CLI layer - belongs to the widget BucketDeployment; identify ours by
+    # description rather than counting all layers.)
+    deps_layers = [
+        layer
+        for layer in template.find_resources("AWS::Lambda::LayerVersion").values()
+        if "trafilatura" in (layer["Properties"].get("Description") or "")
+    ]
+    assert len(deps_layers) == 1, deps_layers
+    func = _scraper_function(template)
+    props = func["Properties"]
+    assert props["Runtime"] == "python3.13"
+    assert props["Architectures"] == ["x86_64"]
+    assert props["Timeout"] == 300
+    assert props["MemorySize"] == 512
+    assert len(props["Layers"]) == 1
+
+
+def test_scraper_lambda_env_wires_bucket_kb_and_data_source():
+    template = _template()
+    env = _scraper_function(template)["Properties"]["Environment"]["Variables"]
+    # seed_urls come from config as a JSON string; bucket/KB/data-source are resource refs.
+    assert json.loads(env["SEED_URLS"]) == CONFIG["scraper"]["seed_urls"]
+    assert "SOURCE_BUCKET" in env and "KNOWLEDGE_BASE_ID" in env and "DATA_SOURCE_ID" in env
+
+
+def test_scraper_role_can_put_objects_and_start_ingestion():
+    template = _template()
+    statements = [
+        stmt
+        for policy in template.find_resources("AWS::IAM::Policy").values()
+        for stmt in policy["Properties"]["PolicyDocument"]["Statement"]
+    ]
+    puts = [s for s in statements if s["Action"] == "s3:PutObject"]
+    assert len(puts) == 1, puts
+    assert "KnowledgeBaseSourceBucket" in json.dumps(puts[0]["Resource"])
+
+    ingest = [s for s in statements if s["Action"] == "bedrock:StartIngestionJob"]
+    assert len(ingest) == 1, ingest
+    assert "KnowledgeBase" in json.dumps(ingest[0]["Resource"])
+
+
+def test_eventbridge_schedule_targets_the_scraper_lambda():
+    template = _template()
+    template.has_resource_properties(
+        "AWS::Events::Rule",
+        {"ScheduleExpression": CONFIG["scraper"]["schedule_cron"], "State": "ENABLED"},
+    )
+    # The rule targets exactly the scraper function (by its logical id via Fn::GetAtt Arn).
+    (rule,) = template.find_resources("AWS::Events::Rule").values()
+    targets = rule["Properties"]["Targets"]
+    assert len(targets) == 1, targets
+    assert "ScraperFunction" in json.dumps(targets[0]["Arn"])
 
 
 def test_widget_distribution_uses_oac_not_oai():
