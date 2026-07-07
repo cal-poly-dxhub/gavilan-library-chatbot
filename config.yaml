@@ -44,6 +44,39 @@ data_source:
     max_pages: 1000
     rate_limit: 300   # max crawl requests per minute
 
+# --- Custom scraper (standalone local tool; NOT part of the CDK/Lambda yet) ---
+#
+# Replaces the removed managed Web Crawler. For now it runs locally (scraper/scraper.py) and
+# writes clean markdown + a metadata JSON sidecar per page to output_dir for manual inspection;
+# a Lambda wrapper that uploads to the KB S3 source bucket comes next. seed_urls is an EXPLICIT
+# curated list - NO recursive crawling (the managed crawler over-crawled the /library/ tree and
+# hit ingestion limits; an explicit list is also how the sponsor's URL list will arrive).
+scraper:
+  seed_urls:
+    - https://www.gavilan.edu/library/howdoi.php
+    - https://www.gavilan.edu/library/libraryservices.php
+    - https://www.gavilan.edu/library/about-the-library.php
+    - https://www.gavilan.edu/library/contactus.php
+    - https://www.gavilan.edu/library/ill.php
+    - https://www.gavilan.edu/library/researchassistance.php
+    - https://www.gavilan.edu/library/findresources.php
+    - https://www.gavilan.edu/library/librarycard.php
+    - https://www.gavilan.edu/library/libcardexamples.php
+    - https://www.gavilan.edu/library/citingsources.php
+    - https://www.gavilan.edu/library/librarycourses.php
+    - https://www.gavilan.edu/library/facultyservices.php
+    - https://www.gavilan.edu/library/otherlibraries.php
+    - https://www.gavilan.edu/library/orientationrequest.php
+    - https://www.gavilan.edu/library/databases.php
+    - https://www.gavilan.edu/library/sites.php
+  output_dir: ./scraper_output
+  timeout_seconds: 20
+  user_agent: "GavilanLibraryScraper/1.0 (+https://www.gavilan.edu/library/)"
+  # EventBridge schedule for the automated re-scrape Lambda (maintenance window). Standard
+  # EventBridge cron, UTC. Default: weekly, Sunday 10:00 UTC (~2-3am Pacific), a low-traffic
+  # window. Change cadence here. (output_dir is local-run only; the Lambda uploads to S3.)
+  schedule_cron: "cron(0 10 ? * SUN *)"
+
 chunking:
   # v1 uses managed FIXED_SIZE chunking (architecture.md Phase 1). Phase 2 moves to
   # HIERARCHICAL. One of: FIXED_SIZE, HIERARCHICAL, SEMANTIC, NONE.

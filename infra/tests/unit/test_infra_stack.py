@@ -30,7 +30,10 @@ def _flatten_arn(value):
 
 
 def _template():
-    app = core.App()
+    # Skip asset bundling: the scraper deps layer bundles (pip --platform / Docker) at real synth,
+    # which needs no Docker for tests and would be slow/network-bound. The resources still
+    # synthesize with placeholder assets, which is all these property assertions inspect.
+    app = core.App(context={"aws:cdk:bundling-stacks": []})
     stack = GavilanChatbotStack(app, "GavilanChatbotStack", config=CONFIG)
     return assertions.Template.from_stack(stack)
 
@@ -180,32 +183,37 @@ def test_knowledge_base_created_after_index():
     assert any(dep.startswith("VectorIndex") for dep in depends_on), depends_on
 
 
-def test_web_crawler_data_source_reads_seed_urls_from_config():
+def test_s3_data_source_is_the_only_data_source():
+    # The KB now ingests from S3, not the managed Web Crawler. Exactly one data source, type S3;
+    # no WEB data source remains (the crawler was hard-coupled to OpenSearch Serverless).
     template = _template()
-    seed_urls = CONFIG["data_source"]["web_crawler"]["seed_urls"]
-    template.has_resource_properties(
-        "AWS::Bedrock::DataSource",
-        {
-            "DataSourceConfiguration": {
-                "Type": "WEB",
-                "WebConfiguration": {
-                    "SourceConfiguration": {
-                        "UrlConfiguration": {
-                            "SeedUrls": [{"Url": url} for url in seed_urls]
-                        }
-                    }
-                },
-            },
-            "VectorIngestionConfiguration": {
-                "ChunkingConfiguration": {
-                    "ChunkingStrategy": CONFIG["chunking"]["strategy"]
-                }
-            },
-        },
+    template.resource_count_is("AWS::Bedrock::DataSource", 1)
+    (source,) = template.find_resources("AWS::Bedrock::DataSource").values()
+    assert source["Properties"]["DataSourceConfiguration"]["Type"] == "S3", source
+    assert "WebConfiguration" not in source["Properties"]["DataSourceConfiguration"], source
+
+
+def test_s3_data_source_points_at_source_bucket_with_crawler_chunking():
+    template = _template()
+    (source,) = template.find_resources("AWS::Bedrock::DataSource").values()
+    ds_config = source["Properties"]["DataSourceConfiguration"]
+    # bucketArn references the source bucket via GetAtt (not a hardcoded ARN).
+    bucket_arn = ds_config["S3Configuration"]["BucketArn"]
+    assert bucket_arn["Fn::GetAtt"][0].startswith("KnowledgeBaseSourceBucket"), bucket_arn
+    # Same FIXED_SIZE chunking the crawler used, from config.
+    chunk = source["Properties"]["VectorIngestionConfiguration"]["ChunkingConfiguration"]
+    assert chunk["ChunkingStrategy"] == CONFIG["chunking"]["strategy"]
+    assert (
+        chunk["FixedSizeChunkingConfiguration"]["MaxTokens"]
+        == CONFIG["chunking"]["max_tokens"]
+    )
+    assert (
+        chunk["FixedSizeChunkingConfiguration"]["OverlapPercentage"]
+        == CONFIG["chunking"]["overlap_percentage"]
     )
 
 
-def test_web_crawler_data_source_created_after_knowledge_base():
+def test_data_source_created_after_knowledge_base():
     template = _template()
     sources = template.find_resources("AWS::Bedrock::DataSource")
     (source,) = sources.values()
@@ -460,9 +468,9 @@ def test_bare_on_demand_model_id_falls_back_to_single_foundation_model_grant():
 
 def test_widget_bucket_is_private_and_oac_ready():
     template = _template()
-    # Exactly one S3 bucket (the widget bucket): all public access blocked, and ACLs
-    # disabled via bucket-owner-enforced ownership (the ownership OAC requires).
-    template.resource_count_is("AWS::S3::Bucket", 1)
+    # Two S3 buckets now (widget + KB source), both fully private: all public access blocked,
+    # and ACLs disabled via bucket-owner-enforced ownership (the ownership OAC requires).
+    template.resource_count_is("AWS::S3::Bucket", 2)
     template.has_resource_properties(
         "AWS::S3::Bucket",
         {
@@ -477,6 +485,145 @@ def test_widget_bucket_is_private_and_oac_ready():
             },
         },
     )
+
+
+def test_kb_source_bucket_blocks_public_access():
+    # The KB source bucket must be fully private (public access blocked) - it will hold scraped
+    # library content, never served publicly (the KB reads it, CloudFront does not).
+    template = _template()
+    buckets = template.find_resources("AWS::S3::Bucket")
+    assert len(buckets) == 2, list(buckets)
+    for logical_id, res in buckets.items():
+        assert res["Properties"]["PublicAccessBlockConfiguration"] == {
+            "BlockPublicAcls": True,
+            "BlockPublicPolicy": True,
+            "IgnorePublicAcls": True,
+            "RestrictPublicBuckets": True,
+        }, logical_id
+
+
+def test_kb_role_can_read_source_bucket():
+    # KB execution role must be able to list the source bucket and get its objects, or ingestion
+    # from S3 fails. Wired through CDK (bucket ARN + /*), granted on the role's default policy.
+    template = _template()
+    # Collect S3 read statements across all inline policies (role default policies).
+    s3_reads = []
+    for policy in template.find_resources("AWS::IAM::Policy").values():
+        for stmt in policy["Properties"]["PolicyDocument"]["Statement"]:
+            actions = stmt["Action"]
+            actions = actions if isinstance(actions, list) else [actions]
+            if "s3:GetObject" in actions and "s3:ListBucket" in actions:
+                s3_reads.append(stmt)
+    assert len(s3_reads) == 1, s3_reads
+    resources = s3_reads[0]["Resource"]
+    # Two resources: the bucket ARN and its objects (/*), both GetAtt on the source bucket.
+    assert len(resources) == 2, resources
+    for r in resources:
+        # bucket ARN is a GetAtt; objects ARN is a Join of [GetAtt, "/*"].
+        blob = json.dumps(r)
+        assert "KnowledgeBaseSourceBucket" in blob, r
+
+
+# --- Scraper Lambda: deps layer, function, IAM, EventBridge schedule ----------------------------
+
+def _scraper_function(template):
+    """The scraper Lambda, identified by its handler (distinct from the query function)."""
+    funcs = template.find_resources(
+        "AWS::Lambda::Function",
+        {"Properties": {"Handler": "lambda_function.handler"}},
+    )
+    assert len(funcs) == 1, list(funcs)
+    return next(iter(funcs.values()))
+
+
+def test_scraper_lambda_has_deps_layer_and_arch():
+    template = _template()
+    # A LayerVersion carries the manylinux deps; the function uses it on x86_64 (matching the
+    # wheel platform tag), with a multi-minute timeout and a few hundred MB of memory. (Another
+    # LayerVersion - the AWS CLI layer - belongs to the widget BucketDeployment; identify ours by
+    # description rather than counting all layers.)
+    deps_layers = [
+        layer
+        for layer in template.find_resources("AWS::Lambda::LayerVersion").values()
+        if "trafilatura" in (layer["Properties"].get("Description") or "")
+    ]
+    assert len(deps_layers) == 1, deps_layers
+    func = _scraper_function(template)
+    props = func["Properties"]
+    assert props["Runtime"] == "python3.13"
+    assert props["Architectures"] == ["x86_64"]
+    assert props["Timeout"] == 300
+    assert props["MemorySize"] == 512
+    assert len(props["Layers"]) == 1
+
+
+def test_scraper_lambda_env_wires_bucket_kb_and_data_source():
+    template = _template()
+    env = _scraper_function(template)["Properties"]["Environment"]["Variables"]
+    # seed_urls come from config as a JSON string; bucket/KB/data-source are resource refs.
+    assert json.loads(env["SEED_URLS"]) == CONFIG["scraper"]["seed_urls"]
+    assert "SOURCE_BUCKET" in env and "KNOWLEDGE_BASE_ID" in env and "DATA_SOURCE_ID" in env
+
+
+def test_scraper_role_can_put_objects_and_start_ingestion():
+    template = _template()
+    statements = [
+        stmt
+        for policy in template.find_resources("AWS::IAM::Policy").values()
+        for stmt in policy["Properties"]["PolicyDocument"]["Statement"]
+    ]
+    puts = [s for s in statements if s["Action"] == "s3:PutObject"]
+    assert len(puts) == 1, puts
+    assert "KnowledgeBaseSourceBucket" in json.dumps(puts[0]["Resource"])
+
+    ingest = [s for s in statements if s["Action"] == "bedrock:StartIngestionJob"]
+    assert len(ingest) == 1, ingest
+    assert "KnowledgeBase" in json.dumps(ingest[0]["Resource"])
+
+
+def test_eventbridge_schedule_targets_the_scraper_lambda():
+    template = _template()
+    template.has_resource_properties(
+        "AWS::Events::Rule",
+        {"ScheduleExpression": CONFIG["scraper"]["schedule_cron"], "State": "ENABLED"},
+    )
+    # The rule targets exactly the scraper function (by its logical id via Fn::GetAtt Arn).
+    (rule,) = template.find_resources("AWS::Events::Rule").values()
+    targets = rule["Properties"]["Targets"]
+    assert len(targets) == 1, targets
+    assert "ScraperFunction" in json.dumps(targets[0]["Arn"])
+
+
+def test_install_trigger_invokes_scraper_fire_and_forget():
+    # A CDK triggers.Trigger runs the scraper ONCE at deploy so the KB is populated on install.
+    # EVENT invocation = fire-and-forget: the deploy dispatches it and never blocks/fails on the
+    # scrape result. execute_after wires ordering after the scraper + its write/ingest targets.
+    template = _template()
+    trigs = template.find_resources("Custom::Trigger")
+    assert len(trigs) == 1, list(trigs)
+    (trig,) = trigs.values()
+    props = trig["Properties"]
+    assert props["InvocationType"] == "Event"
+    assert "ScraperFunction" in json.dumps(props["HandlerArn"])
+    depends = json.dumps(trig.get("DependsOn", []))
+    for needle in ("ScraperFunction", "KnowledgeBase", "S3DataSource", "KnowledgeBaseSourceBucket"):
+        assert needle in depends, (needle, depends)
+
+
+def test_install_trigger_invoker_grant_is_scoped_to_the_scraper():
+    # The Trigger construct auto-grants its CDK-managed invoker lambda:InvokeFunction, scoped to
+    # the scraper function (no manual grant, least-privilege).
+    template = _template()
+    invoke_stmts = [
+        stmt
+        for role in template.find_resources("AWS::IAM::Role").values()
+        for policy in role["Properties"].get("Policies", [])
+        for stmt in policy["PolicyDocument"]["Statement"]
+        if "lambda:InvokeFunction"
+        in (stmt["Action"] if isinstance(stmt["Action"], list) else [stmt["Action"]])
+    ]
+    assert invoke_stmts, "expected an auto InvokeFunction grant for the trigger invoker"
+    assert any("ScraperFunction" in json.dumps(s["Resource"]) for s in invoke_stmts)
 
 
 def test_widget_distribution_uses_oac_not_oai():

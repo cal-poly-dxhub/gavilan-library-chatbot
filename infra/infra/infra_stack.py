@@ -18,13 +18,19 @@ All changeable knobs come from the repo-root config.yaml
 
 import hashlib
 import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
+import jsii
 from aws_cdk import (
+    AssetHashType,
+    BundlingOptions,
     CfnOutput,
     DefaultStackSynthesizer,
     Duration,
+    ILocalBundling,
     RemovalPolicy,
     Stack,
     aws_apigatewayv2 as apigwv2,
@@ -32,12 +38,15 @@ from aws_cdk import (
     aws_bedrock as bedrock,
     aws_cloudfront as cloudfront,
     aws_cloudfront_origins as origins,
+    aws_events as events,
+    aws_events_targets as events_targets,
     aws_iam as iam,
     aws_lambda as _lambda,
     aws_logs as logs,
     aws_opensearchserverless as oss,
     aws_s3 as s3,
     aws_s3_deployment as s3deploy,
+    triggers,
 )
 from constructs import Construct
 
@@ -47,6 +56,50 @@ _APP_DIR = Path(__file__).resolve().parents[2] / "app"
 # Repo-root frontend/ directory. Only widget.js is uploaded (mock.js / demo.html are
 # dev-only and must never ship to production).
 _FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
+
+# Repo-root scraper/ directory: the scraper Lambda's source (scraper.py + lambda_function.py)
+# and its requirements.txt (the deps built into the Lambda layer below).
+_SCRAPER_DIR = Path(__file__).resolve().parents[2] / "scraper"
+
+# The scraper Lambda's architecture and the MATCHING manylinux wheel tag. trafilatura pulls in
+# lxml and regex - compiled C extensions - so the layer must contain Linux (x86_64) wheels, not
+# the macOS wheels a plain `pip install` produces on a dev Mac. Keep these two in lockstep.
+_LAMBDA_PYTHON = _lambda.Runtime.PYTHON_3_13
+_LAMBDA_ARCH = _lambda.Architecture.X86_64
+_MANYLINUX_TAG = "manylinux2014_x86_64"
+_LAMBDA_PY_TAG = "3.13"
+
+
+@jsii.implements(ILocalBundling)
+class _PipManylinuxLayerBundler:
+    """Builds the scraper's deps as a Lambda layer using prebuilt manylinux wheels via
+    `pip --platform ... --only-binary=:all:` - NO Docker, NO compiler. This is AWS's documented
+    method for compiled deps (lxml/regex): --platform + --only-binary forces pip to download the
+    Linux wheel matching the Lambda architecture instead of building a macOS binary that would
+    fail at runtime with an ELF/Mach-O error.
+
+    Returns False on any failure so CDK falls back to the BundlingOptions Docker `image`/`command`
+    (the required fallback if a transitive dep ever lacks a manylinux wheel).
+    """
+
+    def try_bundle(self, output_dir: str, *, image=None, **_kwargs) -> bool:
+        try:
+            subprocess.run(
+                [
+                    sys.executable, "-m", "pip", "install",
+                    "-r", str(_SCRAPER_DIR / "requirements.txt"),
+                    "--platform", _MANYLINUX_TAG,
+                    "--python-version", _LAMBDA_PY_TAG,
+                    "--implementation", "cp",
+                    "--only-binary=:all:",
+                    "--target", str(Path(output_dir) / "python"),
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            return True
+        except Exception:  # no local pip / missing wheel -> let CDK try Docker bundling
+            return False
 
 
 class GavilanChatbotStack(Stack):
@@ -64,8 +117,8 @@ class GavilanChatbotStack(Stack):
         vs_cfg = config["vector_store"]
         fields = vs_cfg["fields"]
         hnsw = vs_cfg["hnsw"]
-        web_cfg = config["data_source"]["web_crawler"]
         chunking_cfg = config["chunking"]
+        scraper_cfg = config["scraper"]
         http_api_cfg = config["http_api"]
         request_cfg = config["request"]
         retrieval_cfg = config["retrieval"]
@@ -143,6 +196,23 @@ class GavilanChatbotStack(Stack):
         collection.add_dependency(encryption_policy)
         collection.add_dependency(network_policy)
 
+        # --- Knowledge Base source bucket ---------------------------------------------
+
+        # S3 bucket the KB ingests source content from. Populated out-of-band (test files for
+        # now; the scraper Lambda that fills it lands in the next commit). Same private security
+        # posture as the widget bucket: no public access, ACLs disabled, encrypted at rest,
+        # SSL-only. One-click uninstall parity (empty + delete on `cdk destroy`).
+        source_bucket = s3.Bucket(
+            self,
+            "KnowledgeBaseSourceBucket",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            enforce_ssl=True,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+        )
+
         # --- Knowledge Base execution role --------------------------------------------
 
         # Assumable by the Bedrock service. Other resources reference this object directly
@@ -167,6 +237,15 @@ class GavilanChatbotStack(Stack):
             iam.PolicyStatement(
                 actions=["aoss:APIAccessAll"],
                 resources=[collection.attr_arn],
+            )
+        )
+        # Read the S3 source content to ingest: ListBucket on the bucket, GetObject on its
+        # objects. Wired through the CDK bucket object (bucket_arn / arn_for_objects), not a
+        # hardcoded ARN.
+        kb_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:ListBucket"],
+                resources=[source_bucket.bucket_arn, source_bucket.arn_for_objects("*")],
             )
         )
 
@@ -314,37 +393,21 @@ class GavilanChatbotStack(Stack):
         knowledge_base.add_dependency(vector_index)
         knowledge_base.node.add_dependency(kb_role)
 
-        # --- Web Crawler data source --------------------------------------------------
+        # --- S3 data source -----------------------------------------------------------
 
-        # Seed URLs and include/exclude regex filters come from config, not literals here.
-        # Empty filter lists are omitted (passed as None) rather than emitted as empty
-        # arrays. Chunking is FIXED_SIZE for v1 per architecture.md Phase 1.
-        seed_urls = [
-            bedrock.CfnDataSource.SeedUrlProperty(url=url)
-            for url in web_cfg["seed_urls"]
-        ]
-        web_data_source = bedrock.CfnDataSource(
+        # The KB ingests source content from the S3 bucket above (vector-store-agnostic, unlike
+        # the managed Web Crawler which was hard-coupled to OpenSearch Serverless - that swap is
+        # what unblocks moving to a cheaper vector store later). Chunking is the SAME FIXED_SIZE
+        # config the crawler used, still from config.yaml (unchanged): maxTokens 300, overlap 20.
+        s3_data_source = bedrock.CfnDataSource(
             self,
-            "WebCrawlerDataSource",
-            name=f"{kb_name}-web",
+            "S3DataSource",
+            name=f"{kb_name}-s3",
             knowledge_base_id=knowledge_base.attr_knowledge_base_id,
             data_source_configuration=bedrock.CfnDataSource.DataSourceConfigurationProperty(
-                type="WEB",
-                web_configuration=bedrock.CfnDataSource.WebDataSourceConfigurationProperty(
-                    source_configuration=bedrock.CfnDataSource.WebSourceConfigurationProperty(
-                        url_configuration=bedrock.CfnDataSource.UrlConfigurationProperty(
-                            seed_urls=seed_urls,
-                        ),
-                    ),
-                    crawler_configuration=bedrock.CfnDataSource.WebCrawlerConfigurationProperty(
-                        scope=web_cfg.get("scope"),
-                        inclusion_filters=web_cfg.get("include_patterns") or None,
-                        exclusion_filters=web_cfg.get("exclude_patterns") or None,
-                        crawler_limits=bedrock.CfnDataSource.WebCrawlerLimitsProperty(
-                            max_pages=web_cfg.get("max_pages"),
-                            rate_limit=web_cfg.get("rate_limit"),
-                        ),
-                    ),
+                type="S3",
+                s3_configuration=bedrock.CfnDataSource.S3DataSourceConfigurationProperty(
+                    bucket_arn=source_bucket.bucket_arn,
                 ),
             ),
             vector_ingestion_configuration=bedrock.CfnDataSource.VectorIngestionConfigurationProperty(
@@ -358,7 +421,141 @@ class GavilanChatbotStack(Stack):
             ),
         )
         # The data source cannot be created before the KB exists.
-        web_data_source.add_dependency(knowledge_base)
+        s3_data_source.add_dependency(knowledge_base)
+
+        # --- Scraper Lambda: feeds the S3 source bucket + triggers ingestion -----------
+
+        # Dependency LAYER: trafilatura + lxml + regex + httpx as manylinux x86_64 wheels. Built
+        # locally with pip --platform (no Docker); Docker bundling is the fallback if a wheel is
+        # ever missing. asset_hash_type=OUTPUT so the hash tracks the built layer, not the source
+        # dir (which carries .venv/tests). See _PipManylinuxLayerBundler.
+        scraper_deps_layer = _lambda.LayerVersion(
+            self,
+            "ScraperDepsLayer",
+            description="trafilatura/lxml/regex/httpx (manylinux x86_64) for the scraper Lambda.",
+            compatible_runtimes=[_LAMBDA_PYTHON],
+            compatible_architectures=[_LAMBDA_ARCH],
+            code=_lambda.Code.from_asset(
+                str(_SCRAPER_DIR),
+                asset_hash_type=AssetHashType.OUTPUT,
+                exclude=["*", "!requirements.txt"],
+                bundling=BundlingOptions(
+                    image=_LAMBDA_PYTHON.bundling_image,
+                    local=_PipManylinuxLayerBundler(),
+                    # Docker fallback: inside the Linux bundling image, a plain install yields
+                    # correct Linux wheels natively. platform pins x86_64 even on an ARM Mac.
+                    command=[
+                        "bash",
+                        "-c",
+                        "pip install -r requirements.txt --target /asset-output/python",
+                    ],
+                    platform="linux/amd64",
+                ),
+            ),
+        )
+
+        # Its OWN execution role: basic logs + narrow S3 write + narrow StartIngestionJob.
+        scraper_lambda_role = iam.Role(
+            self,
+            "ScraperFunctionRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            description="Execution role for the scraper Lambda (scrape -> S3 -> start ingestion).",
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AWSLambdaBasicExecutionRole"
+                )
+            ],
+        )
+        # Upload markdown + metadata sidecars into the KB source bucket (objects only, one bucket).
+        scraper_lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:PutObject"],
+                resources=[source_bucket.arn_for_objects("*")],
+            )
+        )
+        # Trigger ingestion of the fresh content on the specific KB (StartIngestionJob is scoped
+        # to the knowledge-base ARN; it covers that KB's data sources).
+        scraper_lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["bedrock:StartIngestionJob"],
+                resources=[knowledge_base.attr_knowledge_base_arn],
+            )
+        )
+
+        scraper_log_group = logs.LogGroup(
+            self,
+            "ScraperFunctionLogGroup",
+            retention=logs.RetentionDays.THREE_MONTHS,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        scraper_lambda = _lambda.Function(
+            self,
+            "ScraperFunction",
+            runtime=_LAMBDA_PYTHON,
+            architecture=_LAMBDA_ARCH,
+            handler="lambda_function.handler",
+            # Ship only the two source files; deps come from the layer, boto3 from the runtime.
+            code=_lambda.Code.from_asset(
+                str(_SCRAPER_DIR),
+                exclude=["*", "!scraper.py", "!lambda_function.py"],
+            ),
+            layers=[scraper_deps_layer],
+            role=scraper_lambda_role,
+            # ~16+ pages fetched + parsed sequentially (trafilatura is CPU-ish), then uploaded.
+            timeout=Duration.minutes(5),
+            memory_size=512,
+            log_group=scraper_log_group,
+            environment={
+                "SEED_URLS": json.dumps(scraper_cfg["seed_urls"]),
+                "SCRAPE_TIMEOUT_SECONDS": str(scraper_cfg.get("timeout_seconds", 20)),
+                "SCRAPER_USER_AGENT": scraper_cfg.get("user_agent", ""),
+                "SOURCE_BUCKET": source_bucket.bucket_name,
+                "KNOWLEDGE_BASE_ID": knowledge_base.attr_knowledge_base_id,
+                "DATA_SOURCE_ID": s3_data_source.attr_data_source_id,
+            },
+        )
+        # Needs the KB + data source (it calls StartIngestionJob on them at runtime).
+        scraper_lambda.node.add_dependency(s3_data_source)
+
+        # Weekly re-scrape on a maintenance-window schedule (cron from config.yaml, UTC). Keeps
+        # the KB fresh as the library site changes. EventBridge adds the invoke permission.
+        events.Rule(
+            self,
+            "ScraperSchedule",
+            description="Scheduled re-scrape of the Gavilan library site to refresh KB content.",
+            schedule=events.Schedule.expression(scraper_cfg["schedule_cron"]),
+            targets=[events_targets.LambdaFunction(scraper_lambda)],
+        )
+
+        # One-click install: invoke the (existing) scraper ONCE during `cdk deploy` so the KB is
+        # populated the moment the stack comes up - no manual invoke, no waiting for the weekly
+        # schedule. Uses the stable aws-cdk-lib `triggers.Trigger` (a CDK-managed invoker), NOT a
+        # hand-rolled custom resource.
+        #   - invocation_type=EVENT: fire-and-forget. The trigger succeeds once the function is
+        #     invoked, REGARDLESS of the scrape's result - a flaky site, a partial-page failure, or
+        #     the async ingestion never fails or blocks the deploy. (REQUEST_RESPONSE, the default,
+        #     would make the deploy wait on and fail with the scraper.) The weekly schedule retries,
+        #     so a one-time install hiccup is self-healing.
+        #   - execute_after: run only after the scraper AND its targets exist - it writes to the
+        #     source bucket and calls StartIngestionJob on the data source.
+        #   - execute_on_handler_change (default True): fires on install (create) and whenever the
+        #     scraper changes; a no-op redeploy does not re-fire (KB already populated; the schedule
+        #     refreshes). Re-firing is harmless anyway - it overwrites the same S3 keys.
+        # The Trigger grants its invoker lambda:InvokeFunction on this function automatically.
+        triggers.Trigger(
+            self,
+            "ScraperInstallTrigger",
+            handler=scraper_lambda,
+            invocation_type=triggers.InvocationType.EVENT,
+            execute_after=[
+                scraper_lambda,
+                source_bucket,
+                knowledge_base,
+                s3_data_source,
+            ],
+            execute_on_handler_change=True,
+        )
 
         # --- Bedrock Guardrails: input screen + output backstop -----------------------
 

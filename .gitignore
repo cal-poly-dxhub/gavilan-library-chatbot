@@ -29,3 +29,6 @@ Thumbs.db
 
 # --- Claude ---
 .claude
+
+# --- Scraper ---
+scraper_output/
