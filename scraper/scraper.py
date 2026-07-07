@@ -39,6 +39,10 @@ DEFAULT_TIMEOUT = 20.0
 DEFAULT_USER_AGENT = "GavilanLibraryScraper/1.0 (+https://www.gavilan.edu/library/)"
 DEFAULT_OUTPUT_DIR = "./scraper_output"
 
+# "ï¿½" (U+00EF U+00BF U+00BD) - the Latin-1 view of a UTF-8-encoded U+FFFD. Baked into some
+# source pages as the entities &#239;&#191;&#189;. See _scrub_replacement_chars.
+_REPLACEMENT_SEQ = "ï¿½"
+
 # Readable slug: everything that is not a lowercase letter or digit becomes a hyphen.
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 # Keep the readable portion bounded so filenames stay sane; uniqueness is guaranteed by the hash.
@@ -103,6 +107,23 @@ def build_metadata(
     }
 
 
+def _scrub_replacement_chars(text: Optional[str]) -> Optional[str]:
+    """Remove U+FFFD replacement-char garbage baked into the source content.
+
+    Several Gavilan library pages carry corrupted characters in their HTML - not from OUR fetch,
+    but from an upstream cp1252->UTF-8 lossy mis-decode at authoring/CMS time. The corruption is
+    stored as HTML entities `&#239;&#191;&#189;`, which decode to U+00EF U+00BF U+00BD ("ï¿½") -
+    the Latin-1 view of a UTF-8-encoded U+FFFD. The original characters (an apostrophe in
+    "world's", the ligature in "Encyclopædia") were replaced by U+FFFD at the source and are
+    UNRECOVERABLE - U+FFFD carries no information about what it replaced. All we can do is strip
+    the garbage so it does not pollute the knowledge base. We remove both the 3-char "ï¿½"
+    sequence and any bare U+FFFD; neither occurs in legitimate English library content.
+    """
+    if not text:
+        return text
+    return text.replace(_REPLACEMENT_SEQ, "").replace("�", "")
+
+
 def _extract_title(html: str) -> Optional[str]:
     """Best-effort page title via trafilatura metadata; None if unavailable."""
     try:
@@ -114,22 +135,29 @@ def _extract_title(html: str) -> Optional[str]:
 
 
 def extract_markdown(html: str, url: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
-    """Extract (title, main-content markdown) from static HTML.
+    """Extract (title, main-content markdown) from a page's HTML.
 
     Uses trafilatura, which strips nav/header/footer/sidebar boilerplate. Tables are kept (library
     hours are often tabular); comments are dropped. Returns (title, None) when no main content is
     found (e.g. a redirect stub or an empty page).
+
+    Note on characters: the Gavilan pages are correctly served as UTF-8, so `html` from
+    `response.text` decodes fine. Some pages, however, have replacement-char garbage baked into
+    their source (see `_scrub_replacement_chars`), so both the title and markdown are scrubbed of
+    it before returning.
     """
-    markdown = trafilatura.extract(
-        html,
-        url=url,
-        output_format="markdown",
-        include_tables=True,
-        include_comments=False,
+    markdown = _scrub_replacement_chars(
+        trafilatura.extract(
+            html,
+            url=url,
+            output_format="markdown",
+            include_tables=True,
+            include_comments=False,
+        )
     )
     if markdown is not None:
         markdown = markdown.strip() or None
-    return _extract_title(html), markdown
+    return _scrub_replacement_chars(_extract_title(html)), markdown
 
 
 def scrape_url(url: str, client: httpx.Client) -> ScrapeResult:
@@ -148,6 +176,8 @@ def scrape_url(url: str, client: httpx.Client) -> ScrapeResult:
             url=url, slug=slug, ok=False, error=f"{exc.__class__.__name__}: {exc}"
         )
 
+    # response.text honors the page's declared charset (the site serves UTF-8, header + <meta>).
+    # extract_markdown scrubs any replacement-char garbage baked into the source content.
     title, markdown = extract_markdown(response.text, url=url)
     if not markdown:
         LOG.warning("no main content extracted: %s", url)

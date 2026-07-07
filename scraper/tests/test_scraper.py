@@ -42,6 +42,20 @@ FIXTURE_HTML = """
 </html>
 """
 
+# Real Gavilan pages are served CORRECTLY as UTF-8, but some have replacement-char garbage baked
+# into their SOURCE: the entities &#239;&#191;&#189; (which decode to U+00EF U+00BF U+00BD = the
+# 3-char sequence "ï¿½") stand where an apostrophe or accented letter was lost to an upstream
+# cp1252->UTF-8 mis-decode at authoring time. This fixture reproduces that exactly - a clean UTF-8
+# page whose content carries the baked-in garbage. The scraper cannot recover the lost chars
+# (U+FFFD is information-free), only strip the garbage.
+FIXTURE_MOJIBAKE_HTML = (
+    "<!DOCTYPE html><html><head><meta charset='utf-8'><title>Databases</title></head>"
+    "<body><main><article><h1>Databases</h1>"
+    "<p>Access the world&#239;&#191;&#189;s largest research collection and the "
+    "Encyclop&#239;&#191;&#189;dia Britannica online for library research assistance here.</p>"
+    "</article></main></body></html>"
+)
+
 
 # --- slugify -----------------------------------------------------------------------------------
 
@@ -111,10 +125,52 @@ def test_extract_markdown_keeps_article_drops_boilerplate():
     assert title and "Library Hours" in title
 
 
+# --- replacement-char scrubbing (baked-in source mojibake, no network) -------------------------
+
+def test_scrub_replacement_chars():
+    assert scraper._scrub_replacement_chars("worldï¿½s") == "worlds"  # "ï¿½" triple
+    assert scraper._scrub_replacement_chars("a�b") == "ab"                       # bare U+FFFD
+    assert scraper._scrub_replacement_chars("clean text") == "clean text"
+    assert scraper._scrub_replacement_chars(None) is None
+    assert scraper._scrub_replacement_chars("") == ""
+
+
+def test_extract_markdown_scrubs_baked_in_mojibake():
+    # The baked-in "ï¿½" garbage (from source HTML entities) must not reach the output. The
+    # original apostrophe/ligature are unrecoverable, so the garbage is simply removed.
+    _title, markdown = scraper.extract_markdown(
+        FIXTURE_MOJIBAKE_HTML, url="https://www.gavilan.edu/library/databases.php"
+    )
+    assert markdown
+    assert "ï¿½" not in markdown, "baked-in 'ï¿½' garbage still present"
+    assert "�" not in markdown, "bare U+FFFD still present"
+    assert "worlds largest" in markdown          # "world[ï¿½]s" -> garbage stripped
+    assert "Encyclopdia Britannica" in markdown   # "Encyclop[ï¿½]dia" -> garbage stripped
+
+
 # --- fetch handling (mocked) -------------------------------------------------------------------
 
 def _client(handler) -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=True)
+
+
+def test_scrape_url_scrubs_mojibake_end_to_end():
+    # Server sends the page correctly as UTF-8 (as the real site does); the baked-in "ï¿½" garbage
+    # must be scrubbed out of the result markdown end to end.
+    def handler(request):
+        return httpx.Response(
+            200,
+            content=FIXTURE_MOJIBAKE_HTML.encode("utf-8"),
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+
+    with _client(handler) as client:
+        result = scraper.scrape_url("https://www.gavilan.edu/library/databases.php", client)
+
+    assert result.ok
+    assert "ï¿½" not in result.markdown
+    assert "�" not in result.markdown
+    assert "worlds largest" in result.markdown
 
 
 def test_scrape_url_success_via_mock():
