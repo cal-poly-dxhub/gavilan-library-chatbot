@@ -44,6 +44,21 @@ data_source:
     max_pages: 1000
     rate_limit: 300   # max crawl requests per minute
 
+# --- Custom scraper (standalone local tool; NOT part of the CDK/Lambda yet) ---
+#
+# Replaces the removed managed Web Crawler. For now it runs locally (scraper/scraper.py) and
+# writes clean markdown + a metadata JSON sidecar per page to output_dir for manual inspection;
+# a Lambda wrapper that uploads to the KB S3 source bucket comes next. seed_urls is an EXPLICIT
+# curated list - NO recursive crawling (the managed crawler over-crawled the /library/ tree and
+# hit ingestion limits; an explicit list is also how the sponsor's URL list will arrive).
+scraper:
+  seed_urls:
+    - https://www.gavilan.edu/library/
+  output_dir: ./scraper_output
+  # Per-request HTTP timeout (seconds) and a polite identifying User-Agent for the public site.
+  timeout_seconds: 20
+  user_agent: "GavilanLibraryScraper/1.0 (+https://www.gavilan.edu/library/)"
+
 chunking:
   # v1 uses managed FIXED_SIZE chunking (architecture.md Phase 1). Phase 2 moves to
   # HIERARCHICAL. One of: FIXED_SIZE, HIERARCHICAL, SEMANTIC, NONE.
