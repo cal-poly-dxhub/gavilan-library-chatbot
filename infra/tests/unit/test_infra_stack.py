@@ -594,6 +594,38 @@ def test_eventbridge_schedule_targets_the_scraper_lambda():
     assert "ScraperFunction" in json.dumps(targets[0]["Arn"])
 
 
+def test_install_trigger_invokes_scraper_fire_and_forget():
+    # A CDK triggers.Trigger runs the scraper ONCE at deploy so the KB is populated on install.
+    # EVENT invocation = fire-and-forget: the deploy dispatches it and never blocks/fails on the
+    # scrape result. execute_after wires ordering after the scraper + its write/ingest targets.
+    template = _template()
+    trigs = template.find_resources("Custom::Trigger")
+    assert len(trigs) == 1, list(trigs)
+    (trig,) = trigs.values()
+    props = trig["Properties"]
+    assert props["InvocationType"] == "Event"
+    assert "ScraperFunction" in json.dumps(props["HandlerArn"])
+    depends = json.dumps(trig.get("DependsOn", []))
+    for needle in ("ScraperFunction", "KnowledgeBase", "S3DataSource", "KnowledgeBaseSourceBucket"):
+        assert needle in depends, (needle, depends)
+
+
+def test_install_trigger_invoker_grant_is_scoped_to_the_scraper():
+    # The Trigger construct auto-grants its CDK-managed invoker lambda:InvokeFunction, scoped to
+    # the scraper function (no manual grant, least-privilege).
+    template = _template()
+    invoke_stmts = [
+        stmt
+        for role in template.find_resources("AWS::IAM::Role").values()
+        for policy in role["Properties"].get("Policies", [])
+        for stmt in policy["PolicyDocument"]["Statement"]
+        if "lambda:InvokeFunction"
+        in (stmt["Action"] if isinstance(stmt["Action"], list) else [stmt["Action"]])
+    ]
+    assert invoke_stmts, "expected an auto InvokeFunction grant for the trigger invoker"
+    assert any("ScraperFunction" in json.dumps(s["Resource"]) for s in invoke_stmts)
+
+
 def test_widget_distribution_uses_oac_not_oai():
     template = _template()
     template.resource_count_is("AWS::CloudFront::Distribution", 1)

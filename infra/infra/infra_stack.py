@@ -46,6 +46,7 @@ from aws_cdk import (
     aws_opensearchserverless as oss,
     aws_s3 as s3,
     aws_s3_deployment as s3deploy,
+    triggers,
 )
 from constructs import Construct
 
@@ -525,6 +526,35 @@ class GavilanChatbotStack(Stack):
             description="Scheduled re-scrape of the Gavilan library site to refresh KB content.",
             schedule=events.Schedule.expression(scraper_cfg["schedule_cron"]),
             targets=[events_targets.LambdaFunction(scraper_lambda)],
+        )
+
+        # One-click install: invoke the (existing) scraper ONCE during `cdk deploy` so the KB is
+        # populated the moment the stack comes up - no manual invoke, no waiting for the weekly
+        # schedule. Uses the stable aws-cdk-lib `triggers.Trigger` (a CDK-managed invoker), NOT a
+        # hand-rolled custom resource.
+        #   - invocation_type=EVENT: fire-and-forget. The trigger succeeds once the function is
+        #     invoked, REGARDLESS of the scrape's result - a flaky site, a partial-page failure, or
+        #     the async ingestion never fails or blocks the deploy. (REQUEST_RESPONSE, the default,
+        #     would make the deploy wait on and fail with the scraper.) The weekly schedule retries,
+        #     so a one-time install hiccup is self-healing.
+        #   - execute_after: run only after the scraper AND its targets exist - it writes to the
+        #     source bucket and calls StartIngestionJob on the data source.
+        #   - execute_on_handler_change (default True): fires on install (create) and whenever the
+        #     scraper changes; a no-op redeploy does not re-fire (KB already populated; the schedule
+        #     refreshes). Re-firing is harmless anyway - it overwrites the same S3 keys.
+        # The Trigger grants its invoker lambda:InvokeFunction on this function automatically.
+        triggers.Trigger(
+            self,
+            "ScraperInstallTrigger",
+            handler=scraper_lambda,
+            invocation_type=triggers.InvocationType.EVENT,
+            execute_after=[
+                scraper_lambda,
+                source_bucket,
+                knowledge_base,
+                s3_data_source,
+            ],
+            execute_on_handler_change=True,
         )
 
         # --- Bedrock Guardrails: input screen + output backstop -----------------------
