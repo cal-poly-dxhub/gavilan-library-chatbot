@@ -53,9 +53,23 @@ data_source:
 # hit ingestion limits; an explicit list is also how the sponsor's URL list will arrive).
 scraper:
   seed_urls:
-    - https://www.gavilan.edu/library/
+    - https://www.gavilan.edu/library/howdoi.php
+    - https://www.gavilan.edu/library/libraryservices.php
+    - https://www.gavilan.edu/library/about-the-library.php
+    - https://www.gavilan.edu/library/contactus.php
+    - https://www.gavilan.edu/library/ill.php
+    - https://www.gavilan.edu/library/researchassistance.php
+    - https://www.gavilan.edu/library/findresources.php
+    - https://www.gavilan.edu/library/librarycard.php
+    - https://www.gavilan.edu/library/libcardexamples.php
+    - https://www.gavilan.edu/library/citingsources.php
+    - https://www.gavilan.edu/library/librarycourses.php
+    - https://www.gavilan.edu/library/facultyservices.php
+    - https://www.gavilan.edu/library/otherlibraries.php
+    - https://www.gavilan.edu/library/orientationrequest.php
+    - https://www.gavilan.edu/library/databases.php
+    - https://www.gavilan.edu/library/sites.php
   output_dir: ./scraper_output
-  # Per-request HTTP timeout (seconds) and a polite identifying User-Agent for the public site.
   timeout_seconds: 20
   user_agent: "GavilanLibraryScraper/1.0 (+https://www.gavilan.edu/library/)"
 
