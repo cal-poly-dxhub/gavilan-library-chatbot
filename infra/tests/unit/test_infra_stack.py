@@ -180,32 +180,37 @@ def test_knowledge_base_created_after_index():
     assert any(dep.startswith("VectorIndex") for dep in depends_on), depends_on
 
 
-def test_web_crawler_data_source_reads_seed_urls_from_config():
+def test_s3_data_source_is_the_only_data_source():
+    # The KB now ingests from S3, not the managed Web Crawler. Exactly one data source, type S3;
+    # no WEB data source remains (the crawler was hard-coupled to OpenSearch Serverless).
     template = _template()
-    seed_urls = CONFIG["data_source"]["web_crawler"]["seed_urls"]
-    template.has_resource_properties(
-        "AWS::Bedrock::DataSource",
-        {
-            "DataSourceConfiguration": {
-                "Type": "WEB",
-                "WebConfiguration": {
-                    "SourceConfiguration": {
-                        "UrlConfiguration": {
-                            "SeedUrls": [{"Url": url} for url in seed_urls]
-                        }
-                    }
-                },
-            },
-            "VectorIngestionConfiguration": {
-                "ChunkingConfiguration": {
-                    "ChunkingStrategy": CONFIG["chunking"]["strategy"]
-                }
-            },
-        },
+    template.resource_count_is("AWS::Bedrock::DataSource", 1)
+    (source,) = template.find_resources("AWS::Bedrock::DataSource").values()
+    assert source["Properties"]["DataSourceConfiguration"]["Type"] == "S3", source
+    assert "WebConfiguration" not in source["Properties"]["DataSourceConfiguration"], source
+
+
+def test_s3_data_source_points_at_source_bucket_with_crawler_chunking():
+    template = _template()
+    (source,) = template.find_resources("AWS::Bedrock::DataSource").values()
+    ds_config = source["Properties"]["DataSourceConfiguration"]
+    # bucketArn references the source bucket via GetAtt (not a hardcoded ARN).
+    bucket_arn = ds_config["S3Configuration"]["BucketArn"]
+    assert bucket_arn["Fn::GetAtt"][0].startswith("KnowledgeBaseSourceBucket"), bucket_arn
+    # Same FIXED_SIZE chunking the crawler used, from config.
+    chunk = source["Properties"]["VectorIngestionConfiguration"]["ChunkingConfiguration"]
+    assert chunk["ChunkingStrategy"] == CONFIG["chunking"]["strategy"]
+    assert (
+        chunk["FixedSizeChunkingConfiguration"]["MaxTokens"]
+        == CONFIG["chunking"]["max_tokens"]
+    )
+    assert (
+        chunk["FixedSizeChunkingConfiguration"]["OverlapPercentage"]
+        == CONFIG["chunking"]["overlap_percentage"]
     )
 
 
-def test_web_crawler_data_source_created_after_knowledge_base():
+def test_data_source_created_after_knowledge_base():
     template = _template()
     sources = template.find_resources("AWS::Bedrock::DataSource")
     (source,) = sources.values()
@@ -460,9 +465,9 @@ def test_bare_on_demand_model_id_falls_back_to_single_foundation_model_grant():
 
 def test_widget_bucket_is_private_and_oac_ready():
     template = _template()
-    # Exactly one S3 bucket (the widget bucket): all public access blocked, and ACLs
-    # disabled via bucket-owner-enforced ownership (the ownership OAC requires).
-    template.resource_count_is("AWS::S3::Bucket", 1)
+    # Two S3 buckets now (widget + KB source), both fully private: all public access blocked,
+    # and ACLs disabled via bucket-owner-enforced ownership (the ownership OAC requires).
+    template.resource_count_is("AWS::S3::Bucket", 2)
     template.has_resource_properties(
         "AWS::S3::Bucket",
         {
@@ -477,6 +482,43 @@ def test_widget_bucket_is_private_and_oac_ready():
             },
         },
     )
+
+
+def test_kb_source_bucket_blocks_public_access():
+    # The KB source bucket must be fully private (public access blocked) - it will hold scraped
+    # library content, never served publicly (the KB reads it, CloudFront does not).
+    template = _template()
+    buckets = template.find_resources("AWS::S3::Bucket")
+    assert len(buckets) == 2, list(buckets)
+    for logical_id, res in buckets.items():
+        assert res["Properties"]["PublicAccessBlockConfiguration"] == {
+            "BlockPublicAcls": True,
+            "BlockPublicPolicy": True,
+            "IgnorePublicAcls": True,
+            "RestrictPublicBuckets": True,
+        }, logical_id
+
+
+def test_kb_role_can_read_source_bucket():
+    # KB execution role must be able to list the source bucket and get its objects, or ingestion
+    # from S3 fails. Wired through CDK (bucket ARN + /*), granted on the role's default policy.
+    template = _template()
+    # Collect S3 read statements across all inline policies (role default policies).
+    s3_reads = []
+    for policy in template.find_resources("AWS::IAM::Policy").values():
+        for stmt in policy["Properties"]["PolicyDocument"]["Statement"]:
+            actions = stmt["Action"]
+            actions = actions if isinstance(actions, list) else [actions]
+            if "s3:GetObject" in actions and "s3:ListBucket" in actions:
+                s3_reads.append(stmt)
+    assert len(s3_reads) == 1, s3_reads
+    resources = s3_reads[0]["Resource"]
+    # Two resources: the bucket ARN and its objects (/*), both GetAtt on the source bucket.
+    assert len(resources) == 2, resources
+    for r in resources:
+        # bucket ARN is a GetAtt; objects ARN is a Join of [GetAtt, "/*"].
+        blob = json.dumps(r)
+        assert "KnowledgeBaseSourceBucket" in blob, r
 
 
 def test_widget_distribution_uses_oac_not_oai():

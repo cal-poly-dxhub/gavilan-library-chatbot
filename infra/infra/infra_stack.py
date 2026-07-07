@@ -64,7 +64,6 @@ class GavilanChatbotStack(Stack):
         vs_cfg = config["vector_store"]
         fields = vs_cfg["fields"]
         hnsw = vs_cfg["hnsw"]
-        web_cfg = config["data_source"]["web_crawler"]
         chunking_cfg = config["chunking"]
         http_api_cfg = config["http_api"]
         request_cfg = config["request"]
@@ -143,6 +142,23 @@ class GavilanChatbotStack(Stack):
         collection.add_dependency(encryption_policy)
         collection.add_dependency(network_policy)
 
+        # --- Knowledge Base source bucket ---------------------------------------------
+
+        # S3 bucket the KB ingests source content from. Populated out-of-band (test files for
+        # now; the scraper Lambda that fills it lands in the next commit). Same private security
+        # posture as the widget bucket: no public access, ACLs disabled, encrypted at rest,
+        # SSL-only. One-click uninstall parity (empty + delete on `cdk destroy`).
+        source_bucket = s3.Bucket(
+            self,
+            "KnowledgeBaseSourceBucket",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            enforce_ssl=True,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+        )
+
         # --- Knowledge Base execution role --------------------------------------------
 
         # Assumable by the Bedrock service. Other resources reference this object directly
@@ -167,6 +183,15 @@ class GavilanChatbotStack(Stack):
             iam.PolicyStatement(
                 actions=["aoss:APIAccessAll"],
                 resources=[collection.attr_arn],
+            )
+        )
+        # Read the S3 source content to ingest: ListBucket on the bucket, GetObject on its
+        # objects. Wired through the CDK bucket object (bucket_arn / arn_for_objects), not a
+        # hardcoded ARN.
+        kb_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:ListBucket"],
+                resources=[source_bucket.bucket_arn, source_bucket.arn_for_objects("*")],
             )
         )
 
@@ -314,37 +339,21 @@ class GavilanChatbotStack(Stack):
         knowledge_base.add_dependency(vector_index)
         knowledge_base.node.add_dependency(kb_role)
 
-        # --- Web Crawler data source --------------------------------------------------
+        # --- S3 data source -----------------------------------------------------------
 
-        # Seed URLs and include/exclude regex filters come from config, not literals here.
-        # Empty filter lists are omitted (passed as None) rather than emitted as empty
-        # arrays. Chunking is FIXED_SIZE for v1 per architecture.md Phase 1.
-        seed_urls = [
-            bedrock.CfnDataSource.SeedUrlProperty(url=url)
-            for url in web_cfg["seed_urls"]
-        ]
-        web_data_source = bedrock.CfnDataSource(
+        # The KB ingests source content from the S3 bucket above (vector-store-agnostic, unlike
+        # the managed Web Crawler which was hard-coupled to OpenSearch Serverless - that swap is
+        # what unblocks moving to a cheaper vector store later). Chunking is the SAME FIXED_SIZE
+        # config the crawler used, still from config.yaml (unchanged): maxTokens 300, overlap 20.
+        s3_data_source = bedrock.CfnDataSource(
             self,
-            "WebCrawlerDataSource",
-            name=f"{kb_name}-web",
+            "S3DataSource",
+            name=f"{kb_name}-s3",
             knowledge_base_id=knowledge_base.attr_knowledge_base_id,
             data_source_configuration=bedrock.CfnDataSource.DataSourceConfigurationProperty(
-                type="WEB",
-                web_configuration=bedrock.CfnDataSource.WebDataSourceConfigurationProperty(
-                    source_configuration=bedrock.CfnDataSource.WebSourceConfigurationProperty(
-                        url_configuration=bedrock.CfnDataSource.UrlConfigurationProperty(
-                            seed_urls=seed_urls,
-                        ),
-                    ),
-                    crawler_configuration=bedrock.CfnDataSource.WebCrawlerConfigurationProperty(
-                        scope=web_cfg.get("scope"),
-                        inclusion_filters=web_cfg.get("include_patterns") or None,
-                        exclusion_filters=web_cfg.get("exclude_patterns") or None,
-                        crawler_limits=bedrock.CfnDataSource.WebCrawlerLimitsProperty(
-                            max_pages=web_cfg.get("max_pages"),
-                            rate_limit=web_cfg.get("rate_limit"),
-                        ),
-                    ),
+                type="S3",
+                s3_configuration=bedrock.CfnDataSource.S3DataSourceConfigurationProperty(
+                    bucket_arn=source_bucket.bucket_arn,
                 ),
             ),
             vector_ingestion_configuration=bedrock.CfnDataSource.VectorIngestionConfigurationProperty(
@@ -358,7 +367,7 @@ class GavilanChatbotStack(Stack):
             ),
         )
         # The data source cannot be created before the KB exists.
-        web_data_source.add_dependency(knowledge_base)
+        s3_data_source.add_dependency(knowledge_base)
 
         # --- Bedrock Guardrails: input screen + output backstop -----------------------
 
