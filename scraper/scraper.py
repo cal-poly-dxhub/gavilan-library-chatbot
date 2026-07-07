@@ -124,6 +124,33 @@ def _scrub_replacement_chars(text: Optional[str]) -> Optional[str]:
     return text.replace(_REPLACEMENT_SEQ, "").replace("�", "")
 
 
+def _flatten_markdown_tables(markdown: Optional[str]) -> Optional[str]:
+    """Turn markdown-table rows into plain prose lines. We do NOT want tables in the knowledge
+    base - the Gavilan pages use tables for LAYOUT (databases.php, contactus.php), so trafilatura
+    emits mangled "| cell | |" rows with empty cells. This flattens that markup to flat text.
+
+    Deliberately DUMB and robust (string ops on the OUTPUT markdown, never HTML table parsing, no
+    column/header semantics): a line is treated as a table row only if it starts with "|". Its
+    cells are split on "|"; empty cells and pure table-drawing cells (---, :, spaces - i.e. the
+    |---|---| separator row) are dropped; each remaining cell becomes its own prose line. Non-table
+    lines (including headings) pass through untouched.
+
+    (include_tables stays True in extract_markdown on purpose: setting it False makes trafilatura
+    drop heading markup and jam adjacent cells together with no separator - worse than this.)
+    """
+    if not markdown:
+        return markdown
+    out = []
+    for line in markdown.split("\n"):
+        if not line.strip().startswith("|"):
+            out.append(line)
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        # Keep content cells only: non-empty and not composed solely of table-drawing chars.
+        out.extend(c for c in cells if c and (set(c) - set("-: ")))
+    return "\n".join(out)
+
+
 def _extract_title(html: str) -> Optional[str]:
     """Best-effort page title via trafilatura metadata; None if unavailable."""
     try:
@@ -145,16 +172,18 @@ def extract_markdown(html: str, url: Optional[str] = None) -> tuple[Optional[str
     `response.text` decodes fine. Some pages, however, have replacement-char garbage baked into
     their source (see `_scrub_replacement_chars`), so both the title and markdown are scrubbed of
     it before returning.
+
+    Note on tables: the pages use tables for layout, which trafilatura renders as mangled markdown
+    tables. We flatten those to prose (see `_flatten_markdown_tables`) - the KB wants flat text.
     """
-    markdown = _scrub_replacement_chars(
-        trafilatura.extract(
-            html,
-            url=url,
-            output_format="markdown",
-            include_tables=True,
-            include_comments=False,
-        )
+    markdown = trafilatura.extract(
+        html,
+        url=url,
+        output_format="markdown",
+        include_tables=True,
+        include_comments=False,
     )
+    markdown = _flatten_markdown_tables(_scrub_replacement_chars(markdown))
     if markdown is not None:
         markdown = markdown.strip() or None
     return _scrub_replacement_chars(_extract_title(html)), markdown

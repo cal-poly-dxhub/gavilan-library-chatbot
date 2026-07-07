@@ -56,6 +56,24 @@ FIXTURE_MOJIBAKE_HTML = (
     "</article></main></body></html>"
 )
 
+# The Gavilan pages use tables for LAYOUT (databases.php, contactus.php). trafilatura renders them
+# as mangled markdown tables ("| cell | |" with empty cells). We want flat prose, not tables. This
+# fixture reproduces that: a one-content-cell row (empty 2nd cell) and a two-cell contact row.
+FIXTURE_TABLE_HTML = (
+    "<!DOCTYPE html><html><head><title>Databases</title></head><body><main><article>"
+    "<h1>Databases</h1>"
+    "<table>"
+    "<tr><td>Films on Demand -- Thousands of videos from the world's top producers.</td><td></td></tr>"
+    "<tr><td>Gale Databases -- Articles and journals for research and coursework.</td><td></td></tr>"
+    "</table>"
+    "<h2>Contact</h2>"
+    "<table>"
+    "<tr><td>Phone: (408) 848-4806</td><td>Email: library@gavilan.edu</td></tr>"
+    "<tr><td>Address: 5055 Santa Teresa Blvd</td><td>Gilroy, CA 95020</td></tr>"
+    "</table>"
+    "</article></main></body></html>"
+)
+
 
 # --- slugify -----------------------------------------------------------------------------------
 
@@ -146,6 +164,48 @@ def test_extract_markdown_scrubs_baked_in_mojibake():
     assert "�" not in markdown, "bare U+FFFD still present"
     assert "worlds largest" in markdown          # "world[ï¿½]s" -> garbage stripped
     assert "Encyclopdia Britannica" in markdown   # "Encyclop[ï¿½]dia" -> garbage stripped
+
+
+# --- table flattening (layout tables -> flat prose, no network) --------------------------------
+
+def test_flatten_markdown_tables_unit():
+    src = (
+        "# Title\n\n"
+        "| Films on Demand -- videos. | |\n"
+        "| --- | --- |\n"
+        "| Phone: (408) 848-4806 | Email: library@gavilan.edu |\n\n"
+        "Regular paragraph.\n"
+    )
+    out = scraper._flatten_markdown_tables(src)
+    lines = out.split("\n")
+    # No markdown-table markup survives.
+    assert "| |" not in out
+    assert not any(ln.strip().startswith("|") for ln in lines)
+    # Heading and non-table prose pass through untouched.
+    assert "# Title" in lines
+    assert "Regular paragraph." in lines
+    # Separator row dropped; content cells become their own prose lines.
+    assert "Films on Demand -- videos." in lines
+    assert "Phone: (408) 848-4806" in lines
+    assert "Email: library@gavilan.edu" in lines
+
+
+def test_extract_markdown_flattens_layout_tables_to_prose():
+    _title, markdown = scraper.extract_markdown(
+        FIXTURE_TABLE_HTML, url="https://www.gavilan.edu/library/databases.php"
+    )
+    assert markdown
+    # No table markup: no empty-cell junk, and no line is a table row.
+    assert "| |" not in markdown
+    assert not any(ln.strip().startswith("|") for ln in markdown.split("\n"))
+    # Cell TEXT is preserved as flat prose.
+    assert "Films on Demand -- Thousands of videos from the world's top producers." in markdown
+    assert "Gale Databases -- Articles and journals for research and coursework." in markdown
+    assert "Phone: (408) 848-4806" in markdown
+    assert "Email: library@gavilan.edu" in markdown
+    assert "Gilroy, CA 95020" in markdown
+    # Headings survive (include_tables stays True; we only strip pipes).
+    assert "# Databases" in markdown
 
 
 # --- fetch handling (mocked) -------------------------------------------------------------------
