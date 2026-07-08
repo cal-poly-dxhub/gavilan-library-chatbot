@@ -1,29 +1,33 @@
 # Eval-harness infrastructure config.
 #
-# A SDK/boto3 operational tooling
-# stack. All values below are PLACEHOLDER / TBD until the AWS account and evaluator model
-# access.
+# SDK/boto3 operational-tooling config (separate from the app's root config.yaml). The
+# retrieve-eval path is fully filled for account 202712152316 / us-west-2. The generate-eval
+# fields (generate.bot_api_url) remain TBD - that path is out of scope until the bot capture
+# stage is implemented.
 
 eval:
-  # AWS region where Bedrock evaluation jobs run. Must match the region the stack deploys
-  # into (the same one chosen for KB + Web Crawler + OSS NextGen). Set to the confirmed
-  # deploy region us-west-2, where the generation model's inference profile is served.
+  # AWS region where Bedrock evaluation jobs run. Must match the KB's region and the evaluator
+  # model's region (all resources must be co-located). us-west-2 is where the KB and the Nova Pro
+  # inference profile are served.
   region: us-west-2
 
-  # IAM role Bedrock assumes to run the job. Needs read/write on the eval S3 bucket and
-  # access to the evaluator model. TBD: real role ARN.
-  role_arn: "arn:aws:iam::000000000000:role/TBD-bedrock-eval-role"
+  # IAM role Bedrock assumes to run the job. Needs read/write on the eval S3 bucket, InvokeModel
+  # on the evaluator model, and Retrieve/RetrieveAndGenerate on the KB. Standalone dev/ops role,
+  # NOT part of the CDK app stack (created via CLI).
+  role_arn: "arn:aws:iam::202712152316:role/gavilan-bedrock-eval-role"
 
-  # S3 bucket for eval input (JSONL datasets) and Bedrock output (results). If browsed
-  # from a UI it needs CORS. TBD: real bucket name.
-  bucket: "gavilan-library-eval-TBD"
+  # Dedicated S3 bucket for eval input (JSONL datasets) and Bedrock output (results). CORS is NOT
+  # required for knowledge-base evaluation jobs (only human-based eval needs it). Standalone,
+  # not in the CDK stack.
+  bucket: "gavilan-chatbot-eval-202712152316"
 
   # Key prefixes within the bucket.
   input_prefix: "eval/input"
   output_prefix: "eval/output"
 
-  # LLM-as-judge evaluator model id. TBD: confirm model access in the account/region.
-  evaluator_model_id: "us.anthropic.claude-3-5-sonnet-20240620-v1:0"
+  # LLM-as-judge evaluator model id. Amazon Nova Pro (via the us. cross-region inference profile);
+  # confirmed invocable in this account and on Bedrock's supported evaluator-model list for RAG eval.
+  evaluator_model_id: "us.amazon.nova-pro-v1:0"
 
   # Bedrock evaluation application type for RAG evaluation.
   application_type: "RagEvaluation"
@@ -32,15 +36,16 @@ eval:
   # Measures chunking/retrieval quality via
   # Builtin.ContextCoverage + Builtin.ContextRelevance.
   retrieve:
-    # KB whose retrieval quality is being evaluated. TBD: id of the deployed KB.
-    knowledge_base_id: "TBD-knowledge-base-id"
+    # KB whose retrieval quality is being evaluated (the deployed S3 Vectors KB).
+    knowledge_base_id: "NJHDEJYBHJ"
     # How many chunks Retrieve returns per query. This duplicates the root config.yaml's
     # retrieval.number_of_results and can silently drift from it: to evaluate the PRODUCTION
     # configuration, keep this equal to that value, or the eval measures a different retrieval
     # depth than the deployed bot uses. Diverge deliberately only for A/B depth experiments.
     number_of_results: 5
-    # overrideSearchType: HYBRID or SEMANTIC. v1 retrieval is semantic-only; HYBRID is the
-    # Phase 2 target, so this knob lets eval compare them without code changes.
+    # overrideSearchType. MUST be SEMANTIC: the KB is backed by Amazon S3 Vectors, which is
+    # semantic-search-only - HYBRID is not available on this store and would fail the retrieve
+    # call. (Keyword coverage is the future agentic-lookup work, not a retrieval search type.)
     search_type: "SEMANTIC"
 
   # Retrieve-and-generate evaluation: the answer-quality evaluator. BRING-YOUR-OWN-INFERENCE
