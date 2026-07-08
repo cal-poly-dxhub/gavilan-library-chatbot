@@ -4,12 +4,15 @@ Fronted by an API Gateway HTTP API (payload format 2.0) with two routes on this 
   - POST /query -> the real query path (_handle_query):
       0. _apply_input_guardrail() -> Bedrock `ApplyGuardrail` (source=INPUT) on the BARE
          user query.
-      1. retrieve()  -> Bedrock Knowledge Base `Retrieve` for relevant chunks + sources.
-      2. generate()  -> Bedrock Converse over those chunks, under the real system prompt
-         (app/system_prompt.md), with the OUTPUT guardrail (content filters, answer side
-         only) attached as a backstop.
-  - GET /warm -> _handle_warm(): a retrieval-only pre-warm to wake OpenSearch Serverless
-      before the first real query. No generation, no guardrail.
+      1. run_agent() -> an AGENTIC Bedrock Converse tool-use loop under the real system
+         prompt (app/system_prompt.md), with the OUTPUT guardrail (content filters, answer
+         side only) attached to every Converse call as a backstop. The model is given ONE
+         tool, `search_library_info`, which wraps the KB `Retrieve`; the model decides when
+         (and how many times) to call it. The loop feeds each tool result back and re-calls
+         Converse until stopReason == "end_turn" (or a safety iteration cap). Sources are
+         accumulated from every retrieval the model triggered during the loop.
+  - GET /warm -> _handle_warm(): a retrieval-only pre-warm before the first real query. No
+      generation, no guardrail.
 
 Wiring comes from env vars set by the CDK stack.
 
@@ -21,9 +24,11 @@ Wiring comes from env vars set by the CDK stack.
       ...
     ]
   }
-  - `sources` is deduplicated by uri, in retrieval order. Passages with no resolvable
-    source uri are omitted from `sources` (they still inform the answer).
-  - On empty retrieval, `sources` is [] and the system prompt instructs the model to say
+  - `sources` is deduplicated by uri, in retrieval order, accumulated across every tool
+    retrieval the model ran during the loop. Passages with no resolvable source uri are
+    omitted from `sources` (they still inform the answer). If the model answers without
+    calling the tool (e.g. a greeting), `sources` is [].
+  - When the tool retrieves nothing relevant, the system prompt instructs the model to say
     it does not have the information.
   - When the request sets `include_full_context: true`, the response also carries
     `full_context`: the full, un-deduped, un-truncated retrieved passages (`[{text, source}]`)
@@ -85,9 +90,20 @@ _FALLBACK_BLOCK_MESSAGE = (
     "hours, checkouts, and finding materials."
 )
 
-# The tag the system prompt expects retrieved passages in. MUST match "<context>" in
-# app/system_prompt.md (the prompt/handler contract).
-CONTEXT_TAG = "context"
+# The single tool the agent is given: semantic retrieval over the Bedrock KB. The name is
+# referenced by the system prompt (app/system_prompt.md), so keep the two in sync.
+SEARCH_TOOL_NAME = "search_library_info"
+
+# Safety cap on the Converse tool-use loop: the model can call the tool and be re-invoked at
+# most this many times before we stop and return the best answer so far. Prevents a runaway
+# (or adversarial) loop from spending unboundedly. A factual FAQ needs 1-2 iterations.
+MAX_AGENT_ITERATIONS = int(os.environ.get("MAX_AGENT_ITERATIONS", "5"))
+
+# Shown if the loop hits the iteration cap without the model producing any answer text.
+_MAX_ITERS_FALLBACK_MESSAGE = (
+    "I'm having trouble answering that right now. Please try rephrasing, or reach out to a "
+    "librarian for help."
+)
 
 # Max characters of a passage surfaced as a source excerpt in the response.
 _EXCERPT_CHARS = 300
@@ -159,19 +175,58 @@ def retrieve(query):
     return chunks
 
 
-def _build_context_block(chunks):
-    """Wrap the retrieved chunks in the <context> tag the system prompt expects."""
-    if not chunks:
-        inner = "(no relevant passages were retrieved)"
-    else:
-        entries = []
-        for i, chunk in enumerate(chunks, start=1):
-            entry = f"[{i}] {chunk['text']}"
-            if chunk.get("source"):
-                entry += f"\nSource: {chunk['source']}"
-            entries.append(entry)
-        inner = "\n\n".join(entries)
-    return f"<{CONTEXT_TAG}>\n{inner}\n</{CONTEXT_TAG}>"
+def _tool_config():
+    """The Converse `toolConfig`: the single `search_library_info` tool (KB semantic retrieval),
+    with a one-string `query` input schema. toolChoice is left as the model's default (auto) so
+    it may answer a greeting without searching."""
+    return {
+        "tools": [
+            {
+                "toolSpec": {
+                    "name": SEARCH_TOOL_NAME,
+                    "description": (
+                        "Search the Gavilan College Library's website content for the "
+                        "information needed to answer the user's question - hours, locations, "
+                        "checkout and borrowing policies, laptops and equipment, textbooks and "
+                        "course reserves, services, research databases, contact info, and FAQs. "
+                        "Call this whenever the question needs library facts, and answer from the "
+                        "results it returns rather than from memory. You may call it more than "
+                        "once with different queries to gather what you need."
+                    ),
+                    "inputSchema": {
+                        "json": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": (
+                                        "The search query describing the library information to "
+                                        "look up."
+                                    ),
+                                }
+                            },
+                            "required": ["query"],
+                        }
+                    },
+                }
+            }
+        ]
+    }
+
+
+def _run_search_tool(tool_input):
+    """Execute the search_library_info tool: run KB `Retrieve` on the model's query. Returns
+    (chunks, result_json) where result_json is the toolResult payload handed back to the model."""
+    query = ""
+    if isinstance(tool_input, dict):
+        query = (tool_input.get("query") or "").strip()
+    if not query:
+        return [], {"passages": [], "note": "No search query was provided."}
+    chunks = retrieve(query)
+    passages = [{"text": c["text"], "source": c.get("source")} for c in chunks]
+    if not passages:
+        return chunks, {"passages": [], "note": "No relevant passages were found."}
+    return chunks, {"passages": passages}
 
 
 def _output_guardrail_config():
@@ -343,16 +398,19 @@ def _apply_input_guardrail(query):
     return "proceed", query
 
 
-def _first_text(response):
-    """The first text block of a Converse response. On a guardrail block this is the
-    configured blocked message; otherwise the generated answer."""
-    content = (
-        response.get("output", {}).get("message", {}).get("content", []) or []
-    )
-    for block in content:
+def _message_text(message):
+    """The first text block of a Converse output message (a message may mix text with
+    toolUse blocks; we surface the text). Empty string if there is none."""
+    for block in (message or {}).get("content", []) or []:
         if isinstance(block, dict) and "text" in block:
             return block["text"]
     return ""
+
+
+def _first_text(response):
+    """The first text block of a Converse response. On a guardrail block this is the
+    configured blocked message; otherwise the generated answer."""
+    return _message_text(response.get("output", {}).get("message", {}))
 
 
 def _log_guardrail_assessment(response):
@@ -376,36 +434,97 @@ def _log_guardrail_assessment(response):
     )
 
 
-def generate(query, chunks):
-    """Bedrock Converse generation under the system prompt + OUTPUT guardrail. The system
-    prompt goes in Converse `system`; the <context> block and the question go in the user
-    message.
+def run_agent(query):
+    """Agentic Bedrock Converse tool-use loop with KB semantic retrieval as the only tool.
 
-    Returns {"answer": <text>, "blocked": <bool>}. When the output guardrail intervenes,
-    `answer` is the guardrail's configured blocked message and `blocked` is True."""
-    user_text = f"{_build_context_block(chunks)}\n\nQuestion: {query}"
+    The system prompt goes in Converse `system`; the user's (already input-screened) query is
+    the initial user message. Each turn:
+      - call Converse with the one-tool toolConfig + the OUTPUT guardrail (backstop on every turn);
+      - if the OUTPUT guardrail intervenes -> return the blocked message, no sources;
+      - if stopReason == "tool_use" -> run the tool for EACH toolUse block the model requested
+        (it may ask for several at once), append the assistant turn and ONE user message carrying
+        all the toolResults, and loop;
+      - any other stopReason (end_turn, max_tokens, ...) -> done, return the answer.
+    Retrieval only happens when the model calls the tool, so `chunks` accumulates across the
+    whole loop (empty if the model answered directly, e.g. a greeting). A safety cap of
+    MAX_AGENT_ITERATIONS bounds the loop.
 
-    kwargs = {
-        "modelId": GENERATION_MODEL_ID,
-        "system": [{"text": SYSTEM_PROMPT}],
-        "messages": [{"role": "user", "content": [{"text": user_text}]}],
-        # Short, direct, low-variance answers for a factual FAQ bot. The maxTokens/temperature
-        # key names and nesting match the bedrock-runtime Converse inferenceConfig shape.
-        "inferenceConfig": {
-            "maxTokens": GENERATION_MAX_TOKENS,
-            "temperature": GENERATION_TEMPERATURE,
-        },
-    }
+    Returns {"answer": <text>, "blocked": <bool>, "chunks": [<retrieved chunk>...]}."""
+    messages = [{"role": "user", "content": [{"text": query}]}]
+    collected_chunks = []
+    answer = ""
+    tool_config = _tool_config()
     guardrail = _output_guardrail_config()
-    if guardrail:
-        kwargs["guardrailConfig"] = guardrail
 
-    response = _bedrock_client().converse(**kwargs)
-    _log_guardrail_assessment(response)
+    for _ in range(MAX_AGENT_ITERATIONS):
+        kwargs = {
+            "modelId": GENERATION_MODEL_ID,
+            "system": [{"text": SYSTEM_PROMPT}],
+            "messages": messages,
+            "toolConfig": tool_config,
+            # Short, direct, low-variance answers for a factual FAQ bot. The maxTokens/temperature
+            # key names and nesting match the bedrock-runtime Converse inferenceConfig shape.
+            "inferenceConfig": {
+                "maxTokens": GENERATION_MAX_TOKENS,
+                "temperature": GENERATION_TEMPERATURE,
+            },
+        }
+        # OUTPUT guardrail on EVERY turn so the final answer is always screened.
+        if guardrail:
+            kwargs["guardrailConfig"] = guardrail
 
+        response = _bedrock_client().converse(**kwargs)
+        _log_guardrail_assessment(response)
+
+        if response.get("stopReason") == _GUARDRAIL_STOP_REASON:
+            # The OUTPUT guardrail blocked this turn: return its message, drop sources.
+            return {"answer": _first_text(response), "blocked": True, "chunks": []}
+
+        out_message = response.get("output", {}).get("message", {}) or {}
+        text = _message_text(out_message)
+        if text:
+            answer = text  # keep the latest model text as the running best answer
+
+        if response.get("stopReason") != "tool_use":
+            # Terminal turn (end_turn / max_tokens / stop_sequence / ...): we have the answer.
+            return {"answer": answer, "blocked": False, "chunks": collected_chunks}
+
+        # tool_use: echo the assistant turn back verbatim (it carries the toolUse blocks), then
+        # run every requested tool and return all results in a single following user message.
+        messages.append(out_message)
+        tool_results = []
+        for block in out_message.get("content", []) or []:
+            tool_use = block.get("toolUse") if isinstance(block, dict) else None
+            if not tool_use:
+                continue
+            if tool_use.get("name") == SEARCH_TOOL_NAME:
+                chunks, result_json = _run_search_tool(tool_use.get("input"))
+                collected_chunks.extend(chunks)
+                status = "success"
+            else:
+                # The model requested a tool we did not define; report an error result so it can
+                # recover rather than silently hanging.
+                result_json = {"error": f"Unknown tool: {tool_use.get('name')}"}
+                status = "error"
+            tool_results.append(
+                {
+                    "toolResult": {
+                        "toolUseId": tool_use.get("toolUseId"),
+                        "content": [{"json": result_json}],
+                        "status": status,
+                    }
+                }
+            )
+        if not tool_results:
+            # stopReason was tool_use but no toolUse block was present: bail rather than loop.
+            break
+        messages.append({"role": "user", "content": tool_results})
+
+    # Iteration cap hit without a terminal turn: return the best answer we have (or a fallback).
     return {
-        "answer": _first_text(response),
-        "blocked": response.get("stopReason") == _GUARDRAIL_STOP_REASON,
+        "answer": answer or _MAX_ITERS_FALLBACK_MESSAGE,
+        "blocked": False,
+        "chunks": collected_chunks,
     }
 
 
@@ -538,22 +657,24 @@ def _handle_query(event):
     # JSON error instead of an opaque 500. `stage` names the step that failed. No retry logic.
     stage = "input_guardrail"
     try:
-        # Screen the bare query BEFORE retrieval. A content-filter / prompt-attack hit is
+        # Screen the bare query BEFORE the agent runs. A content-filter / prompt-attack hit is
         # blocked here and returns immediately - no retrieval, no generation, no Bedrock spend.
-        # PII is masked and we proceed silently on the masked text; the retrieved <context> is
-        # never screened, so contact facts survive.
+        # PII is masked and we proceed silently on the masked text; the retrieved passages the
+        # tool returns are never input-screened, so contact facts survive.
         decision, screened_query = _apply_input_guardrail(query)
         if decision == "block":
             return _response(200, {"answer": screened_query, "sources": []})
-        stage = "retrieve"
-        chunks = retrieve(screened_query)
-        stage = "generate"
-        result = generate(screened_query, chunks)
+        # The agentic loop: Converse tool-use with KB retrieval as the sole tool. Retrieval,
+        # generation, and the output-guardrail backstop all happen inside; on any fault this
+        # whole step reports as the "agent" stage.
+        stage = "agent"
+        result = run_agent(screened_query)
     except Exception as exc:  # noqa: BLE001 - deliberately broad: any AWS/runtime fault
         return _error_response(stage, exc)
 
-    # On an OUTPUT guardrail block the answer is the blocked message; don't attach library
-    # sources to it (v1: just return the message, no re-retrieve or escalation).
+    # Sources come from whatever the tool retrieved across the loop, deduped by uri. On an OUTPUT
+    # guardrail block the answer is the blocked message; don't attach library sources to it.
+    chunks = result["chunks"]
     sources = [] if result["blocked"] else _build_sources(chunks)
     payload = {"answer": result["answer"], "sources": sources}
     if include_full_context:
