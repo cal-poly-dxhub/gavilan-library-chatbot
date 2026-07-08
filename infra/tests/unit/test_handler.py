@@ -438,6 +438,95 @@ def test_chunk_without_source_omitted_from_sources(monkeypatch):
     assert passages == [{"text": "A passage with no location.", "source": None}]
 
 
+# --- public source URL vs internal S3 URI --------------------------------------
+#
+# The scraper writes each document's public original URL into its Bedrock metadata sidecar
+# (metadata["source_url"]). _extract_source surfaces that; the internal s3:// URI is only a
+# last-resort fallback, and a source that resolves ONLY to s3:// is dropped so no raw bucket
+# path ever reaches the client.
+
+
+def test_extract_source_prefers_public_source_url_metadata():
+    # source_url wins over both a location entry and the internal s3 source-uri.
+    result = {
+        "content": {"text": "x"},
+        "location": {"s3Location": {"uri": "s3://kb-bucket/docs/hours.txt"}},
+        "metadata": {
+            "source_url": "https://www.gavilan.edu/library/hours.php",
+            "x-amz-bedrock-kb-source-uri": "s3://kb-bucket/docs/hours.txt",
+        },
+    }
+    assert handler._extract_source(result) == "https://www.gavilan.edu/library/hours.php"
+
+
+def test_extract_source_falls_back_to_location_url_when_no_source_url():
+    # Web-crawler result with no source_url: the public page url from location is used.
+    result = {"location": {"webLocation": {"url": "https://gav.edu/page"}}, "metadata": {}}
+    assert handler._extract_source(result) == "https://gav.edu/page"
+
+
+def test_extract_source_falls_back_to_s3_uri_when_no_public_url():
+    # No source_url and no location: the internal s3 uri is returned (last resort). It is dropped
+    # later by _build_sources, but _extract_source itself still surfaces it (e.g. for eval).
+    result = {"metadata": {"x-amz-bedrock-kb-source-uri": "s3://kb-bucket/docs/x.txt"}}
+    assert handler._extract_source(result) == "s3://kb-bucket/docs/x.txt"
+
+
+def test_build_sources_omits_s3_only_sources():
+    chunks = [
+        {"text": "public passage", "source": "https://gav.edu/a"},
+        {"text": "internal doc", "source": "s3://kb-bucket/docs/x.txt"},
+        {"text": "no source at all", "source": None},
+    ]
+    # Only the public source survives; the s3:// one and the sourceless one are omitted.
+    assert handler._build_sources(chunks) == [
+        {"uri": "https://gav.edu/a", "excerpt": "public passage"}
+    ]
+
+
+def test_source_url_metadata_surfaces_as_public_uri_end_to_end(monkeypatch):
+    # An S3-data-source chunk carrying the public source_url sidecar surfaces the PUBLIC url in
+    # the response, not the s3:// path.
+    agent = FakeAgentRuntime(results=[
+        {
+            "content": {"text": "Open 9am to 5pm."},
+            "location": {"s3Location": {"uri": "s3://kb-bucket/docs/hours.txt"}},
+            "metadata": {"source_url": "https://www.gavilan.edu/library/hours.php"},
+        },
+    ])
+    bedrock = FakeBedrockRuntime(converse_script=search_then_answer("Open 9am to 5pm."))
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
+
+    body = json.loads(resp["body"])
+    assert body["sources"] == [
+        {"uri": "https://www.gavilan.edu/library/hours.php", "excerpt": "Open 9am to 5pm."}
+    ]
+    # The internal s3 path never appears anywhere in the response.
+    assert "s3://" not in resp["body"]
+
+
+def test_s3_only_source_omitted_end_to_end(monkeypatch):
+    # A document with no public source_url (only the internal s3 uri) contributes NO source: the
+    # answer still returns, but with no leaked bucket path.
+    agent = FakeAgentRuntime(results=[
+        {
+            "content": {"text": "Some internal-only passage."},
+            "location": {"s3Location": {"uri": "s3://kb-bucket/docs/old-doc.txt"}},
+        },
+    ])
+    bedrock = FakeBedrockRuntime(converse_script=search_then_answer("Here is the answer."))
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "x?"})), None)
+
+    body = json.loads(resp["body"])
+    assert body["answer"] == "Here is the answer."
+    assert body["sources"] == []
+    assert "s3://" not in resp["body"]
+
+
 # --- include_full_context flag -------------------------------------------------
 
 

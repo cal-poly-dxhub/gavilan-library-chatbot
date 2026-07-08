@@ -341,6 +341,73 @@
     }
   }
 
+  // ---- inline SVG icons ---------------------------------------------------
+  //
+  // Icons are built as real SVG nodes (createElementNS), not emoji or font
+  // glyphs, so they render identically everywhere and inherit color via
+  // `currentColor`. Feather-style single-stroke paths, sized to 1em.
+
+  var SVG_NS = "http://www.w3.org/2000/svg";
+
+  function svgIcon(doc, shapes) {
+    var svg = doc.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("width", "1em");
+    svg.setAttribute("height", "1em");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    for (var i = 0; i < shapes.length; i++) {
+      var node = doc.createElementNS(SVG_NS, shapes[i][0]);
+      var attrs = shapes[i][1];
+      for (var k in attrs) {
+        if (Object.prototype.hasOwnProperty.call(attrs, k)) node.setAttribute(k, attrs[k]);
+      }
+      svg.appendChild(node);
+    }
+    return svg;
+  }
+
+  // Chat bubble (launcher).
+  function iconChat(doc) {
+    return svgIcon(doc, [
+      ["path", { d: "M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" }]
+    ]);
+  }
+
+  // Diagonal expand / collapse (header size toggle).
+  function iconExpand(doc) {
+    return svgIcon(doc, [
+      ["polyline", { points: "15 3 21 3 21 9" }],
+      ["polyline", { points: "9 21 3 21 3 15" }],
+      ["line", { x1: "21", y1: "3", x2: "14", y2: "10" }],
+      ["line", { x1: "3", y1: "21", x2: "10", y2: "14" }]
+    ]);
+  }
+  function iconCollapse(doc) {
+    return svgIcon(doc, [
+      ["polyline", { points: "4 14 10 14 10 20" }],
+      ["polyline", { points: "20 10 14 10 14 4" }],
+      ["line", { x1: "14", y1: "10", x2: "21", y2: "3" }],
+      ["line", { x1: "3", y1: "21", x2: "10", y2: "14" }]
+    ]);
+  }
+
+  // Down chevron (sources disclosure); CSS rotates it when expanded.
+  function iconChevron(doc) {
+    return svgIcon(doc, [["polyline", { points: "6 9 12 15 18 9" }]]);
+  }
+
+  /** Replace an element's children with a single icon node. */
+  function setIcon(el, icon) {
+    while (el.firstChild) el.removeChild(el.firstChild);
+    el.appendChild(icon);
+  }
+
   // ---- styles (scoped inside the shadow root) -----------------------------
 
   var STYLES = [
@@ -376,7 +443,9 @@
     "}",
     ".launcher:hover { filter: brightness(1.07); }",
     ".launcher:focus-visible { outline: 3px solid #9ec5ff; outline-offset: 2px; }",
-    ".launcher__icon { font-size: 18px; line-height: 1; }",
+    ".launcher__icon { display: inline-flex; font-size: 18px; line-height: 1; }",
+    // SVG icons: size to 1em of their control, inherit color via currentColor.
+    ".launcher__icon svg, .header__expand svg, .sources__caret svg { display: block; width: 1em; height: 1em; }",
     // panel
     ".panel {",
     "  position: fixed; right: 20px; bottom: 20px; z-index: 2147483000;",
@@ -431,13 +500,21 @@
     ".msg--user .bubble { background: var(--user-bg); color: var(--user-ink); border-bottom-right-radius: 4px; }",
     ".msg--bot .bubble { background: var(--bot-bg); color: var(--bot-ink); border-bottom-left-radius: 4px; }",
     ".bubble--error { background: var(--error-bg); color: var(--error-ink); }",
-    // sources
+    // sources - per message, collapsed behind a disclosure toggle
     ".sources { margin-top: 8px; padding-top: 8px; border-top: 1px solid #dfe3e8; }",
-    ".sources__label {",
-    "  font-size: 11px; font-weight: 700; letter-spacing: .04em;",
-    "  text-transform: uppercase; color: var(--muted); margin-bottom: 6px;",
+    ".sources__toggle {",
+    "  display: inline-flex; align-items: center; gap: 5px;",
+    "  appearance: none; border: none; background: transparent; cursor: pointer;",
+    "  padding: 2px 0; color: var(--muted); font: inherit;",
+    "  font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;",
     "}",
-    ".sources__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }",
+    ".sources__toggle:hover { color: var(--accent); }",
+    ".sources__toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }",
+    ".sources__caret { display: inline-flex; transition: transform .15s ease; }",
+    ".sources__toggle[aria-expanded=\"true\"] .sources__caret { transform: rotate(180deg); }",
+    "@media (prefers-reduced-motion: reduce) { .sources__caret { transition: none; } }",
+    ".sources__list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }",
+    ".sources__list[hidden] { display: none; }",
     ".sources__link { color: var(--accent); font-weight: 600; font-size: 13px; text-decoration: none; word-break: break-word; }",
     ".sources__link:hover { text-decoration: underline; }",
     ".sources__link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }",
@@ -538,7 +615,7 @@
     var lIcon = doc.createElement("span");
     lIcon.className = "launcher__icon";
     lIcon.setAttribute("aria-hidden", "true");
-    lIcon.textContent = "💬"; // speech balloon
+    lIcon.appendChild(iconChat(doc)); // inline SVG chat bubble
     var lText = doc.createElement("span");
     lText.textContent = CONFIG.launcherLabel;
     launcher.appendChild(lIcon);
@@ -562,7 +639,7 @@
     hExpand.className = "header__expand";
     hExpand.setAttribute("aria-label", "Expand chat");
     hExpand.setAttribute("aria-pressed", "false");
-    hExpand.textContent = "⤢"; // diagonal resize glyph
+    hExpand.appendChild(iconExpand(doc)); // inline SVG, swapped on toggle
     var hClose = doc.createElement("button");
     hClose.type = "button";
     hClose.className = "header__close";
@@ -623,24 +700,48 @@
       scrollToBottom();
     }
 
+    // Build the collapsible sources disclosure for ONE message. Caller only invokes this when
+    // that message has at least one source, so there is never an empty "Sources" affordance.
+    // Collapsed by default: a small toggle reveals this message's own list of public links.
     function buildSources(sources) {
       var container = doc.createElement("div");
       container.className = "sources";
-      var label = doc.createElement("div");
-      label.className = "sources__label";
-      label.textContent = sources.length > 1 ? "Sources" : "Source";
-      container.appendChild(label);
+
       var list = doc.createElement("ul");
       list.className = "sources__list";
+      list.hidden = true; // collapsed by default
+
+      var toggle = doc.createElement("button");
+      toggle.type = "button";
+      toggle.className = "sources__toggle";
+      toggle.setAttribute("aria-expanded", "false");
+      var caret = doc.createElement("span");
+      caret.className = "sources__caret";
+      caret.setAttribute("aria-hidden", "true");
+      caret.appendChild(iconChevron(doc));
+      var toggleText = doc.createElement("span");
+      toggleText.className = "sources__toggle-text";
+      toggleText.textContent =
+        sources.length > 1 ? "Sources (" + sources.length + ")" : "Source";
+      toggle.appendChild(caret);
+      toggle.appendChild(toggleText);
+      toggle.addEventListener("click", function () {
+        var expanded = toggle.getAttribute("aria-expanded") === "true";
+        toggle.setAttribute("aria-expanded", expanded ? "false" : "true");
+        list.hidden = expanded; // was open -> collapse; was closed -> reveal
+        scrollToBottom();
+      });
+
       for (var i = 0; i < sources.length; i++) {
         var src = sources[i];
         var href = safeHttpUrl(src.uri);
         var li = doc.createElement("li");
+        li.className = "sources__item";
         if (href) {
           var a = doc.createElement("a");
           a.className = "sources__link";
           a.href = href;
-          a.target = "_blank";
+          a.target = "_blank"; // open the public library page in a new tab
           a.rel = "noopener noreferrer nofollow";
           a.textContent = displayUrl(href);
           li.appendChild(a);
@@ -659,6 +760,8 @@
         }
         list.appendChild(li);
       }
+
+      container.appendChild(toggle);
       container.appendChild(list);
       return container;
     }
@@ -867,7 +970,7 @@
       }
       hExpand.setAttribute("aria-pressed", state.expanded ? "true" : "false");
       hExpand.setAttribute("aria-label", state.expanded ? "Shrink chat" : "Expand chat");
-      hExpand.textContent = state.expanded ? "⤡" : "⤢";
+      setIcon(hExpand, state.expanded ? iconCollapse(doc) : iconExpand(doc));
       scrollToBottom();
     }
 

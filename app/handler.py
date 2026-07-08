@@ -226,8 +226,20 @@ def _get_catalog():
 
 
 def _extract_source(result):
-    """Pull a source URI from a KB Retrieve result. Web crawler -> page url; falls back to
-    the bedrock source-uri metadata."""
+    """Pull the public source URL for a KB Retrieve result.
+
+    Order of preference:
+      1. metadata["source_url"] - the public original page URL, ingested per document by the
+         scraper into each document's Bedrock metadata sidecar. This is what we want to show.
+      2. a location URL (e.g. a web crawler's page url).
+      3. the internal S3 URI (s3Location / the bedrock source-uri metadata) as a LAST resort.
+
+    The S3 URI is an internal path, not something to show a student: _build_sources drops any
+    source that resolves only to an s3:// URI so it never reaches the client."""
+    metadata = result.get("metadata") or {}
+    source_url = metadata.get("source_url")
+    if source_url:
+        return source_url
     location = result.get("location") or {}
     for key in (
         "webLocation",
@@ -241,7 +253,6 @@ def _extract_source(result):
             uri = loc.get("url") or loc.get("uri")
             if uri:
                 return uri
-    metadata = result.get("metadata") or {}
     return metadata.get("x-amz-bedrock-kb-source-uri")
 
 
@@ -764,12 +775,16 @@ def run_agent(messages):
 
 
 def _build_sources(chunks):
-    """Deduplicate retrieved chunks by source uri for the response `sources` list."""
+    """Deduplicate retrieved chunks by source uri for the response `sources` list.
+
+    Only public URLs are surfaced. A chunk whose source resolves only to an internal s3:// URI
+    (e.g. an older document ingested before the public-url sidecar existed) is OMITTED entirely -
+    we never leak internal S3 bucket paths to the client. Fewer, clean sources beats a raw path."""
     sources = []
     seen = set()
     for chunk in chunks:
         uri = chunk.get("source")
-        if not uri or uri in seen:
+        if not uri or uri in seen or uri.startswith("s3://"):
             continue
         seen.add(uri)
         sources.append({"uri": uri, "excerpt": chunk["text"][:_EXCERPT_CHARS]})

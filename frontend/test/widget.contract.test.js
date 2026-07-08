@@ -345,6 +345,10 @@ function makeEl(tagName) {
     },
     set: function (v) { el._text = String(v); el.children = []; }
   });
+  Object.defineProperty(el, "firstChild", { get: function () { return el.children[0] || null; } });
+  Object.defineProperty(el, "lastChild", {
+    get: function () { return el.children[el.children.length - 1] || null; }
+  });
   Object.defineProperty(el, "scrollHeight", { get: function () { return 40; } });
   el.scrollTop = 0;
   return el;
@@ -353,6 +357,8 @@ function makeEl(tagName) {
 function makeDoc() {
   var doc = {
     createElement: function (tag) { return makeEl(tag); },
+    // SVG namespace element (icons); the fake ignores the namespace.
+    createElementNS: function (ns, tag) { return makeEl(tag); },
     createTextNode: function (t) {
       var n = { nodeType: 3, tagName: "#text", children: [], _t: String(t) };
       Object.defineProperty(n, "textContent", { get: function () { return n._t; } });
@@ -391,6 +397,25 @@ function findByClass(node, cls) {
     if (f) return f;
   }
   return node.shadow ? findByClass(node.shadow, cls) : null;
+}
+
+function findAll(node, cls) {
+  var out = [];
+  (function walk(n) {
+    if (!n) return;
+    var cn = n.className || "";
+    if ((" " + cn + " ").indexOf(" " + cls + " ") >= 0) out.push(n);
+    (n.children || []).forEach(walk);
+    if (n.shadow) walk(n.shadow);
+  })(node);
+  return out;
+}
+
+// A fetch stub that resolves one canned {answer, sources} payload as an ok JSON response.
+function okJson(payload) {
+  return function () {
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve(payload); } });
+  };
 }
 
 function countUserTurns(state) {
@@ -560,6 +585,108 @@ test("expanded dimensions clamp to the viewport (usable on mobile)", () => {
   // The .panel--expanded rule sizes with min(...) against the viewport, so a phone can't
   // get an off-screen panel.
   assert.ok(/\.panel--expanded\s*\{[^}]*min\(/.test(SOURCE), "expanded width/height clamp with min()");
+});
+
+// --- per-message, collapsible sources UI --------------------------------
+test("sources are per-message: each answer shows only its own sources, not a union", async () => {
+  var calls = 0;
+  var restore = withNetwork(function () {
+    calls++;
+    var payload = calls === 1
+      ? { answer: "A1", sources: [{ uri: "https://gav.edu/hours", excerpt: "h" }] }
+      : { answer: "A2", sources: [{ uri: "https://gav.edu/borrow", excerpt: "b" }] };
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve(payload); } });
+  });
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    handle.submit("q1"); await flush();
+    handle.submit("q2"); await flush();
+
+    var bots = findAll(handle.shadow, "msg--bot"); // greeting + 2 answers
+    var linksOf = function (msg) {
+      var list = findByClass(msg, "sources__list");
+      return list ? collectByTag(list, "a").map(function (a) { return a.href; }) : [];
+    };
+    // Each answer shows ONLY its own source (no accumulation across the conversation).
+    assert.deepStrictEqual(linksOf(bots[bots.length - 2]), ["https://gav.edu/hours"]);
+    assert.deepStrictEqual(linksOf(bots[bots.length - 1]), ["https://gav.edu/borrow"]);
+  } finally {
+    restore();
+  }
+});
+
+test("sources are collapsed by default and expand on click, linking the public URL in a new tab", async () => {
+  var restore = withNetwork(
+    okJson({ answer: "A", sources: [{ uri: "https://www.gavilan.edu/library/hours.php", excerpt: "e" }] })
+  );
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    handle.submit("hours?"); await flush();
+
+    var bot = findAll(handle.shadow, "msg--bot").pop();
+    var toggle = findByClass(bot, "sources__toggle");
+    var list = findByClass(bot, "sources__list");
+    assert.ok(toggle && list, "a sources toggle and list are rendered");
+
+    // Collapsed by default.
+    assert.strictEqual(toggle.getAttribute("aria-expanded"), "false");
+    assert.strictEqual(list.hidden, true, "list is hidden until the user expands it");
+
+    // Expands on click.
+    toggle.fire("click");
+    assert.strictEqual(toggle.getAttribute("aria-expanded"), "true");
+    assert.strictEqual(list.hidden, false, "list is revealed after clicking the toggle");
+
+    // Clean public link, opens in a new tab, safe rel.
+    var a = collectByTag(list, "a")[0];
+    assert.strictEqual(a.href, "https://www.gavilan.edu/library/hours.php");
+    assert.strictEqual(a.target, "_blank");
+    assert.match(a.rel, /noopener noreferrer/);
+
+    // Collapses again on a second click.
+    toggle.fire("click");
+    assert.strictEqual(toggle.getAttribute("aria-expanded"), "false");
+    assert.strictEqual(list.hidden, true);
+  } finally {
+    restore();
+  }
+});
+
+test("an answer with zero sources shows no sources affordance at all", async () => {
+  var restore = withNetwork(okJson({ answer: "Just a greeting reply.", sources: [] }));
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    handle.submit("hello"); await flush();
+
+    var bot = findAll(handle.shadow, "msg--bot").pop();
+    assert.strictEqual(findByClass(bot, "sources"), null, "no .sources container");
+    assert.strictEqual(findByClass(bot, "sources__toggle"), null, "no empty Sources label");
+  } finally {
+    restore();
+  }
+});
+
+// --- SVG icons (no emoji glyphs) ----------------------------------------
+test("launcher and resize controls use inline SVG icons, not emoji glyphs", () => {
+  assert.ok(!/💬/.test(SOURCE), "no chat speech-balloon emoji");
+  assert.ok(!/[⤢⤡⬌⬍]/.test(SOURCE), "no resize arrow glyphs");
+  assert.ok(!/⤢|⤡/.test(SOURCE), "no diagonal resize glyphs");
+  assert.ok(/createElementNS\(/.test(SOURCE), "icons are built as real SVG nodes");
+});
+
+test("launcher renders an SVG icon and the expand control swaps SVG icons on toggle", () => {
+  var doc = makeDoc();
+  var handle = widget.mount(doc);
+  var launcherIcon = findByClass(handle.shadow, "launcher__icon");
+  assert.ok(collectByTag(launcherIcon, "svg").length >= 1, "launcher shows an svg icon");
+
+  var expandBtn = findByClass(handle.shadow, "header__expand");
+  assert.strictEqual(collectByTag(expandBtn, "svg").length, 1, "expand shows one svg icon");
+  expandBtn.fire("click");
+  assert.strictEqual(collectByTag(expandBtn, "svg").length, 1, "still exactly one svg after toggling to collapse");
 });
 
 // --- brand color: one swappable token -----------------------------------
