@@ -654,6 +654,36 @@ test("sources are collapsed by default and expand on click, linking the public U
   }
 });
 
+test("expanding a source dropdown does NOT force the thread to scroll to the bottom", async () => {
+  // Regression: toggling sources on a message that isn't the most recent used to jerk the whole
+  // thread down. Expanding/collapsing must leave the scroll position alone.
+  var restore = withNetwork(
+    okJson({ answer: "A", sources: [{ uri: "https://gav.edu/x", excerpt: "e" }] })
+  );
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    handle.submit("q1"); await flush();
+    handle.submit("q2"); await flush(); // a later message exists, so q1's answer isn't the most recent
+
+    var thread = findByClass(handle.shadow, "thread");
+    var firstAnswer = findAll(handle.shadow, "msg--bot")[1]; // greeting[0], q1 answer[1]
+    var toggle = findByClass(firstAnswer, "sources__toggle");
+    assert.ok(thread && toggle, "thread and an older message's sources toggle exist");
+
+    // Simulate the user having scrolled up to that older message.
+    thread.scrollTop = 5;
+    toggle.fire("click"); // expand
+    assert.strictEqual(thread.scrollTop, 5, "expanding must not move the scroll position");
+    toggle.fire("click"); // collapse
+    assert.strictEqual(thread.scrollTop, 5, "collapsing must not move the scroll position");
+    // And it still actually toggled.
+    assert.strictEqual(toggle.getAttribute("aria-expanded"), "false");
+  } finally {
+    restore();
+  }
+});
+
 test("an answer with zero sources shows no sources affordance at all", async () => {
   var restore = withNetwork(okJson({ answer: "Just a greeting reply.", sources: [] }));
   try {

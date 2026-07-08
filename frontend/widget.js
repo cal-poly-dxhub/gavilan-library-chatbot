@@ -781,7 +781,9 @@
         var expanded = toggle.getAttribute("aria-expanded") === "true";
         toggle.setAttribute("aria-expanded", expanded ? "false" : "true");
         list.hidden = expanded; // was open -> collapse; was closed -> reveal
-        scrollToBottom();
+        // No scroll: the list appears right under the toggle the user clicked, which is already
+        // in view. Forcing scrollToBottom() here jerked the thread down when expanding sources on
+        // an older (not-most-recent) message.
       });
 
       for (var i = 0; i < sources.length; i++) {
