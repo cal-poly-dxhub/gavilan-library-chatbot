@@ -54,7 +54,15 @@
     greeting:
       "Hi! I'm the Gavilan College Library assistant. I can help with hours, " +
       "checking out materials, textbooks, and what the library offers. " +
-      "What can I help you find?"
+      "What can I help you find?",
+    // Starter questions shown as clickable buttons on first launch, under the greeting.
+    // They disappear as soon as the user sends any message. Scoped to what the bot handles.
+    suggestedQuestions: [
+      "What are the library hours?",
+      "How do I check out a book?",
+      "Where do I find my textbook?",
+      "What research databases are available?"
+    ]
   };
 
   // Capture the script element at load time (before the deferred mount runs),
@@ -210,15 +218,240 @@
     }
   }
 
+  // ---- minimal, safe markdown renderer ------------------------------------
+  //
+  // Renders a small, well-defined markdown subset (bold, italic, inline code,
+  // links, bullet/numbered lists, headings, paragraphs with soft breaks) into
+  // real DOM nodes. It builds every node with createElement + createTextNode
+  // ONLY - never innerHTML - so message content can never inject markup or run
+  // scripts, and link targets are passed through safeHttpUrl (javascript:/data:/
+  // relative URLs degrade to plain text). Anything unrecognized renders as literal
+  // text. The model's answers are the only input; user messages stay plain text.
+
+  // Inline rules, in scan-precedence order: code first (its contents are never
+  // re-parsed), then links, then bold, then italic.
+  var MD_INLINE = [
+    { re: /`([^`]+)`/, kind: "code" },
+    { re: /\[([^\]]+)\]\(([^)\s]+)\)/, kind: "link" },
+    { re: /\*\*([^*]+)\*\*/, kind: "strong" },
+    { re: /__([^_]+)__/, kind: "strong" },
+    { re: /\*([^*]+)\*/, kind: "em" },
+    { re: /_([^_]+)_/, kind: "em" }
+  ];
+
+  /** Render inline markdown in `text` as child nodes appended to `parent`. */
+  function renderInline(parent, text, doc) {
+    var remaining = String(text == null ? "" : text);
+    while (remaining) {
+      var best = null;
+      for (var i = 0; i < MD_INLINE.length; i++) {
+        var m = MD_INLINE[i].re.exec(remaining);
+        if (m && (best === null || m.index < best.match.index)) {
+          best = { spec: MD_INLINE[i], match: m };
+        }
+      }
+      if (!best) {
+        parent.appendChild(doc.createTextNode(remaining));
+        break;
+      }
+      var match = best.match;
+      if (match.index > 0) {
+        parent.appendChild(doc.createTextNode(remaining.slice(0, match.index)));
+      }
+      var kind = best.spec.kind;
+      if (kind === "link") {
+        var href = safeHttpUrl(match[2]);
+        if (href) {
+          var a = doc.createElement("a");
+          a.className = "md-link";
+          a.href = href;
+          a.target = "_blank";
+          a.rel = "noopener noreferrer nofollow";
+          renderInline(a, match[1], doc);
+          parent.appendChild(a);
+        } else {
+          // Unsafe/relative URL: never linkify; keep the label as plain text.
+          parent.appendChild(doc.createTextNode(match[1]));
+        }
+      } else if (kind === "code") {
+        var code = doc.createElement("code");
+        code.className = "md-code";
+        code.textContent = match[1]; // literal, never re-parsed
+        parent.appendChild(code);
+      } else {
+        var el = doc.createElement(kind === "strong" ? "strong" : "em");
+        renderInline(el, match[1], doc);
+        parent.appendChild(el);
+      }
+      remaining = remaining.slice(match.index + match[0].length);
+    }
+  }
+
+  var MD_BULLET = /^\s*[-*+]\s+(.*)$/;
+  var MD_ORDERED = /^\s*\d+[.)]\s+(.*)$/;
+  var MD_HEADING = /^\s*#{1,6}\s+(.*)$/;
+
+  /** Render block-level markdown from `md` as child nodes appended to `parent`. */
+  function renderMarkdown(parent, md, doc) {
+    var lines = String(md == null ? "" : md).replace(/\r\n?/g, "\n").split("\n");
+    var i = 0;
+    while (i < lines.length) {
+      if (/^\s*$/.test(lines[i])) { i++; continue; } // skip blank lines between blocks
+
+      var ordered = MD_ORDERED.test(lines[i]);
+      var bullet = MD_BULLET.test(lines[i]);
+      if (ordered || bullet) {
+        var list = doc.createElement(ordered ? "ol" : "ul");
+        list.className = "md-list";
+        var itemRe = ordered ? MD_ORDERED : MD_BULLET;
+        while (i < lines.length) {
+          var im = itemRe.exec(lines[i]);
+          if (!im) break;
+          var li = doc.createElement("li");
+          renderInline(li, im[1], doc);
+          list.appendChild(li);
+          i++;
+        }
+        parent.appendChild(list);
+        continue;
+      }
+
+      var hm = MD_HEADING.exec(lines[i]);
+      if (hm) {
+        var heading = doc.createElement("p");
+        heading.className = "md-heading";
+        renderInline(heading, hm[1], doc);
+        parent.appendChild(heading);
+        i++;
+        continue;
+      }
+
+      // Paragraph: consecutive non-blank lines that aren't a list/heading; a single
+      // newline inside becomes a soft <br> break.
+      var para = [];
+      while (
+        i < lines.length &&
+        !/^\s*$/.test(lines[i]) &&
+        !MD_BULLET.test(lines[i]) &&
+        !MD_ORDERED.test(lines[i]) &&
+        !MD_HEADING.test(lines[i])
+      ) {
+        para.push(lines[i]);
+        i++;
+      }
+      var p = doc.createElement("p");
+      p.className = "md-p";
+      for (var k = 0; k < para.length; k++) {
+        if (k > 0) p.appendChild(doc.createElement("br"));
+        renderInline(p, para[k], doc);
+      }
+      parent.appendChild(p);
+    }
+  }
+
+  // ---- inline SVG icons ---------------------------------------------------
+  //
+  // Icons are built as real SVG nodes (createElementNS), not emoji or font
+  // glyphs, so they render identically everywhere and inherit color via
+  // `currentColor`. Feather-style single-stroke paths, sized to 1em.
+
+  var SVG_NS = "http://www.w3.org/2000/svg";
+
+  function svgIcon(doc, shapes) {
+    var svg = doc.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("width", "1em");
+    svg.setAttribute("height", "1em");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("focusable", "false");
+    for (var i = 0; i < shapes.length; i++) {
+      var node = doc.createElementNS(SVG_NS, shapes[i][0]);
+      var attrs = shapes[i][1];
+      for (var k in attrs) {
+        if (Object.prototype.hasOwnProperty.call(attrs, k)) node.setAttribute(k, attrs[k]);
+      }
+      svg.appendChild(node);
+    }
+    return svg;
+  }
+
+  // Chat bubble (launcher).
+  function iconChat(doc) {
+    return svgIcon(doc, [
+      ["path", { d: "M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" }]
+    ]);
+  }
+
+  // Diagonal expand / collapse (header size toggle).
+  function iconExpand(doc) {
+    return svgIcon(doc, [
+      ["polyline", { points: "15 3 21 3 21 9" }],
+      ["polyline", { points: "9 21 3 21 3 15" }],
+      ["line", { x1: "21", y1: "3", x2: "14", y2: "10" }],
+      ["line", { x1: "3", y1: "21", x2: "10", y2: "14" }]
+    ]);
+  }
+  function iconCollapse(doc) {
+    return svgIcon(doc, [
+      ["polyline", { points: "4 14 10 14 10 20" }],
+      ["polyline", { points: "20 10 14 10 14 4" }],
+      ["line", { x1: "14", y1: "10", x2: "21", y2: "3" }],
+      ["line", { x1: "3", y1: "21", x2: "10", y2: "14" }]
+    ]);
+  }
+
+  // Down chevron (sources disclosure); CSS rotates it when expanded.
+  function iconChevron(doc) {
+    return svgIcon(doc, [["polyline", { points: "6 9 12 15 18 9" }]]);
+  }
+
+  /** Replace an element's children with a single icon node. */
+  function setIcon(el, icon) {
+    while (el.firstChild) el.removeChild(el.firstChild);
+    el.appendChild(icon);
+  }
+
+  // ---- title font ---------------------------------------------------------
+  //
+  // The title uses Bitter, loaded once from Google Fonts. The <link> goes in the HOST document
+  // head (not the shadow root) because @font-face registered at the document level is usable
+  // inside the shadow tree, which a shadow-scoped link cannot guarantee across browsers. Purely
+  // decorative: if the host site's CSP blocks the font, the title just falls back to serif.
+  var FONT_LINK_ID = "gavilan-chatbot-font";
+  var FONT_HREF =
+    "https://fonts.googleapis.com/css2?family=Bitter:wght@600;700&display=swap";
+
+  function ensureTitleFont(doc) {
+    try {
+      if (!doc || !doc.head || doc.getElementById(FONT_LINK_ID)) return;
+      var link = doc.createElement("link");
+      link.id = FONT_LINK_ID;
+      link.rel = "stylesheet";
+      link.href = FONT_HREF;
+      doc.head.appendChild(link);
+    } catch (e) {
+      /* font is decorative; never let it break the widget */
+    }
+  }
+
   // ---- styles (scoped inside the shadow root) -----------------------------
 
   var STYLES = [
     ":host { all: initial; }",
     "*, *::before, *::after { box-sizing: border-box; }",
     ".root {",
-    "  --accent: #1f4e79; --accent-ink: #ffffff;",
+    // PRIMARY BRAND COLOR - the single source of truth. Everything that reads as
+    // "brand" (header, launcher, buttons, user bubbles, links) derives from --brand,
+    // so swapping this one value re-skins the widget.
+    "  --brand: #8a1c30;",
+    "  --accent: var(--brand); --accent-ink: #ffffff;",
     "  --bg: #ffffff; --panel-border: #d9dee5;",
-    "  --user-bg: #1f4e79; --user-ink: #ffffff;",
+    "  --user-bg: var(--brand); --user-ink: #ffffff;",
     "  --bot-bg: #f1f3f6; --bot-ink: #1a1d21;",
     "  --muted: #5b6570; --error-bg: #fdecea; --error-ink: #8a1c12;",
     "  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;",
@@ -240,7 +473,9 @@
     "}",
     ".launcher:hover { filter: brightness(1.07); }",
     ".launcher:focus-visible { outline: 3px solid #9ec5ff; outline-offset: 2px; }",
-    ".launcher__icon { font-size: 18px; line-height: 1; }",
+    ".launcher__icon { display: inline-flex; font-size: 18px; line-height: 1; }",
+    // SVG icons: size to 1em of their control, inherit color via currentColor.
+    ".launcher__icon svg, .header__expand svg, .sources__caret svg { display: block; width: 1em; height: 1em; }",
     // panel
     ".panel {",
     "  position: fixed; right: 20px; bottom: 20px; z-index: 2147483000;",
@@ -251,13 +486,22 @@
     "  border-radius: 14px; overflow: hidden;",
     "  box-shadow: 0 12px 40px rgba(0,0,0,0.24);",
     "}",
+    // Expanded size, toggled from the header. width/height both clamp to the viewport
+    // via min(), so on a phone this collapses to the same near-full-width panel and the
+    // gain is mostly extra height - usable on desktop and mobile alike.
+    ".panel--expanded {",
+    "  width: min(720px, calc(100vw - 24px));",
+    "  height: min(860px, calc(100vh - 32px));",
+    "}",
     ".panel[hidden], .launcher[hidden] { display: none !important; }",
     // header
     ".header {",
     "  display: flex; align-items: center; justify-content: space-between;",
     "  padding: 12px 14px; background: var(--accent); color: var(--accent-ink);",
     "}",
-    ".header__title { font-size: 15px; font-weight: 600; }",
+    // Title uses Bitter (loaded from Google Fonts into the host document head at mount);
+    // falls back to a serif until/if it loads. Only the title uses it - body/UI stays default.
+    ".header__title { font-family: 'Bitter', Georgia, 'Times New Roman', serif; font-size: 15px; font-weight: 700; }",
     ".header__close {",
     "  appearance: none; border: none; background: transparent;",
     "  color: var(--accent-ink); font-size: 22px; line-height: 1;",
@@ -265,6 +509,14 @@
     "}",
     ".header__close:hover { background: rgba(255,255,255,0.18); }",
     ".header__close:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }",
+    ".header__actions { display: inline-flex; align-items: center; gap: 2px; }",
+    ".header__expand {",
+    "  appearance: none; border: none; background: transparent;",
+    "  color: var(--accent-ink); font-size: 17px; line-height: 1;",
+    "  cursor: pointer; padding: 2px 6px; border-radius: 6px;",
+    "}",
+    ".header__expand:hover { background: rgba(255,255,255,0.18); }",
+    ".header__expand:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }",
     // thread
     ".thread {",
     "  flex: 1 1 auto; overflow-y: auto; padding: 14px;",
@@ -280,17 +532,41 @@
     ".msg--user .bubble { background: var(--user-bg); color: var(--user-ink); border-bottom-right-radius: 4px; }",
     ".msg--bot .bubble { background: var(--bot-bg); color: var(--bot-ink); border-bottom-left-radius: 4px; }",
     ".bubble--error { background: var(--error-bg); color: var(--error-ink); }",
-    // sources
+    // sources - per message, collapsed behind a disclosure toggle
     ".sources { margin-top: 8px; padding-top: 8px; border-top: 1px solid #dfe3e8; }",
-    ".sources__label {",
-    "  font-size: 11px; font-weight: 700; letter-spacing: .04em;",
-    "  text-transform: uppercase; color: var(--muted); margin-bottom: 6px;",
+    ".sources__toggle {",
+    "  display: inline-flex; align-items: center; gap: 5px;",
+    "  appearance: none; border: none; background: transparent; cursor: pointer;",
+    "  padding: 2px 0; color: var(--muted); font: inherit;",
+    "  font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;",
     "}",
-    ".sources__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }",
+    ".sources__toggle:hover { color: var(--accent); }",
+    ".sources__toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }",
+    ".sources__caret { display: inline-flex; transition: transform .15s ease; }",
+    ".sources__toggle[aria-expanded=\"true\"] .sources__caret { transform: rotate(180deg); }",
+    "@media (prefers-reduced-motion: reduce) { .sources__caret { transition: none; } }",
+    ".sources__list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }",
+    ".sources__list[hidden] { display: none; }",
     ".sources__link { color: var(--accent); font-weight: 600; font-size: 13px; text-decoration: none; word-break: break-word; }",
     ".sources__link:hover { text-decoration: underline; }",
     ".sources__link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }",
     ".sources__excerpt { color: var(--muted); font-size: 12.5px; margin-top: 2px; }",
+    // rendered markdown (assistant messages). Block spacing is tight; first/last
+    // children lose their outer margin so the bubble stays snug.
+    ".md { white-space: normal; }",
+    ".md > :first-child { margin-top: 0; }",
+    ".md > :last-child { margin-bottom: 0; }",
+    ".md-p { margin: 0 0 8px; }",
+    ".md-heading { margin: 0 0 8px; font-weight: 700; }",
+    ".md-list { margin: 0 0 8px; padding-left: 20px; }",
+    ".md-list li { margin: 2px 0; }",
+    ".md-code {",
+    "  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;",
+    "  font-size: 0.9em; background: rgba(0,0,0,0.06); padding: 1px 4px; border-radius: 4px;",
+    "}",
+    ".md-link { color: var(--accent); font-weight: 600; text-decoration: underline; word-break: break-word; }",
+    ".md-link:hover { text-decoration: none; }",
+    ".md-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }",
     // typing indicator
     ".typing { display: inline-flex; gap: 4px; align-items: center; padding: 4px 2px; }",
     ".typing .dot { width: 7px; height: 7px; border-radius: 50%; background: #9aa4b0; animation: gv-blink 1.2s infinite ease-in-out; }",
@@ -318,7 +594,14 @@
     "  padding: 9px 11px; border: 1px solid #c8cfd8; border-radius: 10px;",
     "  font: inherit; color: inherit; background: #fff;",
     "}",
-    ".composer__input:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; border-color: var(--accent); }",
+    // Soft focus ring: a translucent tint of --brand instead of the full-strength red, so the
+    // text box highlight on focus reads gently rather than harsh/bold. Derived from --brand so
+    // it still tracks the single color token.
+    ".composer__input:focus-visible {",
+    "  outline: 2px solid color-mix(in srgb, var(--brand) 38%, transparent);",
+    "  outline-offset: 0;",
+    "  border-color: color-mix(in srgb, var(--brand) 55%, transparent);",
+    "}",
     ".composer__send {",
     "  flex: 0 0 auto; appearance: none; border: none; border-radius: 10px;",
     "  background: var(--accent); color: var(--accent-ink); cursor: pointer;",
@@ -327,6 +610,17 @@
     ".composer__send:hover:not(:disabled) { filter: brightness(1.07); }",
     ".composer__send:disabled { opacity: .5; cursor: default; }",
     ".composer__send:focus-visible { outline: 3px solid #9ec5ff; outline-offset: 2px; }",
+    // first-launch example questions (removed after the first message)
+    ".suggestions { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; margin: 2px 0 2px; }",
+    ".suggestions__label { font-size: 12px; color: var(--muted); margin-bottom: 2px; }",
+    ".suggestion {",
+    "  appearance: none; cursor: pointer; text-align: left; max-width: 100%;",
+    "  background: #fff; border: 1px solid var(--panel-border); color: var(--accent);",
+    "  font: inherit; font-size: 13px; font-weight: 600; line-height: 1.3;",
+    "  padding: 8px 12px; border-radius: 12px;",
+    "}",
+    ".suggestion:hover { border-color: var(--accent); background: color-mix(in srgb, var(--brand) 6%, #fff); }",
+    ".suggestion:focus-visible { outline: 2px solid color-mix(in srgb, var(--brand) 45%, transparent); outline-offset: 2px; }",
     // visually-hidden (for a11y live region labels)
     ".sr-only {",
     "  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;",
@@ -347,6 +641,8 @@
     if (!doc || !doc.body) return null;
     if (doc.getElementById(HOST_ID)) return null; // already mounted
 
+    ensureTitleFont(doc); // load Bitter for the title (host document head; safe no-op if blocked)
+
     var host = doc.createElement("div");
     host.id = HOST_ID;
     doc.body.appendChild(host);
@@ -361,7 +657,7 @@
     shadow.appendChild(root);
 
     // in-memory session state (no storage)
-    var state = { open: false, pending: false, messages: [], lastQuestion: null };
+    var state = { open: false, pending: false, expanded: false, messages: [], lastQuestion: null };
 
     // launcher
     var launcher = doc.createElement("button");
@@ -371,7 +667,7 @@
     var lIcon = doc.createElement("span");
     lIcon.className = "launcher__icon";
     lIcon.setAttribute("aria-hidden", "true");
-    lIcon.textContent = "💬"; // speech balloon
+    lIcon.appendChild(iconChat(doc)); // inline SVG chat bubble
     var lText = doc.createElement("span");
     lText.textContent = CONFIG.launcherLabel;
     launcher.appendChild(lIcon);
@@ -390,13 +686,23 @@
     var hTitle = doc.createElement("span");
     hTitle.className = "header__title";
     hTitle.textContent = CONFIG.title;
+    var hExpand = doc.createElement("button");
+    hExpand.type = "button";
+    hExpand.className = "header__expand";
+    hExpand.setAttribute("aria-label", "Expand chat");
+    hExpand.setAttribute("aria-pressed", "false");
+    hExpand.appendChild(iconExpand(doc)); // inline SVG, swapped on toggle
     var hClose = doc.createElement("button");
     hClose.type = "button";
     hClose.className = "header__close";
     hClose.setAttribute("aria-label", "Close chat");
     hClose.textContent = "×"; // ×
+    var hActions = doc.createElement("div");
+    hActions.className = "header__actions";
+    hActions.appendChild(hExpand);
+    hActions.appendChild(hClose);
     header.appendChild(hTitle);
-    header.appendChild(hClose);
+    header.appendChild(hActions);
 
     var thread = doc.createElement("div");
     thread.className = "thread";
@@ -446,24 +752,50 @@
       scrollToBottom();
     }
 
+    // Build the collapsible sources disclosure for ONE message. Caller only invokes this when
+    // that message has at least one source, so there is never an empty "Sources" affordance.
+    // Collapsed by default: a small toggle reveals this message's own list of public links.
     function buildSources(sources) {
       var container = doc.createElement("div");
       container.className = "sources";
-      var label = doc.createElement("div");
-      label.className = "sources__label";
-      label.textContent = sources.length > 1 ? "Sources" : "Source";
-      container.appendChild(label);
+
       var list = doc.createElement("ul");
       list.className = "sources__list";
+      list.hidden = true; // collapsed by default
+
+      var toggle = doc.createElement("button");
+      toggle.type = "button";
+      toggle.className = "sources__toggle";
+      toggle.setAttribute("aria-expanded", "false");
+      var caret = doc.createElement("span");
+      caret.className = "sources__caret";
+      caret.setAttribute("aria-hidden", "true");
+      caret.appendChild(iconChevron(doc));
+      var toggleText = doc.createElement("span");
+      toggleText.className = "sources__toggle-text";
+      toggleText.textContent =
+        sources.length > 1 ? "Sources (" + sources.length + ")" : "Source";
+      toggle.appendChild(caret);
+      toggle.appendChild(toggleText);
+      toggle.addEventListener("click", function () {
+        var expanded = toggle.getAttribute("aria-expanded") === "true";
+        toggle.setAttribute("aria-expanded", expanded ? "false" : "true");
+        list.hidden = expanded; // was open -> collapse; was closed -> reveal
+        // No scroll: the list appears right under the toggle the user clicked, which is already
+        // in view. Forcing scrollToBottom() here jerked the thread down when expanding sources on
+        // an older (not-most-recent) message.
+      });
+
       for (var i = 0; i < sources.length; i++) {
         var src = sources[i];
         var href = safeHttpUrl(src.uri);
         var li = doc.createElement("li");
+        li.className = "sources__item";
         if (href) {
           var a = doc.createElement("a");
           a.className = "sources__link";
           a.href = href;
-          a.target = "_blank";
+          a.target = "_blank"; // open the public library page in a new tab
           a.rel = "noopener noreferrer nofollow";
           a.textContent = displayUrl(href);
           li.appendChild(a);
@@ -482,6 +814,8 @@
         }
         list.appendChild(li);
       }
+
+      container.appendChild(toggle);
       container.appendChild(list);
       return container;
     }
@@ -493,10 +827,16 @@
       var bubble = doc.createElement("div");
       bubble.className = "bubble";
       var textEl = doc.createElement("div");
-      textEl.textContent =
+      textEl.className = "md";
+      // Render the assistant answer as markdown (safe DOM, no innerHTML). The
+      // no-response fallback is plain text and renders as a single paragraph.
+      renderMarkdown(
+        textEl,
         answer && answer.trim()
           ? answer
-          : "Sorry, I didn't get a response. Please try again.";
+          : "Sorry, I didn't get a response. Please try again.",
+        doc
+      );
       bubble.appendChild(textEl);
       if (sources && sources.length) {
         bubble.appendChild(buildSources(sources));
@@ -569,7 +909,8 @@
         retry.textContent = "Try again";
         retry.addEventListener("click", function () {
           wrap.parentNode && wrap.parentNode.removeChild(wrap);
-          submitQuestion(question);
+          // Resend the existing transcript; do NOT re-append the user turn (it's already there).
+          deliver(question);
         });
         bubble.appendChild(retry);
       }
@@ -605,15 +946,58 @@
       return out;
     }
 
+    // First-launch example questions. Rendered under the greeting; each is a button that submits
+    // that question. They are removed on the first message (typed or clicked), never to return.
+    var suggestionsWrap = null;
+
+    function renderSuggestions() {
+      var qs = CONFIG.suggestedQuestions;
+      if (!qs || !qs.length) return;
+      var wrap = doc.createElement("div");
+      wrap.className = "suggestions";
+      var label = doc.createElement("div");
+      label.className = "suggestions__label";
+      label.textContent = "Try asking:";
+      wrap.appendChild(label);
+      qs.forEach(function (q) {
+        var btn = doc.createElement("button");
+        btn.type = "button";
+        btn.className = "suggestion";
+        btn.textContent = q;
+        btn.addEventListener("click", function () { submitQuestion(q); });
+        wrap.appendChild(btn);
+      });
+      thread.appendChild(wrap);
+      suggestionsWrap = wrap;
+      scrollToBottom();
+    }
+
+    function removeSuggestions() {
+      if (suggestionsWrap && suggestionsWrap.parentNode) {
+        suggestionsWrap.parentNode.removeChild(suggestionsWrap);
+      }
+      suggestionsWrap = null;
+    }
+
     function submitQuestion(question) {
       var text = String(question == null ? "" : question).trim();
       if (!text || state.pending) return;
+      removeSuggestions(); // the starter questions go away once any message is sent
       state.lastQuestion = text;
-      appendUserMessage(text);
+      appendUserMessage(text); // the user turn is appended to the transcript exactly ONCE, here
+      deliver(text);
+    }
+
+    /**
+     * Send the current transcript to the backend and render the reply. `question` is used only
+     * to re-arm the retry button on failure; it is NOT re-appended, so retrying a failed send
+     * never duplicates the user turn in the transcript (the transcript already holds it).
+     */
+    function deliver(question) {
+      if (state.pending) return;
       setPending(true);
       var typing = showTyping();
 
-      // Send the whole transcript (the new user turn is already appended above).
       sendQuery(conversationForRequest()).then(
         function (result) {
           typing.done();
@@ -623,7 +1007,7 @@
         },
         function (err) {
           typing.done();
-          appendError(text);
+          appendError(question);
           setPending(false);
           focusInput();
           if (typeof console !== "undefined" && console.error) {
@@ -663,8 +1047,24 @@
       }
     }
 
+    // Toggle the panel between its default and expanded size. A CSS class drives the
+    // size (both dimensions clamp to the viewport), so this stays usable on mobile.
+    function toggleExpand() {
+      state.expanded = !state.expanded;
+      if (state.expanded) {
+        panel.classList.add("panel--expanded");
+      } else {
+        panel.classList.remove("panel--expanded");
+      }
+      hExpand.setAttribute("aria-pressed", state.expanded ? "true" : "false");
+      hExpand.setAttribute("aria-label", state.expanded ? "Shrink chat" : "Expand chat");
+      setIcon(hExpand, state.expanded ? iconCollapse(doc) : iconExpand(doc));
+      scrollToBottom();
+    }
+
     launcher.addEventListener("click", openPanel);
     hClose.addEventListener("click", closePanel);
+    hExpand.addEventListener("click", toggleExpand);
 
     form.addEventListener("submit", function (e) {
       e.preventDefault();
@@ -694,8 +1094,9 @@
       }
     });
 
-    // seed the greeting so it's present when the panel opens
+    // seed the greeting + first-launch example questions so they're present when the panel opens
     appendBotMessage(CONFIG.greeting, []);
+    renderSuggestions();
 
     return {
       host: host,
@@ -731,6 +1132,7 @@
       warmUrl: warmUrl,
       safeHttpUrl: safeHttpUrl,
       displayUrl: displayUrl,
+      renderMarkdown: renderMarkdown,
       CONFIG: CONFIG,
       HOST_ID: HOST_ID
     };

@@ -289,4 +289,530 @@ test("apiUrl fallback selector is scoped to the widget's own script tag", () => 
   );
 });
 
+// =========================================================================
+// ===  tiny dependency-free DOM fake (jsdom is not available offline)  ====
+// =========================================================================
+// Enough of the DOM for mount() and the markdown renderer: elements with
+// children, className/classList, attributes, textContent, and event
+// listeners you can fire(). Text nodes are {nodeType:3}. This lets the
+// contract test exercise real widget behavior without any dependency.
+
+function makeEl(tagName) {
+  var el = {
+    tagName: tagName,
+    nodeType: 1,
+    children: [],
+    _text: "",
+    attrs: {},
+    listeners: {},
+    style: {},
+    hidden: false,
+    disabled: false,
+    className: "",
+    parentNode: null
+  };
+  el.classList = {
+    _s: {},
+    add: function (c) { this._s[c] = true; },
+    remove: function (c) { delete this._s[c]; },
+    contains: function (c) { return !!this._s[c]; }
+  };
+  el.appendChild = function (c) { c.parentNode = el; el.children.push(c); return c; };
+  el.removeChild = function (c) {
+    var i = el.children.indexOf(c);
+    if (i >= 0) el.children.splice(i, 1);
+    c.parentNode = null;
+    return c;
+  };
+  el.setAttribute = function (k, v) { el.attrs[k] = String(v); };
+  el.getAttribute = function (k) {
+    return Object.prototype.hasOwnProperty.call(el.attrs, k) ? el.attrs[k] : null;
+  };
+  el.addEventListener = function (t, fn) { (el.listeners[t] = el.listeners[t] || []).push(fn); };
+  el.attachShadow = function () { el.shadow = makeEl("#shadow"); return el.shadow; };
+  el.focus = function () {};
+  el.querySelector = function () { return null; };
+  el.fire = function (t, ev) {
+    ev = ev || {};
+    ev.preventDefault = ev.preventDefault || function () {};
+    ev.stopPropagation = ev.stopPropagation || function () {};
+    (el.listeners[t] || []).slice().forEach(function (fn) { fn(ev); });
+  };
+  Object.defineProperty(el, "textContent", {
+    get: function () {
+      if (el.children.length === 0) return el._text;
+      return el.children.map(function (c) { return c.textContent; }).join("");
+    },
+    set: function (v) { el._text = String(v); el.children = []; }
+  });
+  Object.defineProperty(el, "firstChild", { get: function () { return el.children[0] || null; } });
+  Object.defineProperty(el, "lastChild", {
+    get: function () { return el.children[el.children.length - 1] || null; }
+  });
+  Object.defineProperty(el, "scrollHeight", { get: function () { return 40; } });
+  el.scrollTop = 0;
+  return el;
+}
+
+function makeDoc() {
+  var doc = {
+    createElement: function (tag) { return makeEl(tag); },
+    // SVG namespace element (icons); the fake ignores the namespace.
+    createElementNS: function (ns, tag) { return makeEl(tag); },
+    createTextNode: function (t) {
+      var n = { nodeType: 3, tagName: "#text", children: [], _t: String(t) };
+      Object.defineProperty(n, "textContent", { get: function () { return n._t; } });
+      return n;
+    },
+    getElementById: function () { return null; }
+  };
+  doc.body = makeEl("body");
+  return doc;
+}
+
+function collectByTag(node, tag) {
+  var out = [];
+  (node.children || []).forEach(function (c) {
+    if (c.tagName === tag) out.push(c);
+    out = out.concat(collectByTag(c, tag));
+  });
+  return out;
+}
+
+function allText(node) {
+  if (node.nodeType === 3) return node.textContent;
+  var s = node._text || "";
+  (node.children || []).forEach(function (c) { s += allText(c); });
+  return s;
+}
+
+function findByClass(node, cls) {
+  if (!node) return null;
+  var cn = node.className || "";
+  if ((" " + cn + " ").indexOf(" " + cls + " ") >= 0) return node;
+  if (node.classList && node.classList.contains(cls)) return node;
+  var kids = node.children || [];
+  for (var i = 0; i < kids.length; i++) {
+    var f = findByClass(kids[i], cls);
+    if (f) return f;
+  }
+  return node.shadow ? findByClass(node.shadow, cls) : null;
+}
+
+function findAll(node, cls) {
+  var out = [];
+  (function walk(n) {
+    if (!n) return;
+    var cn = n.className || "";
+    if ((" " + cn + " ").indexOf(" " + cls + " ") >= 0) out.push(n);
+    (n.children || []).forEach(walk);
+    if (n.shadow) walk(n.shadow);
+  })(node);
+  return out;
+}
+
+// A fetch stub that resolves one canned {answer, sources} payload as an ok JSON response.
+function okJson(payload) {
+  return function () {
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve(payload); } });
+  };
+}
+
+function countUserTurns(state) {
+  return state.messages.filter(function (m) { return m.role === "user"; }).length;
+}
+
+// Let one microtask/timer cycle drain so settled fetch promises run their handlers.
+function flush() {
+  return new Promise(function (r) { setTimeout(r, 0); });
+}
+
+// Install browser-ish globals (document for apiUrl, a fetch stub) for the duration of a
+// test; returns a restore fn. `fetchImpl` decides success vs failure.
+function withNetwork(fetchImpl) {
+  var priorDoc = global.document;
+  var priorFetch = global.fetch;
+  var priorErr = console.error;
+  global.document = {
+    querySelector: function () {
+      return { getAttribute: function () { return "https://api.test/query"; } };
+    }
+  };
+  global.fetch = fetchImpl;
+  console.error = function () {}; // silence the widget's expected failure log; not a test failure
+  return function restore() {
+    global.document = priorDoc;
+    global.fetch = priorFetch;
+    console.error = priorErr;
+  };
+}
+
+// --- markdown rendering: safe DOM, correct structure --------------------
+test("renderMarkdown renders bold, links, and lists as real DOM nodes", () => {
+  var doc = makeDoc();
+  var root = doc.createElement("div");
+  widget.renderMarkdown(
+    root,
+    "See **hours** and [the page](https://gav.edu/x).\n\n- one\n- two",
+    doc
+  );
+  var strong = collectByTag(root, "strong");
+  assert.strictEqual(strong.length, 1);
+  assert.strictEqual(strong[0].textContent, "hours");
+
+  var links = collectByTag(root, "a");
+  assert.strictEqual(links.length, 1);
+  assert.strictEqual(links[0].href, "https://gav.edu/x");
+  assert.strictEqual(links[0].target, "_blank");
+  assert.match(links[0].rel, /noopener noreferrer/);
+  assert.strictEqual(links[0].textContent, "the page");
+
+  var lists = collectByTag(root, "ul");
+  assert.strictEqual(lists.length, 1);
+  var items = collectByTag(lists[0], "li");
+  assert.deepStrictEqual(items.map(function (li) { return li.textContent; }), ["one", "two"]);
+});
+
+test("renderMarkdown renders numbered lists as <ol>", () => {
+  var doc = makeDoc();
+  var root = doc.createElement("div");
+  widget.renderMarkdown(root, "1. first\n2. second", doc);
+  var ol = collectByTag(root, "ol");
+  assert.strictEqual(ol.length, 1);
+  assert.strictEqual(collectByTag(ol[0], "li").length, 2);
+});
+
+test("renderMarkdown is injection-safe: no markup or scripts from message content", () => {
+  var doc = makeDoc();
+  var root = doc.createElement("div");
+  widget.renderMarkdown(
+    root,
+    "<script>alert(1)</script> <b>x</b> [evil](javascript:alert(1)) [data](data:text/html,x)",
+    doc
+  );
+  // Nothing from the content becomes an element: no <script>, no <b>, and dangerous
+  // link schemes are NOT linkified (label kept as text).
+  assert.strictEqual(collectByTag(root, "script").length, 0);
+  assert.strictEqual(collectByTag(root, "b").length, 0);
+  assert.strictEqual(collectByTag(root, "a").length, 0, "javascript:/data: URLs are never linkified");
+  var text = allText(root);
+  assert.ok(/<script>alert\(1\)<\/script>/.test(text), "angle brackets survive as literal text");
+  assert.ok(/evil/.test(text) && /data/.test(text), "unsafe link labels kept as text");
+});
+
+// --- double-append fix: a retry must not duplicate the user turn --------
+test("a failed send followed by retry does NOT duplicate the user turn in the transcript", async () => {
+  var restore = withNetwork(function () {
+    return Promise.reject(new Error("network down"));
+  });
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    assert.ok(handle, "widget mounted");
+
+    handle.submit("what are the hours?");
+    await flush();
+
+    var state = handle.getState();
+    // greeting(bot) + one user turn; the failed send appends no bot turn.
+    assert.strictEqual(countUserTurns(state), 1, "one user turn after the first failed send");
+
+    // Click the retry button in the rendered error bubble.
+    var retryBtn = findByClass(handle.shadow, "retry");
+    assert.ok(retryBtn, "an error/retry button is shown after a failed send");
+    retryBtn.fire("click");
+    await flush();
+
+    // THE regression: retry resends the existing transcript; it must not append a 2nd user turn.
+    assert.strictEqual(
+      countUserTurns(handle.getState()),
+      1,
+      "retry must not add a phantom duplicate user turn"
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("a successful send records exactly one user turn and one new bot turn", async () => {
+  var restore = withNetwork(function () {
+    return Promise.resolve({
+      ok: true,
+      json: function () {
+        return Promise.resolve({ answer: "Open **9-5**.", sources: [] });
+      }
+    });
+  });
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    var before = handle.getState().messages.length; // greeting only
+    handle.submit("hours?");
+    await flush();
+    var msgs = handle.getState().messages;
+    assert.strictEqual(countUserTurns(handle.getState()), 1);
+    // greeting + user + bot answer
+    assert.strictEqual(msgs.length, before + 2);
+    assert.strictEqual(msgs[msgs.length - 1].role, "bot");
+    // The bot turn stores the RAW markdown (what we echo back to the server), not rendered HTML.
+    assert.strictEqual(msgs[msgs.length - 1].text, "Open **9-5**.");
+  } finally {
+    restore();
+  }
+});
+
+// --- expandable window --------------------------------------------------
+test("the header expand control toggles the expanded size class and aria-pressed", () => {
+  var doc = makeDoc();
+  var handle = widget.mount(doc);
+  var panel = findByClass(handle.shadow, "panel");
+  var expandBtn = findByClass(handle.shadow, "header__expand");
+  assert.ok(panel && expandBtn, "panel and expand control exist");
+
+  assert.ok(!panel.classList.contains("panel--expanded"), "starts at default size");
+  assert.strictEqual(expandBtn.getAttribute("aria-pressed"), "false");
+
+  expandBtn.fire("click");
+  assert.ok(panel.classList.contains("panel--expanded"), "expands on click");
+  assert.strictEqual(expandBtn.getAttribute("aria-pressed"), "true");
+
+  expandBtn.fire("click");
+  assert.ok(!panel.classList.contains("panel--expanded"), "collapses on second click");
+  assert.strictEqual(expandBtn.getAttribute("aria-pressed"), "false");
+});
+
+test("expanded dimensions clamp to the viewport (usable on mobile)", () => {
+  // The .panel--expanded rule sizes with min(...) against the viewport, so a phone can't
+  // get an off-screen panel.
+  assert.ok(/\.panel--expanded\s*\{[^}]*min\(/.test(SOURCE), "expanded width/height clamp with min()");
+});
+
+// --- per-message, collapsible sources UI --------------------------------
+test("sources are per-message: each answer shows only its own sources, not a union", async () => {
+  var calls = 0;
+  var restore = withNetwork(function () {
+    calls++;
+    var payload = calls === 1
+      ? { answer: "A1", sources: [{ uri: "https://gav.edu/hours", excerpt: "h" }] }
+      : { answer: "A2", sources: [{ uri: "https://gav.edu/borrow", excerpt: "b" }] };
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve(payload); } });
+  });
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    handle.submit("q1"); await flush();
+    handle.submit("q2"); await flush();
+
+    var bots = findAll(handle.shadow, "msg--bot"); // greeting + 2 answers
+    var linksOf = function (msg) {
+      var list = findByClass(msg, "sources__list");
+      return list ? collectByTag(list, "a").map(function (a) { return a.href; }) : [];
+    };
+    // Each answer shows ONLY its own source (no accumulation across the conversation).
+    assert.deepStrictEqual(linksOf(bots[bots.length - 2]), ["https://gav.edu/hours"]);
+    assert.deepStrictEqual(linksOf(bots[bots.length - 1]), ["https://gav.edu/borrow"]);
+  } finally {
+    restore();
+  }
+});
+
+test("sources are collapsed by default and expand on click, linking the public URL in a new tab", async () => {
+  var restore = withNetwork(
+    okJson({ answer: "A", sources: [{ uri: "https://www.gavilan.edu/library/hours.php", excerpt: "e" }] })
+  );
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    handle.submit("hours?"); await flush();
+
+    var bot = findAll(handle.shadow, "msg--bot").pop();
+    var toggle = findByClass(bot, "sources__toggle");
+    var list = findByClass(bot, "sources__list");
+    assert.ok(toggle && list, "a sources toggle and list are rendered");
+
+    // Collapsed by default.
+    assert.strictEqual(toggle.getAttribute("aria-expanded"), "false");
+    assert.strictEqual(list.hidden, true, "list is hidden until the user expands it");
+
+    // Expands on click.
+    toggle.fire("click");
+    assert.strictEqual(toggle.getAttribute("aria-expanded"), "true");
+    assert.strictEqual(list.hidden, false, "list is revealed after clicking the toggle");
+
+    // Clean public link, opens in a new tab, safe rel.
+    var a = collectByTag(list, "a")[0];
+    assert.strictEqual(a.href, "https://www.gavilan.edu/library/hours.php");
+    assert.strictEqual(a.target, "_blank");
+    assert.match(a.rel, /noopener noreferrer/);
+
+    // Collapses again on a second click.
+    toggle.fire("click");
+    assert.strictEqual(toggle.getAttribute("aria-expanded"), "false");
+    assert.strictEqual(list.hidden, true);
+  } finally {
+    restore();
+  }
+});
+
+test("expanding a source dropdown does NOT force the thread to scroll to the bottom", async () => {
+  // Regression: toggling sources on a message that isn't the most recent used to jerk the whole
+  // thread down. Expanding/collapsing must leave the scroll position alone.
+  var restore = withNetwork(
+    okJson({ answer: "A", sources: [{ uri: "https://gav.edu/x", excerpt: "e" }] })
+  );
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    handle.submit("q1"); await flush();
+    handle.submit("q2"); await flush(); // a later message exists, so q1's answer isn't the most recent
+
+    var thread = findByClass(handle.shadow, "thread");
+    var firstAnswer = findAll(handle.shadow, "msg--bot")[1]; // greeting[0], q1 answer[1]
+    var toggle = findByClass(firstAnswer, "sources__toggle");
+    assert.ok(thread && toggle, "thread and an older message's sources toggle exist");
+
+    // Simulate the user having scrolled up to that older message.
+    thread.scrollTop = 5;
+    toggle.fire("click"); // expand
+    assert.strictEqual(thread.scrollTop, 5, "expanding must not move the scroll position");
+    toggle.fire("click"); // collapse
+    assert.strictEqual(thread.scrollTop, 5, "collapsing must not move the scroll position");
+    // And it still actually toggled.
+    assert.strictEqual(toggle.getAttribute("aria-expanded"), "false");
+  } finally {
+    restore();
+  }
+});
+
+test("an answer with zero sources shows no sources affordance at all", async () => {
+  var restore = withNetwork(okJson({ answer: "Just a greeting reply.", sources: [] }));
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    handle.submit("hello"); await flush();
+
+    var bot = findAll(handle.shadow, "msg--bot").pop();
+    assert.strictEqual(findByClass(bot, "sources"), null, "no .sources container");
+    assert.strictEqual(findByClass(bot, "sources__toggle"), null, "no empty Sources label");
+  } finally {
+    restore();
+  }
+});
+
+// --- SVG icons (no emoji glyphs) ----------------------------------------
+test("launcher and resize controls use inline SVG icons, not emoji glyphs", () => {
+  assert.ok(!/💬/.test(SOURCE), "no chat speech-balloon emoji");
+  assert.ok(!/[⤢⤡⬌⬍]/.test(SOURCE), "no resize arrow glyphs");
+  assert.ok(!/⤢|⤡/.test(SOURCE), "no diagonal resize glyphs");
+  assert.ok(/createElementNS\(/.test(SOURCE), "icons are built as real SVG nodes");
+});
+
+test("launcher renders an SVG icon and the expand control swaps SVG icons on toggle", () => {
+  var doc = makeDoc();
+  var handle = widget.mount(doc);
+  var launcherIcon = findByClass(handle.shadow, "launcher__icon");
+  assert.ok(collectByTag(launcherIcon, "svg").length >= 1, "launcher shows an svg icon");
+
+  var expandBtn = findByClass(handle.shadow, "header__expand");
+  assert.strictEqual(collectByTag(expandBtn, "svg").length, 1, "expand shows one svg icon");
+  expandBtn.fire("click");
+  assert.strictEqual(collectByTag(expandBtn, "svg").length, 1, "still exactly one svg after toggling to collapse");
+});
+
+// --- brand color: one swappable token -----------------------------------
+test("the primary color is a single --brand token, reused (not hardcoded per spot)", () => {
+  assert.ok(/--brand:\s*#[0-9a-fA-F]{3,8}\s*;/.test(SOURCE), "defines a single --brand token");
+  assert.ok(/--accent:\s*var\(--brand\)/.test(SOURCE), "accent derives from --brand");
+  assert.ok(/--user-bg:\s*var\(--brand\)/.test(SOURCE), "user bubble derives from --brand");
+  // The old hardcoded blue is fully gone.
+  assert.ok(!/#1f4e79/i.test(SOURCE), "old blue accent value removed");
+});
+
+test("the brand red is the exact Claude Design value", () => {
+  assert.ok(/--brand:\s*#8a1c30\s*;/i.test(SOURCE), "--brand is #8a1c30");
+});
+
+// --- title font ----------------------------------------------------------
+test("the title uses the Bitter font, loaded from Google Fonts", () => {
+  // Header title font-family is Bitter (body/UI is untouched).
+  assert.ok(
+    /\.header__title\s*\{[^}]*font-family:\s*'Bitter'/.test(SOURCE),
+    "header title uses Bitter"
+  );
+  // The font is loaded via a Google Fonts link for Bitter.
+  assert.ok(
+    /fonts\.googleapis\.com\/css2\?family=Bitter/.test(SOURCE),
+    "loads the Bitter font stylesheet"
+  );
+  assert.ok(/ensureTitleFont\(/.test(SOURCE), "font link is injected at mount");
+});
+
+// --- softened focus ring on the composer --------------------------------
+test("the text box focus ring is a softened tint of the brand, not full-strength", () => {
+  assert.ok(
+    /\.composer__input:focus-visible\s*\{[\s\S]*color-mix\(in srgb, var\(--brand\)/.test(SOURCE),
+    "composer focus outline uses a translucent color-mix of --brand"
+  );
+  // It must NOT be the old full-strength solid accent outline.
+  assert.ok(
+    !/\.composer__input:focus-visible\s*\{\s*outline:\s*2px solid var\(--accent\)/.test(SOURCE),
+    "no full-strength solid accent outline remains"
+  );
+});
+
+// --- first-launch example questions -------------------------------------
+test("example questions appear on first launch and each is clickable", () => {
+  var doc = makeDoc();
+  var handle = widget.mount(doc);
+  var suggestions = findByClass(handle.shadow, "suggestions");
+  assert.ok(suggestions, "a suggestions block is shown on first launch");
+  var btns = findAll(handle.shadow, "suggestion");
+  assert.ok(btns.length >= 3, "several starter question buttons are shown");
+  // Each button carries a non-empty question string.
+  btns.forEach(function (b) {
+    assert.ok(typeof b.textContent === "string" && b.textContent.length > 0);
+  });
+});
+
+test("clicking an example question submits it and removes the suggestions", async () => {
+  var asked = null;
+  var restore = withNetwork(function (url, init) {
+    asked = JSON.parse(init.body); // capture what got sent
+    return okJson({ answer: "A", sources: [] })();
+  });
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    var firstBtn = findAll(handle.shadow, "suggestion")[0];
+    var questionText = firstBtn.textContent;
+    firstBtn.fire("click");
+    await flush();
+
+    // The clicked question was submitted...
+    var lastMsg = asked.messages[asked.messages.length - 1];
+    assert.strictEqual(lastMsg.role, "user");
+    assert.strictEqual(lastMsg.content, questionText);
+    // ...and the suggestions are gone.
+    assert.strictEqual(findByClass(handle.shadow, "suggestions"), null, "suggestions removed after use");
+    assert.strictEqual(handle.getState().messages.filter(function (m) { return m.role === "user"; }).length, 1);
+  } finally {
+    restore();
+  }
+});
+
+test("suggestions disappear after a typed message and do not come back", async () => {
+  var restore = withNetwork(okJson({ answer: "A", sources: [] }));
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    assert.ok(findByClass(handle.shadow, "suggestions"), "present before any message");
+    handle.submit("a typed question"); await flush();
+    assert.strictEqual(findByClass(handle.shadow, "suggestions"), null, "gone after first message");
+    handle.submit("a second question"); await flush();
+    assert.strictEqual(findByClass(handle.shadow, "suggestions"), null, "still gone after later messages");
+  } finally {
+    restore();
+  }
+});
+
 run();
