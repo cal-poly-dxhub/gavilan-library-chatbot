@@ -20,10 +20,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timezone
 
 import boto3
 
-from scraper import scrape_urls
+from scraper import extract_database_catalog, scrape_urls, validate_held_list
 
 LOG = logging.getLogger()
 LOG.setLevel(logging.INFO)
@@ -35,6 +36,185 @@ def _s3_client():
 
 def _bedrock_agent_client():
     return boto3.client("bedrock-agent")
+
+
+def _bedrock_runtime_client():
+    return boto3.client("bedrock-runtime")
+
+
+# --- Database-catalog regeneration (Phase 2b) ----------------------------------------------
+#
+# The held portion of the database catalog is DERIVED from databases.php on every scrape:
+#   1. extract_database_catalog() parses the raw HTML into {name, description, url} deterministically;
+#   2. a Bedrock model enriches each database with subjects + aliases (judgment the page lacks) -
+#      ONLY for databases not already enriched in the previous catalog (stability + ~zero cost on
+#      unchanged weeks), and CONSTRAINED to the parsed names (the model can't add/rename databases);
+#   3. validate_held_list() guards the result; on failure we keep the last-good catalog (no write).
+# The hand-authored NOT-HELD list is NOT produced here - it lives in the query Lambda bundle and is
+# merged in at read time (you can't scrape absence).
+
+
+def _norm(text):
+    return " ".join("".join(c if c.isalnum() else " " for c in (text or "").lower()).split())
+
+
+_ENRICH_INSTRUCTIONS = (
+    "You are enriching a library's research-database catalog. For EACH database given (by name and "
+    "description), return its subject tags and common aliases. Rules: use ONLY the exact database "
+    "names provided - do not add, remove, rename, or invent databases. `subjects` is a list of "
+    "lowercase topic keywords a student might search (broad and specific, e.g. \"business\", "
+    "\"nursing\", \"psychology\", \"history\", \"criminal justice\"), inferred from the name and "
+    "description. `aliases` is a list of alternate names, abbreviations, or short forms people use "
+    "for that database (e.g. \"EBSCO\" for EbscoHost Core Search); [] if none. Return ONLY a JSON "
+    'array of objects: [{"name": <exact name>, "subjects": [...], "aliases": [...]}].'
+)
+
+
+def _parse_json_array(text):
+    """Pull the first JSON array out of a model response (tolerates prose/code fences around it)."""
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start : end + 1])
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, list) else None
+
+
+def enrich_held(entries, bedrock_runtime, model_id):
+    """Ask the model for {subjects, aliases} per database. `entries` is [{name, description}].
+    Returns {normalized_name: {"subjects": [...], "aliases": [...]}} for names it returned; names
+    the model omits simply won't appear (the caller defaults them). Never raises for a bad model
+    reply - returns {} so the caller can proceed with empty enrichment rather than fail the scrape."""
+    if not entries:
+        return {}
+    payload = json.dumps([{"name": e["name"], "description": e.get("description", "")} for e in entries])
+    try:
+        response = bedrock_runtime.converse(
+            modelId=model_id,
+            system=[{"text": _ENRICH_INSTRUCTIONS}],
+            messages=[{"role": "user", "content": [{"text": payload}]}],
+            inferenceConfig={"maxTokens": 4000, "temperature": 0.0},
+        )
+        text = ""
+        for block in response.get("output", {}).get("message", {}).get("content", []) or []:
+            if isinstance(block, dict) and "text" in block:
+                text += block["text"]
+        rows = _parse_json_array(text) or []
+    except Exception as exc:  # noqa: BLE001 - enrichment is best-effort; never break the scrape
+        LOG.warning("catalog enrichment call failed (%s); proceeding without new subjects", exc)
+        return {}
+
+    given = {_norm(e["name"]) for e in entries}
+    enriched = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = _norm(row.get("name"))
+        if key not in given:  # constrain to the deterministic name set; drop hallucinated names
+            continue
+        subjects = [str(s).strip().lower() for s in (row.get("subjects") or []) if str(s).strip()]
+        aliases = [str(a).strip() for a in (row.get("aliases") or []) if str(a).strip()]
+        enriched[key] = {"subjects": subjects, "aliases": aliases}
+    return enriched
+
+
+def regenerate_held(html, previous_held, bedrock_runtime, model_id, min_databases):
+    """Build the fresh held list from databases.php HTML: parse -> reuse prior enrichment for
+    unchanged databases + enrich only new ones -> validate. Returns the held list, or None if the
+    parse/validation guard fails (caller keeps the last-good catalog).
+
+    `previous_held` is the held list from the current S3 catalog (or []); its subjects/aliases are
+    reused for databases whose names are unchanged, so wording stays stable and the model is only
+    called for newly-added databases (often zero)."""
+    parsed = extract_database_catalog(html)
+    if not validate_held_list(parsed, min_databases):
+        LOG.error(
+            "catalog extraction produced only %d entries (< min %d) or malformed rows; "
+            "KEEPING LAST-GOOD catalog, not overwriting",
+            len(parsed) if isinstance(parsed, list) else -1, min_databases,
+        )
+        return None
+
+    prior = {_norm(e.get("name")): e for e in (previous_held or [])}
+    to_enrich = [e for e in parsed if not prior.get(_norm(e["name"]), {}).get("subjects")]
+    LOG.info("catalog: %d databases parsed, %d need enrichment (rest reused)", len(parsed), len(to_enrich))
+    new_enrichment = enrich_held(to_enrich, bedrock_runtime, model_id) if to_enrich else {}
+
+    held = []
+    for e in parsed:
+        key = _norm(e["name"])
+        prev = prior.get(key, {})
+        enr = new_enrichment.get(key, {})
+        held.append({
+            "name": e["name"],
+            "description": e.get("description", ""),
+            "url": e.get("url", ""),
+            "subjects": enr.get("subjects") or prev.get("subjects") or [],
+            "aliases": enr.get("aliases") or prev.get("aliases") or [],
+        })
+
+    if not validate_held_list(held, min_databases):
+        LOG.error("catalog held list failed validation AFTER enrichment; KEEPING LAST-GOOD")
+        return None
+    return held
+
+
+def _read_previous_held(s3, bucket, key):
+    """The held list from the catalog currently in S3, or [] if absent/unreadable (first run)."""
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        data = json.loads(obj["Body"].read())
+        held = data.get("held")
+        return held if isinstance(held, list) else []
+    except Exception as exc:  # noqa: BLE001 - no prior catalog yet, or transient read error
+        LOG.info("no readable previous catalog at s3://%s/%s (%s); enriching all", bucket, key, exc)
+        return []
+
+
+def regenerate_catalog(results, s3, *, timestamp=None):
+    """Find the databases.php scrape result, regenerate the held catalog, and write it to S3 -
+    unless the robustness guard fails, in which case the last-good catalog is left in place.
+
+    Reads its config from env (set by the stack): CATALOG_BUCKET (required to do anything),
+    CATALOG_KEY, CATALOG_ENRICHMENT_MODEL_ID, CATALOG_MIN_DATABASES. Returns a small status dict
+    for logging. Callers wrap this so a catalog failure never breaks the KB scrape."""
+    bucket = os.environ.get("CATALOG_BUCKET")
+    if not bucket:
+        return {"catalog": "skipped (no CATALOG_BUCKET)"}
+    key = os.environ.get("CATALOG_KEY", "database_catalog.json")
+    model_id = os.environ.get("CATALOG_ENRICHMENT_MODEL_ID", "")
+    min_databases = int(os.environ.get("CATALOG_MIN_DATABASES", "30"))
+
+    db_result = next(
+        (r for r in results if r.ok and "databases.php" in r.url and r.html), None
+    )
+    if db_result is None:
+        LOG.error("no successful databases.php scrape with HTML; KEEPING LAST-GOOD catalog")
+        return {"catalog": "no databases.php html"}
+
+    previous_held = _read_previous_held(s3, bucket, key)
+    held = regenerate_held(
+        db_result.html, previous_held, _bedrock_runtime_client(), model_id, min_databases
+    )
+    if held is None:
+        return {"catalog": "guard failed; last-good kept"}
+
+    body = {
+        "generated_at": timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source_url": db_result.url,
+        "held": held,
+    }
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+    LOG.info("catalog written: s3://%s/%s (%d databases)", bucket, key, len(held))
+    return {"catalog": "written", "databases": len(held)}
 
 
 def _metadata_body(metadata: dict) -> bytes:
@@ -108,8 +288,19 @@ def handler(event, context):
     else:
         LOG.warning("no pages uploaded - skipping ingestion job")
 
+    # Regenerate the database catalog from the databases.php scrape (Phase 2b). Wrapped so ANY
+    # catalog failure is logged but never breaks the KB scrape/ingestion above - the robustness
+    # guard inside also keeps the last-good catalog rather than writing garbage.
+    catalog_status = {"catalog": "not attempted"}
+    try:
+        catalog_status = regenerate_catalog(results, s3)
+    except Exception as exc:  # noqa: BLE001 - catalog is best-effort relative to the KB scrape
+        LOG.exception("catalog regeneration failed (ignored): %s", exc)
+        catalog_status = {"catalog": f"error: {type(exc).__name__}"}
+
     return {
         "uploaded": len(uploaded_keys),
         "failed": failures,
         "ingestionJobId": ingestion_job_id,
+        **catalog_status,
     }

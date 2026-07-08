@@ -4,12 +4,15 @@ Fronted by an API Gateway HTTP API (payload format 2.0) with two routes on this 
   - POST /query -> the real query path (_handle_query):
       0. _apply_input_guardrail() -> Bedrock `ApplyGuardrail` (source=INPUT) on the BARE
          user query.
-      1. retrieve()  -> Bedrock Knowledge Base `Retrieve` for relevant chunks + sources.
-      2. generate()  -> Bedrock Converse over those chunks, under the real system prompt
-         (app/system_prompt.md), with the OUTPUT guardrail (content filters, answer side
-         only) attached as a backstop.
-  - GET /warm -> _handle_warm(): a retrieval-only pre-warm to wake OpenSearch Serverless
-      before the first real query. No generation, no guardrail.
+      1. run_agent() -> an AGENTIC Bedrock Converse tool-use loop under the real system
+         prompt (app/system_prompt.md), with the OUTPUT guardrail (content filters, answer
+         side only) attached to every Converse call as a backstop. The model is given ONE
+         tool, `search_library_info`, which wraps the KB `Retrieve`; the model decides when
+         (and how many times) to call it. The loop feeds each tool result back and re-calls
+         Converse until stopReason == "end_turn" (or a safety iteration cap). Sources are
+         accumulated from every retrieval the model triggered during the loop.
+  - GET /warm -> _handle_warm(): a retrieval-only pre-warm before the first real query. No
+      generation, no guardrail.
 
 Wiring comes from env vars set by the CDK stack.
 
@@ -21,9 +24,11 @@ Wiring comes from env vars set by the CDK stack.
       ...
     ]
   }
-  - `sources` is deduplicated by uri, in retrieval order. Passages with no resolvable
-    source uri are omitted from `sources` (they still inform the answer).
-  - On empty retrieval, `sources` is [] and the system prompt instructs the model to say
+  - `sources` is deduplicated by uri, in retrieval order, accumulated across every tool
+    retrieval the model ran during the loop. Passages with no resolvable source uri are
+    omitted from `sources` (they still inform the answer). If the model answers without
+    calling the tool (e.g. a greeting), `sources` is [].
+  - When the tool retrieves nothing relevant, the system prompt instructs the model to say
     it does not have the information.
   - When the request sets `include_full_context: true`, the response also carries
     `full_context`: the full, un-deduped, un-truncated retrieved passages (`[{text, source}]`)
@@ -34,6 +39,7 @@ Wiring comes from env vars set by the CDK stack.
 import base64
 import json
 import os
+import time
 from pathlib import Path
 
 import boto3
@@ -85,17 +91,32 @@ _FALLBACK_BLOCK_MESSAGE = (
     "hours, checkouts, and finding materials."
 )
 
-# The tag the system prompt expects retrieved passages in. MUST match "<context>" in
-# app/system_prompt.md (the prompt/handler contract).
-CONTEXT_TAG = "context"
+# The tools the agent is given. Both names are referenced by the system prompt's <tools>
+# section (app/system_prompt.md), so keep the two in sync.
+#   search_library_info - semantic retrieval over the Bedrock KB (hours, services, policies, ...).
+#   database_catalog     - authoritative lookup of the research-database catalog (is X held? what
+#                          databases for subject Y?), from a bundled static JSON.
+SEARCH_TOOL_NAME = "search_library_info"
+CATALOG_TOOL_NAME = "database_catalog"
+
+# Safety cap on the Converse tool-use loop: the model can call the tool and be re-invoked at
+# most this many times before we stop and return the best answer so far. Prevents a runaway
+# (or adversarial) loop from spending unboundedly. A factual FAQ needs 1-2 iterations.
+MAX_AGENT_ITERATIONS = int(os.environ.get("MAX_AGENT_ITERATIONS", "5"))
+
+# Shown if the loop hits the iteration cap without the model producing any answer text.
+_MAX_ITERS_FALLBACK_MESSAGE = (
+    "I'm having trouble answering that right now. Please try rephrasing, or reach out to a "
+    "librarian for help."
+)
 
 # Max characters of a passage surfaced as a source excerpt in the response.
 _EXCERPT_CHARS = 300
 
-# Warm path. The widget fires GET /warm on page load to wake the OpenSearch Serverless
-# collection before the first real query. WARM_PATH is matched against the request
-# path; _WARM_QUERY is a throwaway retrieval query (the goal is to spin OSS up, not to get
-# useful results).
+# Warm path. The widget fires GET /warm on page load to warm the query Lambda container (and
+# exercise the KB Retrieve path) before the first real query. WARM_PATH is matched against the
+# request path; _WARM_QUERY is a throwaway retrieval query (the goal is to warm the path, not to
+# get useful results).
 WARM_PATH = "/warm"
 _WARM_QUERY = "library hours"
 
@@ -104,8 +125,38 @@ _WARM_QUERY = "library hours"
 _PROMPT_PATH = Path(__file__).resolve().parent / "system_prompt.md"
 SYSTEM_PROMPT = _PROMPT_PATH.read_text(encoding="utf-8").strip()
 
+# Database catalog (Phase 2b: self-updating).
+#   - The HELD list is regenerated weekly by the scraper and written to S3; this Lambda reads the
+#     fresh copy from CATALOG_BUCKET/CATALOG_KEY at query time (cached per container, see below).
+#   - The bundled app/data/database_catalog.json is the SEED: it provides the hand-authored NOT_HELD
+#     list + catalog_url + default_alternatives (merged in at read time, since absence can't be
+#     scraped), AND a fallback HELD list used before the first scrape or if the S3 read fails.
+# Shape (both S3 and seed): {catalog_url, default_alternatives, held:[{name,subjects,description,
+# aliases}], not_held:[{name,aliases,suggested_alternatives}]}. The S3 object carries only `held`.
+_SEED_CATALOG_PATH = Path(__file__).resolve().parent / "data" / "database_catalog.json"
+_SEED_CATALOG = json.loads(_SEED_CATALOG_PATH.read_text(encoding="utf-8"))
+
+CATALOG_BUCKET = os.environ.get("CATALOG_BUCKET")
+CATALOG_KEY = os.environ.get("CATALOG_KEY", "database_catalog.json")
+# Per-container cache TTL. The catalog changes at most weekly, so serving a copy up to this many
+# seconds stale (default 15 min) is fine and avoids an S3 GET on every query; the next lookup after
+# the TTL re-fetches, so weekly updates are picked up quickly without a redeploy. A cold container
+# always fetches fresh.
+CATALOG_CACHE_TTL_SECONDS = int(os.environ.get("CATALOG_CACHE_TTL_SECONDS", "900"))
+
+# A catalog answer isn't a scraped-page passage, so it never adds a KB `sources` excerpt. Instead a
+# substantive catalog lookup contributes ONE synthetic source: the library's A-Z database page,
+# where the data comes from and where the user can browse/verify. Deduped like any other source.
+_CATALOG_SOURCE = {
+    "uri": _SEED_CATALOG.get("catalog_url", ""),
+    "excerpt": "Gavilan Library A-Z database list",
+}
+
 _agent_runtime = None
 _bedrock_runtime = None
+_catalog_s3 = None
+# Cached merged catalog: {"catalog": <dict>, "at": <monotonic seconds>}. None until first load.
+_catalog_cache = {"catalog": None, "at": 0.0}
 
 
 def _agent_client():
@@ -120,6 +171,48 @@ def _bedrock_client():
     if _bedrock_runtime is None:
         _bedrock_runtime = boto3.client("bedrock-runtime", region_name=REGION)
     return _bedrock_runtime
+
+
+def _catalog_s3_client():
+    global _catalog_s3
+    if _catalog_s3 is None:
+        _catalog_s3 = boto3.client("s3", region_name=REGION)
+    return _catalog_s3
+
+
+def _read_s3_held():
+    """The fresh held list the scraper wrote to S3, or None if unavailable (no bucket configured,
+    object missing before the first scrape, or a read error). None -> caller falls back to the
+    bundled seed held list, so the tool always works."""
+    if not CATALOG_BUCKET:
+        return None
+    try:
+        obj = _catalog_s3_client().get_object(Bucket=CATALOG_BUCKET, Key=CATALOG_KEY)
+        held = json.loads(obj["Body"].read()).get("held")
+        return held if isinstance(held, list) and held else None
+    except Exception as exc:  # noqa: BLE001 - degrade to the bundled seed, never hard-fail a query
+        print(json.dumps({"event": "catalog_s3_read_failed", "error": f"{type(exc).__name__}: {exc}"}))
+        return None
+
+
+def _get_catalog():
+    """The merged catalog the tool reads: the hand-authored not_held + catalog_url +
+    default_alternatives from the bundled seed, with the HELD list from S3 (falling back to the
+    seed's held if S3 is unavailable). Cached per container for CATALOG_CACHE_TTL_SECONDS so a
+    warm container doesn't GET S3 on every query but still picks up the weekly refresh."""
+    now = time.monotonic()
+    if _catalog_cache["catalog"] is not None and (now - _catalog_cache["at"]) < CATALOG_CACHE_TTL_SECONDS:
+        return _catalog_cache["catalog"]
+    held = _read_s3_held()
+    catalog = {
+        "catalog_url": _SEED_CATALOG.get("catalog_url", ""),
+        "default_alternatives": _SEED_CATALOG.get("default_alternatives", []),
+        "held": held if held is not None else _SEED_CATALOG.get("held", []),
+        "not_held": _SEED_CATALOG.get("not_held", []),
+    }
+    _catalog_cache["catalog"] = catalog
+    _catalog_cache["at"] = now
+    return catalog
 
 
 def _extract_source(result):
@@ -159,19 +252,184 @@ def retrieve(query):
     return chunks
 
 
-def _build_context_block(chunks):
-    """Wrap the retrieved chunks in the <context> tag the system prompt expects."""
-    if not chunks:
-        inner = "(no relevant passages were retrieved)"
-    else:
-        entries = []
-        for i, chunk in enumerate(chunks, start=1):
-            entry = f"[{i}] {chunk['text']}"
-            if chunk.get("source"):
-                entry += f"\nSource: {chunk['source']}"
-            entries.append(entry)
-        inner = "\n\n".join(entries)
-    return f"<{CONTEXT_TAG}>\n{inner}\n</{CONTEXT_TAG}>"
+def _tool_config():
+    """The Converse `toolConfig`: two tools the model routes between (toolChoice left at the
+    model's default `auto`, so it may also answer a greeting without any tool):
+      - search_library_info: semantic search over the library website (hours, services, policies,
+        how-to, borrowing, contact, general questions).
+      - database_catalog: authoritative lookup of the research-database catalog - whether a named
+        database is available (including confirming it is NOT), and databases by subject.
+    The descriptions are deliberately differentiated so the model picks the right one."""
+    return {
+        "tools": [
+            {
+                "toolSpec": {
+                    "name": SEARCH_TOOL_NAME,
+                    "description": (
+                        "Search the Gavilan College Library's website content for general library "
+                        "information: hours, locations, checkout and borrowing policies, laptops "
+                        "and equipment, textbooks and course reserves, services, contact info, and "
+                        "how-to/FAQ questions. Answer from the results it returns rather than from "
+                        "memory. You may call it more than once with different queries. Do NOT use "
+                        "this to check whether a specific named research database is available or "
+                        "to list databases by subject - use database_catalog for that."
+                    ),
+                    "inputSchema": {
+                        "json": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": (
+                                        "The search query describing the library information to "
+                                        "look up."
+                                    ),
+                                }
+                            },
+                            "required": ["query"],
+                        }
+                    },
+                }
+            },
+            {
+                "toolSpec": {
+                    "name": CATALOG_TOOL_NAME,
+                    "description": (
+                        "Look up the library's research-database catalog. Use this for two things: "
+                        "(1) to check whether a SPECIFIC named database or resource is available - "
+                        "e.g. 'do you have JSTOR / EBSCO / Opposing Viewpoints?' - it authoritatively "
+                        "returns whether the database is held, and if not, suggests held alternatives; "
+                        "and (2) to list the databases the library has for a SUBJECT - e.g. 'databases "
+                        "for business / nursing / psychology'. This catalog is authoritative for "
+                        "database availability: trust its held / not-held answer. It does NOT cover "
+                        "hours, services, or policies - use search_library_info for those."
+                    ),
+                    "inputSchema": {
+                        "json": {
+                            "type": "object",
+                            "properties": {
+                                "query_type": {
+                                    "type": "string",
+                                    "enum": ["name", "subject"],
+                                    "description": (
+                                        "'name' to check availability of a specific named database; "
+                                        "'subject' to list databases for a subject area."
+                                    ),
+                                },
+                                "value": {
+                                    "type": "string",
+                                    "description": (
+                                        "The database name (for query_type 'name') or the subject "
+                                        "(for query_type 'subject')."
+                                    ),
+                                },
+                            },
+                            "required": ["query_type", "value"],
+                        }
+                    },
+                }
+            },
+        ]
+    }
+
+
+def _run_search_tool(tool_input):
+    """Execute the search_library_info tool: run KB `Retrieve` on the model's query. Returns
+    (chunks, result_json) where result_json is the toolResult payload handed back to the model."""
+    query = ""
+    if isinstance(tool_input, dict):
+        query = (tool_input.get("query") or "").strip()
+    if not query:
+        return [], {"passages": [], "note": "No search query was provided."}
+    chunks = retrieve(query)
+    passages = [{"text": c["text"], "source": c.get("source")} for c in chunks]
+    if not passages:
+        return chunks, {"passages": [], "note": "No relevant passages were found."}
+    return chunks, {"passages": passages}
+
+
+def _norm(text):
+    """Normalize a name/subject for matching: lowercase, drop punctuation, collapse whitespace."""
+    return " ".join("".join(c if c.isalnum() else " " for c in (text or "").lower()).split())
+
+
+def _name_matches(query_norm, name, aliases):
+    """Whether a normalized query names this database, by its name or any alias. Matches on exact
+    normalized equality or a whole-string containment either way (so 'ebsco' hits the 'EBSCO'
+    alias and 'jstor database' still hits 'JSTOR'), which is safe for specific named-database
+    lookups."""
+    for candidate in [name] + list(aliases or []):
+        cand = _norm(candidate)
+        if not cand:
+            continue
+        if query_norm == cand or query_norm in cand or cand in query_norm:
+            return True
+    return False
+
+
+def _catalog_name_lookup(value):
+    """Authoritatively answer whether a named database is held. Returns structured JSON (the model
+    writes the prose). Held -> {held:true,...}; known-absent -> {held:false, suggested_alternatives};
+    unknown -> {held:false, not in catalog, generic alternatives}."""
+    catalog = _get_catalog()
+    query_norm = _norm(value)
+    for db in catalog.get("held", []):
+        if _name_matches(query_norm, db["name"], db.get("aliases")):
+            return {
+                "held": True,
+                "name": db["name"],
+                "subjects": db.get("subjects", []),
+                "description": db.get("description", ""),
+            }
+    for db in catalog.get("not_held", []):
+        if _name_matches(query_norm, db["name"], db.get("aliases")):
+            return {
+                "held": False,
+                "name": db["name"],
+                "suggested_alternatives": db.get("suggested_alternatives", []),
+            }
+    # Not in either list: the catalog is authoritative for what is held, so an unknown name is not
+    # held. Offer a generic starting point rather than a curated alternative.
+    return {
+        "held": False,
+        "name": value,
+        "suggested_alternatives": catalog.get("default_alternatives", []),
+        "note": "This database was not found in the library's catalog.",
+    }
+
+
+def _catalog_subject_lookup(value):
+    """List the held databases for a subject. Matches the subject query against each database's
+    subject tags (normalized, containment either way). Returns {subject, databases:[{name,
+    description}], note?}."""
+    query_norm = _norm(value)
+    matches = []
+    for db in _get_catalog().get("held", []):
+        for subject in db.get("subjects", []):
+            sub = _norm(subject)
+            if query_norm == sub or query_norm in sub or sub in query_norm:
+                matches.append({"name": db["name"], "description": db.get("description", "")})
+                break
+    result = {"subject": value, "databases": matches}
+    if not matches:
+        result["note"] = "No databases were found for that subject in the catalog."
+    return result
+
+
+def _run_catalog_tool(tool_input):
+    """Execute the database_catalog tool. Returns (result_json, contributed_source) where
+    contributed_source is _CATALOG_SOURCE for a real lookup (name or subject) or None for a bad
+    input - so only substantive catalog answers add the synthetic A-Z-page source."""
+    if not isinstance(tool_input, dict):
+        return {"error": "Invalid catalog input."}, None
+    value = (tool_input.get("value") or "").strip()
+    if not value:
+        return {"error": "No database name or subject was provided."}, None
+    query_type = (tool_input.get("query_type") or "").strip().lower()
+    if query_type == "subject":
+        return _catalog_subject_lookup(value), _CATALOG_SOURCE
+    # Default to a name lookup (the common "do you have X?" case) for 'name' or anything else.
+    return _catalog_name_lookup(value), _CATALOG_SOURCE
 
 
 def _output_guardrail_config():
@@ -343,16 +601,19 @@ def _apply_input_guardrail(query):
     return "proceed", query
 
 
-def _first_text(response):
-    """The first text block of a Converse response. On a guardrail block this is the
-    configured blocked message; otherwise the generated answer."""
-    content = (
-        response.get("output", {}).get("message", {}).get("content", []) or []
-    )
-    for block in content:
+def _message_text(message):
+    """The first text block of a Converse output message (a message may mix text with
+    toolUse blocks; we surface the text). Empty string if there is none."""
+    for block in (message or {}).get("content", []) or []:
         if isinstance(block, dict) and "text" in block:
             return block["text"]
     return ""
+
+
+def _first_text(response):
+    """The first text block of a Converse response. On a guardrail block this is the
+    configured blocked message; otherwise the generated answer."""
+    return _message_text(response.get("output", {}).get("message", {}))
 
 
 def _log_guardrail_assessment(response):
@@ -376,36 +637,118 @@ def _log_guardrail_assessment(response):
     )
 
 
-def generate(query, chunks):
-    """Bedrock Converse generation under the system prompt + OUTPUT guardrail. The system
-    prompt goes in Converse `system`; the <context> block and the question go in the user
-    message.
+def run_agent(query):
+    """Agentic Bedrock Converse tool-use loop with KB semantic retrieval as the only tool.
 
-    Returns {"answer": <text>, "blocked": <bool>}. When the output guardrail intervenes,
-    `answer` is the guardrail's configured blocked message and `blocked` is True."""
-    user_text = f"{_build_context_block(chunks)}\n\nQuestion: {query}"
+    The system prompt goes in Converse `system`; the user's (already input-screened) query is
+    the initial user message. Each turn:
+      - call Converse with the one-tool toolConfig + the OUTPUT guardrail (backstop on every turn);
+      - if the OUTPUT guardrail intervenes -> return the blocked message, no sources;
+      - if stopReason == "tool_use" -> run the tool for EACH toolUse block the model requested
+        (it may ask for several at once), append the assistant turn and ONE user message carrying
+        all the toolResults, and loop;
+      - any other stopReason (end_turn, max_tokens, ...) -> done, return the answer.
+    Retrieval only happens when the model calls the tool, so `chunks` accumulates across the
+    whole loop (empty if the model answered directly, e.g. a greeting). A safety cap of
+    MAX_AGENT_ITERATIONS bounds the loop.
 
-    kwargs = {
-        "modelId": GENERATION_MODEL_ID,
-        "system": [{"text": SYSTEM_PROMPT}],
-        "messages": [{"role": "user", "content": [{"text": user_text}]}],
-        # Short, direct, low-variance answers for a factual FAQ bot. The maxTokens/temperature
-        # key names and nesting match the bedrock-runtime Converse inferenceConfig shape.
-        "inferenceConfig": {
-            "maxTokens": GENERATION_MAX_TOKENS,
-            "temperature": GENERATION_TEMPERATURE,
-        },
-    }
+    Returns {"answer", "blocked", "chunks", "catalog_sources"}: `chunks` are the KB passages from
+    search_library_info (drive `sources` + eval full_context); `catalog_sources` are synthetic
+    source entries a substantive database_catalog lookup contributed."""
+    messages = [{"role": "user", "content": [{"text": query}]}]
+    collected_chunks = []
+    catalog_sources = []
+    answer = ""
+    tool_config = _tool_config()
     guardrail = _output_guardrail_config()
-    if guardrail:
-        kwargs["guardrailConfig"] = guardrail
 
-    response = _bedrock_client().converse(**kwargs)
-    _log_guardrail_assessment(response)
+    for _ in range(MAX_AGENT_ITERATIONS):
+        kwargs = {
+            "modelId": GENERATION_MODEL_ID,
+            "system": [{"text": SYSTEM_PROMPT}],
+            "messages": messages,
+            "toolConfig": tool_config,
+            # Short, direct, low-variance answers for a factual FAQ bot. The maxTokens/temperature
+            # key names and nesting match the bedrock-runtime Converse inferenceConfig shape.
+            "inferenceConfig": {
+                "maxTokens": GENERATION_MAX_TOKENS,
+                "temperature": GENERATION_TEMPERATURE,
+            },
+        }
+        # OUTPUT guardrail on EVERY turn so the final answer is always screened.
+        if guardrail:
+            kwargs["guardrailConfig"] = guardrail
 
+        response = _bedrock_client().converse(**kwargs)
+        _log_guardrail_assessment(response)
+
+        if response.get("stopReason") == _GUARDRAIL_STOP_REASON:
+            # The OUTPUT guardrail blocked this turn: return its message, drop all sources.
+            return {
+                "answer": _first_text(response),
+                "blocked": True,
+                "chunks": [],
+                "catalog_sources": [],
+            }
+
+        out_message = response.get("output", {}).get("message", {}) or {}
+        text = _message_text(out_message)
+        if text:
+            answer = text  # keep the latest model text as the running best answer
+
+        if response.get("stopReason") != "tool_use":
+            # Terminal turn (end_turn / max_tokens / stop_sequence / ...): we have the answer.
+            return {
+                "answer": answer,
+                "blocked": False,
+                "chunks": collected_chunks,
+                "catalog_sources": catalog_sources,
+            }
+
+        # tool_use: echo the assistant turn back verbatim (it carries the toolUse blocks), then
+        # run every requested tool and return all results in a single following user message.
+        messages.append(out_message)
+        tool_results = []
+        for block in out_message.get("content", []) or []:
+            tool_use = block.get("toolUse") if isinstance(block, dict) else None
+            if not tool_use:
+                continue
+            name = tool_use.get("name")
+            if name == SEARCH_TOOL_NAME:
+                chunks, result_json = _run_search_tool(tool_use.get("input"))
+                collected_chunks.extend(chunks)
+                status = "success"
+            elif name == CATALOG_TOOL_NAME:
+                result_json, source = _run_catalog_tool(tool_use.get("input"))
+                # A substantive catalog lookup contributes the synthetic A-Z-page source (deduped).
+                if source and source not in catalog_sources:
+                    catalog_sources.append(source)
+                status = "error" if "error" in result_json else "success"
+            else:
+                # The model requested a tool we did not define; report an error result so it can
+                # recover rather than silently hanging.
+                result_json = {"error": f"Unknown tool: {name}"}
+                status = "error"
+            tool_results.append(
+                {
+                    "toolResult": {
+                        "toolUseId": tool_use.get("toolUseId"),
+                        "content": [{"json": result_json}],
+                        "status": status,
+                    }
+                }
+            )
+        if not tool_results:
+            # stopReason was tool_use but no toolUse block was present: bail rather than loop.
+            break
+        messages.append({"role": "user", "content": tool_results})
+
+    # Iteration cap hit without a terminal turn: return the best answer we have (or a fallback).
     return {
-        "answer": _first_text(response),
-        "blocked": response.get("stopReason") == _GUARDRAIL_STOP_REASON,
+        "answer": answer or _MAX_ITERS_FALLBACK_MESSAGE,
+        "blocked": False,
+        "chunks": collected_chunks,
+        "catalog_sources": catalog_sources,
     }
 
 
@@ -504,11 +847,10 @@ def _request_path(event):
 
 
 def _handle_warm():
-    """Warm path (GET /warm): a single KB Retrieve to wake the OpenSearch Serverless
-    collection (which scales to zero after ~10min idle) before the student's first real
-    query. No generation and no guardrail input screen - there is no user query to screen,
-    and OSS scale-to-zero is the dominant cold-start cost, so warming retrieval is the whole
-    point. The Bedrock Converse path is deliberately left cold."""
+    """Warm path (GET /warm): a single KB Retrieve to warm the query Lambda container and the
+    retrieval path before the student's first real query. No generation and no guardrail input
+    screen - there is no user query to screen. The Bedrock Converse path is deliberately left
+    cold."""
     try:
         retrieve(_WARM_QUERY)
     except Exception as exc:  # noqa: BLE001 - warm is fire-and-forget; return a clean error
@@ -538,23 +880,35 @@ def _handle_query(event):
     # JSON error instead of an opaque 500. `stage` names the step that failed. No retry logic.
     stage = "input_guardrail"
     try:
-        # Screen the bare query BEFORE retrieval. A content-filter / prompt-attack hit is
+        # Screen the bare query BEFORE the agent runs. A content-filter / prompt-attack hit is
         # blocked here and returns immediately - no retrieval, no generation, no Bedrock spend.
-        # PII is masked and we proceed silently on the masked text; the retrieved <context> is
-        # never screened, so contact facts survive.
+        # PII is masked and we proceed silently on the masked text; the retrieved passages the
+        # tool returns are never input-screened, so contact facts survive.
         decision, screened_query = _apply_input_guardrail(query)
         if decision == "block":
             return _response(200, {"answer": screened_query, "sources": []})
-        stage = "retrieve"
-        chunks = retrieve(screened_query)
-        stage = "generate"
-        result = generate(screened_query, chunks)
+        # The agentic loop: Converse tool-use with KB retrieval as the sole tool. Retrieval,
+        # generation, and the output-guardrail backstop all happen inside; on any fault this
+        # whole step reports as the "agent" stage.
+        stage = "agent"
+        result = run_agent(screened_query)
     except Exception as exc:  # noqa: BLE001 - deliberately broad: any AWS/runtime fault
         return _error_response(stage, exc)
 
-    # On an OUTPUT guardrail block the answer is the blocked message; don't attach library
-    # sources to it (v1: just return the message, no re-retrieve or escalation).
-    sources = [] if result["blocked"] else _build_sources(chunks)
+    # Sources: KB passages from search_library_info (deduped by uri) PLUS any synthetic
+    # database-catalog source (the A-Z page). On an OUTPUT guardrail block the answer is the
+    # blocked message, so attach no sources at all. full_context stays KB-only (what the model
+    # semantically retrieved), so the catalog's synthetic source never pollutes eval data.
+    chunks = result["chunks"]
+    if result["blocked"]:
+        sources = []
+    else:
+        sources = _build_sources(chunks)
+        seen = {s["uri"] for s in sources}
+        for cs in result.get("catalog_sources", []):
+            if cs["uri"] and cs["uri"] not in seen:
+                seen.add(cs["uri"])
+                sources.append(cs)
     payload = {"answer": result["answer"], "sources": sources}
     if include_full_context:
         payload["full_context"] = _full_context(chunks)

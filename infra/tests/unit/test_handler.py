@@ -122,9 +122,63 @@ class FakeAgentRuntime:
         return {"retrievalResults": self._results}
 
 
+SEARCH_TOOL = "search_library_info"
+
+
+def tool_use_turn(query="library hours", *, tool_use_id="tu-1", text=None, name=SEARCH_TOOL):
+    """A Converse response asking to call a tool (stopReason=tool_use). The assistant message
+    carries an optional text block plus a toolUse block, exactly as the real API returns."""
+    content = []
+    if text is not None:
+        content.append({"text": text})
+    content.append(
+        {"toolUse": {"toolUseId": tool_use_id, "name": name, "input": {"query": query}}}
+    )
+    return {
+        "output": {"message": {"role": "assistant", "content": content}},
+        "stopReason": "tool_use",
+    }
+
+
+def multi_tool_use_turn(*queries):
+    """A single Converse response requesting several tool calls at once (the model can do this)."""
+    content = [
+        {"toolUse": {"toolUseId": f"tu-{i}", "name": SEARCH_TOOL, "input": {"query": q}}}
+        for i, q in enumerate(queries, start=1)
+    ]
+    return {
+        "output": {"message": {"role": "assistant", "content": content}},
+        "stopReason": "tool_use",
+    }
+
+
+def end_turn(answer, *, trace=None):
+    """A terminal Converse response (stopReason=end_turn) carrying the final answer text."""
+    resp = {
+        "output": {"message": {"role": "assistant", "content": [{"text": answer}]}},
+        "stopReason": "end_turn",
+    }
+    if trace is not None:
+        resp["trace"] = trace
+    return resp
+
+
+def search_then_answer(answer, *, query="library hours"):
+    """The standard single-search flow: model searches once, then answers."""
+    return [tool_use_turn(query=query), end_turn(answer)]
+
+
 class FakeBedrockRuntime:
     """Stands in for the bedrock-runtime client, which serves BOTH apply_guardrail (input
-    screen) and converse (generation). Calls are recorded in separate lists."""
+    screen) and converse (the agent loop). Calls are recorded in separate lists.
+
+    converse() has two modes:
+      - scripted: pass `converse_script`, a list of full response dicts returned in order (the
+        last one repeats if the loop calls more times than scripted). Use the tool_use_turn /
+        end_turn builders to drive the agent loop.
+      - legacy single-turn: no script -> every converse() returns one message built from
+        `answer` / `stop_reason` / `trace`. stopReason defaults to end_turn, so the loop runs
+        exactly once (no tool use) - the shape most non-loop tests want."""
 
     def __init__(
         self,
@@ -132,6 +186,7 @@ class FakeBedrockRuntime:
         stop_reason=None,
         trace=None,
         guardrail_response=None,
+        converse_script=None,
     ):
         self.converse_calls = []
         self.apply_guardrail_calls = []
@@ -141,6 +196,8 @@ class FakeBedrockRuntime:
         self._guardrail_response = (
             guardrail_response if guardrail_response is not None else clean_input_response()
         )
+        self._script = converse_script
+        self._i = 0
 
     def apply_guardrail(self, **kwargs):
         self.apply_guardrail_calls.append(kwargs)
@@ -148,9 +205,13 @@ class FakeBedrockRuntime:
 
     def converse(self, **kwargs):
         self.converse_calls.append(kwargs)
-        resp = {"output": {"message": {"content": [{"text": self._answer}]}}}
-        if self._stop_reason is not None:
-            resp["stopReason"] = self._stop_reason
+        if self._script is not None:
+            resp = self._script[min(self._i, len(self._script) - 1)]
+            self._i += 1
+            return resp
+        # Legacy single-turn: terminal by default so the agent loop runs exactly once.
+        resp = {"output": {"message": {"role": "assistant", "content": [{"text": self._answer}]}}}
+        resp["stopReason"] = self._stop_reason if self._stop_reason is not None else "end_turn"
         if self._trace is not None:
             resp["trace"] = self._trace
         return resp
@@ -214,12 +275,17 @@ def test_real_system_prompt_loaded_from_file():
     # The real prompt is loaded from app/system_prompt.md, not a placeholder string.
     assert handler.SYSTEM_PROMPT.startswith("<role>")
     assert "Gavilan College Library assistant" in handler.SYSTEM_PROMPT
-    assert "<context>" in handler.SYSTEM_PROMPT  # the tag the contract depends on
+    # The prompt tells the model about the search tool it drives in the agent loop.
+    assert "search_library_info" in handler.SYSTEM_PROMPT
     assert "PLACEHOLDER" not in handler.SYSTEM_PROMPT
 
 
 def test_happy_path_response_shape(monkeypatch):
-    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    # Standard flow: the model searches once, the tool retrieves, the model answers.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(
+        converse_script=search_then_answer("The library is open 9am to 5pm.")
+    )
     _wire(monkeypatch, agent, bedrock)
 
     event = _payload_v2_event(json.dumps({"query": "What are the library hours?"}))
@@ -229,11 +295,12 @@ def test_happy_path_response_shape(monkeypatch):
     body = json.loads(resp["body"])
     assert set(body.keys()) == {"answer", "sources"}
     assert body["answer"] == "The library is open 9am to 5pm."
+    # Sources come from the tool's retrieval during the loop.
     assert body["sources"] == [
         {"uri": "https://gav.edu/library/hours", "excerpt": "The library is open 9am to 5pm."},
         {"uri": "https://gav.edu/library/borrow", "excerpt": "Checkout period is 3 weeks."},
     ]
-    # Retrieve was called against the configured KB id, not RetrieveAndGenerate.
+    # The tool ran Retrieve against the configured KB id, not RetrieveAndGenerate.
     assert agent.calls[0]["knowledgeBaseId"] == "KB123456"
 
 
@@ -251,30 +318,49 @@ def test_system_prompt_passed_via_converse_system_not_message_body(monkeypatch):
     assert handler.SYSTEM_PROMPT not in _user_text(bedrock)
 
 
-def test_retrieved_chunks_wrapped_in_context_tag(monkeypatch):
-    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+def test_tool_result_fed_back_to_model_with_passages_and_sources(monkeypatch):
+    # After the model calls the tool, the loop runs Retrieve and feeds the passages back as a
+    # toolResult in the NEXT converse call's messages (no <context> block; retrieval is a tool).
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=search_then_answer("Open 9-5."))
     _wire(monkeypatch, agent, bedrock)
 
     handler.lambda_handler(
         _payload_v2_event(json.dumps({"query": "What are the library hours?"})), None
     )
 
-    user_text = _user_text(bedrock)
-    # The exact tag the system prompt references.
-    assert "<context>" in user_text and "</context>" in user_text
-    assert handler.CONTEXT_TAG == "context"
-    # Both retrieved chunks and their sources are inside the context block.
-    assert "The library is open 9am to 5pm." in user_text
-    assert "Source: https://gav.edu/library/hours" in user_text
-    # The question is present alongside the context.
-    assert "Question: What are the library hours?" in user_text
-    # Context comes before the question.
-    assert user_text.index("</context>") < user_text.index("Question:")
+    # Two converse calls: the tool request, then the final answer.
+    assert len(bedrock.converse_calls) == 2
+    # The toolConfig advertises both tools; the search tool is present.
+    tool_names = {
+        t["toolSpec"]["name"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]
+    }
+    assert tool_names == {"search_library_info", "database_catalog"}
+    # The initial user message is the bare question (not a context-wrapped prompt).
+    assert _user_text(bedrock) == "What are the library hours?"
+    # The second call's messages carry the assistant tool_use turn AND a user toolResult.
+    second_msgs = bedrock.converse_calls[1]["messages"]
+    tool_results = [
+        b["toolResult"] for m in second_msgs for b in m.get("content", []) if "toolResult" in b
+    ]
+    assert len(tool_results) == 1
+    tr = tool_results[0]
+    assert tr["toolUseId"] == "tu-1"
+    assert tr["status"] == "success"
+    passages = tr["content"][0]["json"]["passages"]
+    assert {
+        "text": "The library is open 9am to 5pm.",
+        "source": "https://gav.edu/library/hours",
+    } in passages
 
 
 def test_empty_retrieval_returns_no_sources(monkeypatch):
     agent = FakeAgentRuntime(results=[])
-    bedrock = FakeBedrockRuntime(answer="I do not have that information. Please ask a librarian.")
+    bedrock = FakeBedrockRuntime(
+        converse_script=search_then_answer(
+            "I do not have that information. Please ask a librarian."
+        )
+    )
     _wire(monkeypatch, agent, bedrock)
 
     resp = handler.lambda_handler(
@@ -285,10 +371,16 @@ def test_empty_retrieval_returns_no_sources(monkeypatch):
     body = json.loads(resp["body"])
     assert body["sources"] == []
     assert body["answer"].startswith("I do not have that information")
-    # The context block still exists and signals the empty case to the model.
-    user_text = _user_text(bedrock)
-    assert "<context>" in user_text
-    assert "(no relevant passages were retrieved)" in user_text
+    # The empty result is signalled back to the model in the toolResult note.
+    tr = [
+        b["toolResult"]
+        for m in bedrock.converse_calls[1]["messages"]
+        for b in m.get("content", [])
+        if "toolResult" in b
+    ][0]
+    result_json = tr["content"][0]["json"]
+    assert result_json["passages"] == []
+    assert "No relevant passages" in result_json["note"]
 
 
 def test_sources_deduplicated_by_uri(monkeypatch):
@@ -297,7 +389,7 @@ def test_sources_deduplicated_by_uri(monkeypatch):
         {"content": {"text": "Open 9-5."}, "location": {"webLocation": {"url": "https://gav.edu/library/hours"}}},
         {"content": {"text": "Closed on holidays."}, "location": {"webLocation": {"url": "https://gav.edu/library/hours"}}},
     ])
-    bedrock = FakeBedrockRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=search_then_answer("Open 9-5."))
     _wire(monkeypatch, agent, bedrock)
 
     resp = handler.lambda_handler(
@@ -312,16 +404,22 @@ def test_chunk_without_source_omitted_from_sources(monkeypatch):
     agent = FakeAgentRuntime(results=[
         {"content": {"text": "A passage with no location."}},
     ])
-    bedrock = FakeBedrockRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=search_then_answer("ok"))
     _wire(monkeypatch, agent, bedrock)
 
     resp = handler.lambda_handler(
         _payload_v2_event(json.dumps({"query": "hours?"})), None
     )
     body = json.loads(resp["body"])
-    # No resolvable uri -> not in sources, but the chunk still reached the context.
+    # No resolvable uri -> not in sources, but the chunk still reached the model via the tool.
     assert body["sources"] == []
-    assert "A passage with no location." in _user_text(bedrock)
+    passages = [
+        b["toolResult"]["content"][0]["json"]["passages"]
+        for m in bedrock.converse_calls[1]["messages"]
+        for b in m.get("content", [])
+        if "toolResult" in b
+    ][0]
+    assert passages == [{"text": "A passage with no location.", "source": None}]
 
 
 # --- include_full_context flag -------------------------------------------------
@@ -330,7 +428,8 @@ def test_chunk_without_source_omitted_from_sources(monkeypatch):
 def test_default_response_omits_full_context_widget_path_unchanged(monkeypatch):
     # THE regression that matters: without the flag (what the widget sends) the response is
     # exactly {answer, sources} - no full_context key, byte-for-byte the shipped contract.
-    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=search_then_answer("ok"))
     _wire(monkeypatch, agent, bedrock)
 
     resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
@@ -340,7 +439,8 @@ def test_default_response_omits_full_context_widget_path_unchanged(monkeypatch):
 
 
 def test_flag_false_still_omits_full_context(monkeypatch):
-    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=search_then_answer("ok"))
     _wire(monkeypatch, agent, bedrock)
 
     resp = handler.lambda_handler(
@@ -358,7 +458,7 @@ def test_include_full_context_returns_untruncated_undeduped_passages(monkeypatch
         {"content": {"text": "second chunk, same page"}, "location": {"webLocation": {"url": "https://gav.edu/a"}}},
         {"content": {"text": "chunk with no source"}},
     ])
-    bedrock = FakeBedrockRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=search_then_answer("ok"))
     _wire(monkeypatch, agent, bedrock)
 
     resp = handler.lambda_handler(
@@ -427,9 +527,9 @@ def test_query_is_stripped_before_screening(monkeypatch):
 
     handler.lambda_handler(_payload_v2_event(json.dumps({"query": "  hours?  "})), None)
 
-    # The stripped query is what gets screened and retrieved, not the padded raw value.
+    # The stripped query is what gets screened and handed to the agent, not the padded raw value.
     assert bedrock.apply_guardrail_calls[0]["content"] == [{"text": {"text": "hours?"}}]
-    assert _retrieved_query(agent) == "hours?"
+    assert _user_text(bedrock) == "hours?"
 
 
 def test_over_length_query_returns_400_before_any_aws_call(monkeypatch):
@@ -506,8 +606,8 @@ def test_clean_input_proceeds_with_original_query(monkeypatch):
     )
 
     assert resp["statusCode"] == 200
-    # Clean input -> retrieval runs on the original query, generation happens.
-    assert _retrieved_query(agent) == "What are the hours?"
+    # Clean input -> the agent runs on the original query (it becomes the initial user message).
+    assert _user_text(bedrock) == "What are the hours?"
     assert len(bedrock.converse_calls) == 1
 
 
@@ -516,7 +616,8 @@ def test_pii_masked_input_proceeds_on_masked_text(monkeypatch):
     masked = "email me at {EMAIL} about my book"
     agent = FakeAgentRuntime()
     bedrock = FakeBedrockRuntime(
-        guardrail_response=masked_input_response(masked, raw_match="jane@example.com")
+        guardrail_response=masked_input_response(masked, raw_match="jane@example.com"),
+        converse_script=search_then_answer("The library is open 9am to 5pm."),
     )
     _wire(monkeypatch, agent, bedrock)
 
@@ -527,10 +628,9 @@ def test_pii_masked_input_proceeds_on_masked_text(monkeypatch):
 
     assert resp["statusCode"] == 200
     body = json.loads(resp["body"])
-    # Retrieval and generation ran on the masked query, not the raw one.
-    assert _retrieved_query(agent) == masked
+    # The agent runs on the MASKED query (the initial user message), not the raw one.
+    assert _user_text(bedrock) == masked
     assert "jane@example.com" not in _user_text(bedrock)
-    assert len(bedrock.converse_calls) == 1
     # The student gets the normal generated answer + sources - NOT a block message.
     assert body["answer"] == "The library is open 9am to 5pm."
     assert len(body["sources"]) == 2
@@ -598,7 +698,8 @@ def test_input_screen_skipped_when_input_env_unset(monkeypatch):
 
     assert resp["statusCode"] == 200
     assert bedrock.apply_guardrail_calls == []
-    assert _retrieved_query(agent) == "hours?"
+    # No screening -> the raw query passes straight through as the agent's initial message.
+    assert _user_text(bedrock) == "hours?"
 
 
 def test_input_screen_does_not_log_raw_pii(monkeypatch, capsys):
@@ -639,9 +740,6 @@ def test_converse_attaches_output_guardrail_config(monkeypatch):
     assert gc["guardrailIdentifier"] == handler.OUTPUT_GUARDRAIL_ID
     assert gc["guardrailVersion"] == handler.OUTPUT_GUARDRAIL_VERSION
     assert gc["trace"] == "enabled"
-    # No guardContent tagging: the message content is still just <context> + question.
-    user_text = _user_text(bedrock)
-    assert "<context>" in user_text and "Question:" in user_text
 
 
 def test_converse_omits_guardrail_config_when_output_env_unset(monkeypatch):
@@ -662,7 +760,7 @@ def test_output_guardrail_block_returns_blocked_message(monkeypatch):
         "I'm not able to provide a response to that. Try asking about library hours, "
         "services, or materials, or reach out to a librarian for more help."
     )
-    agent = FakeAgentRuntime()  # retrieval still ran, but a blocked answer drops sources
+    agent = FakeAgentRuntime()
     bedrock = FakeBedrockRuntime(
         answer=blocked,
         stop_reason="guardrail_intervened",
@@ -677,7 +775,7 @@ def test_output_guardrail_block_returns_blocked_message(monkeypatch):
     assert resp["statusCode"] == 200
     body = json.loads(resp["body"])
     assert body["answer"] == blocked
-    # A blocked response carries no library sources, even though retrieval happened.
+    # A guardrail-blocked turn returns the block message with no library sources.
     assert body["sources"] == []
 
 
@@ -808,29 +906,32 @@ def test_input_guardrail_failure_returns_clean_staged_error(monkeypatch, capsys)
     assert bedrock.converse_calls == []
 
 
-def test_retrieve_failure_returns_clean_staged_error(monkeypatch, capsys):
-    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+def test_agent_tool_retrieve_failure_returns_clean_staged_error(monkeypatch, capsys):
+    # The tool's Retrieve raises after the model requests it -> the whole agent step reports as
+    # the "agent" stage (retrieval now lives inside the loop, not a separate stage).
+    agent = FakeAgentRuntime()
     monkeypatch.setattr(agent, "retrieve", _raise_boom)
+    bedrock = FakeBedrockRuntime(converse_script=[tool_use_turn()])
     _wire(monkeypatch, agent, bedrock)
 
     resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
 
-    _assert_clean_error(resp, capsys, "retrieve")
-    # The input screen ran (clean); generation never did.
+    _assert_clean_error(resp, capsys, "agent")
+    # Input screen ran (clean); the model made one converse call requesting the tool.
     assert len(bedrock.apply_guardrail_calls) == 1
-    assert bedrock.converse_calls == []
+    assert len(bedrock.converse_calls) == 1
 
 
-def test_generate_failure_returns_clean_staged_error(monkeypatch, capsys):
+def test_agent_converse_failure_returns_clean_staged_error(monkeypatch, capsys):
     agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
     monkeypatch.setattr(bedrock, "converse", _raise_boom)
     _wire(monkeypatch, agent, bedrock)
 
     resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
 
-    _assert_clean_error(resp, capsys, "generate")
-    # Retrieval did run (the failure was at generation).
-    assert len(agent.calls) == 1
+    _assert_clean_error(resp, capsys, "agent")
+    # Converse failed on the first turn, before any tool retrieval.
+    assert agent.calls == []
 
 
 def test_warm_failure_returns_clean_error_not_opaque(monkeypatch, capsys):
@@ -847,3 +948,513 @@ def test_warm_failure_returns_clean_error_not_opaque(monkeypatch, capsys):
     assert "error" in body and body.get("warmed") is None
     rec = _last_json_log(capsys, "query_failed")
     assert rec["stage"] == "warm"
+
+
+# --- Agent tool-use loop --------------------------------------------------------
+
+
+def test_agent_executes_tool_then_terminates(monkeypatch):
+    # The canonical loop: tool_use turn -> run tool -> feed toolResult back -> end_turn.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=search_then_answer("Open 9am to 5pm."))
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
+
+    body = json.loads(resp["body"])
+    assert body["answer"] == "Open 9am to 5pm."
+    # The tool ran exactly once, on the query the MODEL chose (not the user's raw text).
+    assert len(agent.calls) == 1
+    assert _retrieved_query(agent) == "library hours"
+    # Two converse calls: request the tool, then answer after seeing the result.
+    assert len(bedrock.converse_calls) == 2
+    # The loop terminated (did not hit the cap).
+    assert len(bedrock.converse_calls) < handler.MAX_AGENT_ITERATIONS
+
+
+def test_no_tool_use_direct_answer_returns_empty_sources(monkeypatch):
+    # The model answers a greeting directly (end_turn, no tool call): no retrieval, empty sources.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("Hi! How can I help with the library?")])
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hello"})), None)
+
+    body = json.loads(resp["body"])
+    assert body["answer"] == "Hi! How can I help with the library?"
+    assert body["sources"] == []
+    # The tool was never called.
+    assert agent.calls == []
+    assert len(bedrock.converse_calls) == 1
+
+
+def test_sources_accumulate_across_multiple_tool_calls(monkeypatch):
+    # The model searches twice (two sequential tool_use turns) before answering; sources from
+    # BOTH retrievals accumulate. retrieve() is monkeypatched to return per-query results.
+    def fake_retrieve(query):
+        if "hours" in query:
+            return [{"text": "Open 9-5.", "source": "https://gav.edu/hours"}]
+        return [{"text": "3 week checkout.", "source": "https://gav.edu/borrow"}]
+
+    monkeypatch.setattr(handler, "retrieve", fake_retrieve)
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            tool_use_turn(query="hours", tool_use_id="tu-1"),
+            tool_use_turn(query="checkout", tool_use_id="tu-2"),
+            end_turn("Open 9-5, 3 week checkout."),
+        ]
+    )
+    monkeypatch.setattr(handler, "_bedrock_client", lambda: bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours and checkout?"})), None)
+
+    body = json.loads(resp["body"])
+    uris = {s["uri"] for s in body["sources"]}
+    assert uris == {"https://gav.edu/hours", "https://gav.edu/borrow"}
+    assert len(bedrock.converse_calls) == 3
+
+
+def test_multiple_tool_use_blocks_in_one_response(monkeypatch):
+    # The model requests TWO tool calls in a single turn; both execute and both toolResults come
+    # back in ONE following user message.
+    def fake_retrieve(query):
+        return [{"text": f"result for {query}", "source": f"https://gav.edu/{query}"}]
+
+    monkeypatch.setattr(handler, "retrieve", fake_retrieve)
+    bedrock = FakeBedrockRuntime(
+        converse_script=[multi_tool_use_turn("hours", "printing"), end_turn("Here is both.")]
+    )
+    monkeypatch.setattr(handler, "_bedrock_client", lambda: bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours and printing?"})), None)
+
+    body = json.loads(resp["body"])
+    # Both retrievals contributed sources.
+    assert {s["uri"] for s in body["sources"]} == {
+        "https://gav.edu/hours",
+        "https://gav.edu/printing",
+    }
+    # The second converse call carries a single user message with TWO toolResult blocks.
+    second_msgs = bedrock.converse_calls[1]["messages"]
+    tool_result_msgs = [
+        m for m in second_msgs
+        if m.get("role") == "user" and any("toolResult" in b for b in m.get("content", []))
+    ]
+    assert len(tool_result_msgs) == 1
+    results = [b for b in tool_result_msgs[0]["content"] if "toolResult" in b]
+    assert len(results) == 2
+    assert {r["toolResult"]["toolUseId"] for r in results} == {"tu-1", "tu-2"}
+
+
+def test_max_iterations_cap_stops_the_loop(monkeypatch):
+    # A model that ALWAYS asks for the tool must not loop forever: the cap bounds converse calls
+    # and a response is still returned.
+    agent = FakeAgentRuntime()
+    # Script shorter than the cap; the fake repeats its last entry, so every turn is tool_use.
+    bedrock = FakeBedrockRuntime(converse_script=[tool_use_turn(text="let me look that up")])
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
+
+    assert resp["statusCode"] == 200
+    # Converse and the tool were each called exactly MAX_AGENT_ITERATIONS times, then we stopped.
+    assert len(bedrock.converse_calls) == handler.MAX_AGENT_ITERATIONS
+    assert len(agent.calls) == handler.MAX_AGENT_ITERATIONS
+    # A best-effort answer still comes back (the model's running text here).
+    body = json.loads(resp["body"])
+    assert body["answer"] == "let me look that up"
+
+
+def test_max_iterations_cap_falls_back_when_no_answer_text(monkeypatch):
+    # If the capped loop never produced any answer text, a graceful fallback is returned.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[tool_use_turn()])  # no text block, ever
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
+
+    body = json.loads(resp["body"])
+    assert body["answer"] == handler._MAX_ITERS_FALLBACK_MESSAGE
+    assert len(bedrock.converse_calls) == handler.MAX_AGENT_ITERATIONS
+
+
+def test_output_guardrail_applied_on_every_converse_call(monkeypatch):
+    # The OUTPUT guardrail must attach to EVERY turn of the loop, not just the first, so the
+    # final answer is always screened.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=search_then_answer("Open 9-5."))
+    _wire(monkeypatch, agent, bedrock)
+
+    handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
+
+    assert len(bedrock.converse_calls) == 2
+    for call in bedrock.converse_calls:
+        gc = call["guardrailConfig"]
+        assert gc["guardrailIdentifier"] == handler.OUTPUT_GUARDRAIL_ID
+        assert gc["guardrailVersion"] == handler.OUTPUT_GUARDRAIL_VERSION
+
+
+def test_guardrail_block_mid_loop_returns_block_and_no_sources(monkeypatch):
+    # If the OUTPUT guardrail intervenes on a turn AFTER a tool ran, the block message is
+    # returned and the accumulated sources are dropped.
+    agent = FakeAgentRuntime()
+    blocked = "I'm not able to provide a response to that."
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            tool_use_turn(),
+            {
+                "output": {"message": {"role": "assistant", "content": [{"text": blocked}]}},
+                "stopReason": "guardrail_intervened",
+            },
+        ]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
+
+    body = json.loads(resp["body"])
+    assert body["answer"] == blocked
+    assert body["sources"] == []  # dropped despite the tool having retrieved
+    assert len(agent.calls) == 1
+
+
+def test_unknown_tool_request_returns_error_tool_result(monkeypatch):
+    # Defensive: if the model asks for a tool we did not define, the loop returns a status=error
+    # toolResult (so the model can recover) rather than crashing.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            tool_use_turn(name="some_other_tool"),
+            end_turn("Sorry, I could not look that up."),
+        ]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
+
+    assert resp["statusCode"] == 200
+    # The unknown tool did not trigger a KB retrieval...
+    assert agent.calls == []
+    # ...and the toolResult fed back carries status=error.
+    tr = [
+        b["toolResult"]
+        for m in bedrock.converse_calls[1]["messages"]
+        for b in m.get("content", [])
+        if "toolResult" in b
+    ][0]
+    assert tr["status"] == "error"
+    assert "Unknown tool" in tr["content"][0]["json"]["error"]
+
+
+# --- Phase 2a: database_catalog tool -------------------------------------------
+
+
+CATALOG_TOOL = "database_catalog"
+
+
+def catalog_tool_use_turn(query_type="name", value="JSTOR", *, tool_use_id="tu-1"):
+    """A Converse response asking to call database_catalog."""
+    return {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "toolUse": {
+                            "toolUseId": tool_use_id,
+                            "name": CATALOG_TOOL,
+                            "input": {"query_type": query_type, "value": value},
+                        }
+                    }
+                ],
+            }
+        },
+        "stopReason": "tool_use",
+    }
+
+
+def _catalog_tool_results(bedrock, call_index=1):
+    """The toolResult json blocks carried into a later converse call's messages."""
+    return [
+        b["toolResult"]
+        for m in bedrock.converse_calls[call_index]["messages"]
+        for b in m.get("content", [])
+        if "toolResult" in b
+    ]
+
+
+# -- Catalog lookup functions (called directly; no loop) --
+
+
+def test_catalog_name_lookup_held_database():
+    result = handler._catalog_name_lookup("Opposing Viewpoints")
+    assert result["held"] is True
+    assert result["name"] == "Opposing Viewpoints In Context"
+    assert "controversial issues" in result["subjects"]
+
+
+def test_catalog_name_lookup_not_held_jstor_suggests_alternatives():
+    result = handler._catalog_name_lookup("JSTOR")
+    assert result["held"] is False
+    assert result["name"] == "JSTOR"
+    # A real held alternative is suggested.
+    assert "EbscoHost Core Search" in result["suggested_alternatives"]
+
+
+def test_catalog_name_lookup_psycinfo_alias_maps_to_held_neighbor():
+    # "PsychINFO" (a common misspelling / alias) resolves to the not-held PsycINFO entry, whose
+    # alternative is the held Psychology & Behavioral Sciences Collection.
+    result = handler._catalog_name_lookup("PsychINFO")
+    assert result["held"] is False
+    assert result["name"] == "PsycINFO"
+    assert result["suggested_alternatives"] == ["Psychology & Behavioral Sciences Collection"]
+
+
+def test_catalog_name_lookup_alias_matches_held_database():
+    # "EBSCO" is an alias of EbscoHost Core Search.
+    result = handler._catalog_name_lookup("EBSCO")
+    assert result["held"] is True
+    assert result["name"] == "EbscoHost Core Search"
+
+
+def test_catalog_name_lookup_unknown_is_authoritatively_not_held():
+    result = handler._catalog_name_lookup("Totally Made Up Database 9000")
+    assert result["held"] is False
+    assert "not found" in result["note"].lower()
+    # Falls back to the catalog's default alternative rather than a curated one.
+    assert result["suggested_alternatives"] == ["EbscoHost Core Search"]
+
+
+def test_catalog_subject_lookup_business_returns_business_databases():
+    result = handler._catalog_subject_lookup("business")
+    names = {db["name"] for db in result["databases"]}
+    assert "Business Source Complete" in names
+    assert "Statista.com" in names
+
+
+def test_catalog_subject_lookup_psychology_returns_the_psych_collection():
+    result = handler._catalog_subject_lookup("psychology")
+    names = {db["name"] for db in result["databases"]}
+    assert "Psychology & Behavioral Sciences Collection" in names
+
+
+def test_catalog_subject_lookup_unknown_subject_is_empty_with_note():
+    result = handler._catalog_subject_lookup("underwater basket weaving")
+    assert result["databases"] == []
+    assert "note" in result
+
+
+def test_run_catalog_tool_dispatches_name_vs_subject_and_bad_input():
+    name_res, src = handler._run_catalog_tool({"query_type": "name", "value": "JSTOR"})
+    assert name_res["held"] is False and src == handler._CATALOG_SOURCE
+    subj_res, src2 = handler._run_catalog_tool({"query_type": "subject", "value": "history"})
+    assert "databases" in subj_res and src2 == handler._CATALOG_SOURCE
+    # Missing value -> error result, and NO synthetic source contributed.
+    err, src3 = handler._run_catalog_tool({"query_type": "name", "value": ""})
+    assert "error" in err and src3 is None
+
+
+# -- Catalog tool inside the agent loop --
+
+
+def test_agent_routes_named_database_query_to_catalog_not_search(monkeypatch):
+    # The model requests database_catalog for "do you have JSTOR?"; the KB search tool is NOT run.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            catalog_tool_use_turn("name", "JSTOR"),
+            end_turn("We do not have JSTOR, but you can try EbscoHost Core Search."),
+        ]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "do you have JSTOR?"})), None)
+
+    body = json.loads(resp["body"])
+    assert body["answer"].startswith("We do not have JSTOR")
+    # KB retrieval never ran (catalog handled it).
+    assert agent.calls == []
+    # The catalog toolResult fed back reports not-held.
+    (tr,) = _catalog_tool_results(bedrock)
+    assert tr["status"] == "success"
+    assert tr["content"][0]["json"]["held"] is False
+
+
+def test_catalog_answer_contributes_synthetic_databases_source(monkeypatch):
+    # A catalog answer has no scraped-page passage, so its source is the A-Z databases page.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(
+        converse_script=[catalog_tool_use_turn("subject", "business"), end_turn("Here you go.")]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "what databases for business?"})), None
+    )
+
+    body = json.loads(resp["body"])
+    assert body["sources"] == [handler._CATALOG_SOURCE]
+    assert body["sources"][0]["uri"].endswith("databases.php")
+
+
+def test_catalog_and_search_sources_merge_and_dedupe(monkeypatch):
+    # Model uses BOTH tools: search (KB passages) + catalog (synthetic source). Sources merge.
+    agent = FakeAgentRuntime()  # default two KB chunks
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            tool_use_turn(query="library hours", tool_use_id="tu-1"),
+            catalog_tool_use_turn("name", "Opposing Viewpoints", tool_use_id="tu-2"),
+            end_turn("Combined answer."),
+        ]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours and databases"})), None)
+
+    uris = [s["uri"] for s in json.loads(resp["body"])["sources"]]
+    # Two KB sources + one catalog source, no duplicates.
+    assert "https://gav.edu/library/hours" in uris
+    assert "https://gav.edu/library/borrow" in uris
+    assert handler._CATALOG_SOURCE["uri"] in uris
+    assert len(uris) == len(set(uris)) == 3
+
+
+def test_catalog_source_deduped_across_multiple_catalog_calls(monkeypatch):
+    # Two catalog calls contribute only ONE synthetic databases source.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            catalog_tool_use_turn("name", "JSTOR", tool_use_id="tu-1"),
+            catalog_tool_use_turn("name", "PsycINFO", tool_use_id="tu-2"),
+            end_turn("Neither is held."),
+        ]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "jstor and psycinfo?"})), None)
+    assert json.loads(resp["body"])["sources"] == [handler._CATALOG_SOURCE]
+
+
+def test_guardrail_block_drops_catalog_source(monkeypatch):
+    # A guardrail block after a catalog call returns the block message with NO sources.
+    agent = FakeAgentRuntime()
+    blocked = "I'm not able to provide a response to that."
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            catalog_tool_use_turn("name", "JSTOR"),
+            {
+                "output": {"message": {"role": "assistant", "content": [{"text": blocked}]}},
+                "stopReason": "guardrail_intervened",
+            },
+        ]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "x"})), None)
+    body = json.loads(resp["body"])
+    assert body["answer"] == blocked
+    assert body["sources"] == []
+
+
+def test_both_tools_advertised_with_differentiated_descriptions(monkeypatch):
+    # The toolConfig carries both tools, and the catalog input schema uses query_type/value.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("hi")])
+    _wire(monkeypatch, agent, bedrock)
+
+    handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hi"})), None)
+
+    tools = {t["toolSpec"]["name"]: t["toolSpec"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]}
+    assert set(tools) == {"search_library_info", "database_catalog"}
+    cat_schema = tools["database_catalog"]["inputSchema"]["json"]
+    assert set(cat_schema["properties"]) == {"query_type", "value"}
+    assert cat_schema["properties"]["query_type"]["enum"] == ["name", "subject"]
+    assert cat_schema["required"] == ["query_type", "value"]
+
+
+# --- Phase 2b: catalog read from S3 (with seed fallback + not-held merge) -------------------
+
+
+class _FakeBody:
+    def __init__(self, data):
+        self._data = data
+
+    def read(self):
+        return self._data
+
+
+class _FakeCatalogS3:
+    """Stand-in for the S3 client the catalog tool reads its held list from."""
+
+    def __init__(self, held=None, raise_exc=None):
+        self._held = held
+        self._raise = raise_exc
+        self.get_calls = 0
+
+    def get_object(self, Bucket, Key):
+        self.get_calls += 1
+        if self._raise is not None:
+            raise self._raise
+        return {"Body": _FakeBody(json.dumps({"held": self._held}).encode("utf-8"))}
+
+
+def _use_s3_catalog(monkeypatch, fake):
+    monkeypatch.setattr(handler, "CATALOG_BUCKET", "cat-bucket")
+    monkeypatch.setattr(handler, "_catalog_s3_client", lambda: fake)
+    handler._catalog_cache["catalog"] = None
+    handler._catalog_cache["at"] = 0.0
+
+
+def test_catalog_held_is_read_from_s3(monkeypatch):
+    # The held list comes from the scraper-written S3 object, not the bundled seed.
+    fake = _FakeCatalogS3(held=[
+        {"name": "Fresh DB", "subjects": ["freshtopic"], "description": "brand new", "aliases": ["FDB"]}
+    ])
+    _use_s3_catalog(monkeypatch, fake)
+
+    result = handler._catalog_name_lookup("Fresh DB")
+    assert result["held"] is True and result["name"] == "Fresh DB"
+    # Alias from S3 held matches too.
+    assert handler._catalog_name_lookup("FDB")["held"] is True
+    # Subject lookup uses the S3 held subjects.
+    subj = handler._catalog_subject_lookup("freshtopic")
+    assert {d["name"] for d in subj["databases"]} == {"Fresh DB"}
+
+
+def test_not_held_survives_from_seed_when_held_comes_from_s3(monkeypatch):
+    # The scraper only writes `held`; the hand-authored not_held stays in the bundled seed and is
+    # merged at read time - so "do you have JSTOR?" still returns not-held + alternatives.
+    _use_s3_catalog(monkeypatch, _FakeCatalogS3(held=[{"name": "Fresh DB", "subjects": [], "description": "d"}]))
+    jstor = handler._catalog_name_lookup("JSTOR")
+    assert jstor["held"] is False
+    assert "Psychology & Behavioral Sciences Collection" not in jstor["suggested_alternatives"]  # JSTOR's alts
+    assert jstor["suggested_alternatives"]  # has alternatives from the seed not_held
+
+
+def test_s3_read_failure_falls_back_to_seed_held(monkeypatch):
+    # If the S3 read fails (pre-first-scrape or an outage), the bundled seed held is used so the
+    # tool still works. A seed database resolves as held.
+    _use_s3_catalog(monkeypatch, _FakeCatalogS3(raise_exc=RuntimeError("no such key")))
+    assert handler._catalog_name_lookup("Opposing Viewpoints")["held"] is True
+
+
+def test_catalog_cache_avoids_repeated_s3_gets(monkeypatch):
+    fake = _FakeCatalogS3(held=[{"name": "Fresh DB", "subjects": [], "description": "d"}])
+    _use_s3_catalog(monkeypatch, fake)
+    handler._get_catalog()
+    handler._get_catalog()
+    handler._get_catalog()
+    assert fake.get_calls == 1  # cached within the TTL after the first fetch
+    # reset so later tests aren't served this cached S3 catalog
+    handler._catalog_cache["catalog"] = None
+    handler._catalog_cache["at"] = 0.0
+
+
+def test_no_catalog_bucket_uses_seed(monkeypatch):
+    # With no bucket configured (local/dev), the tool reads entirely from the bundled seed.
+    monkeypatch.setattr(handler, "CATALOG_BUCKET", None)
+    handler._catalog_cache["catalog"] = None
+    handler._catalog_cache["at"] = 0.0
+    assert handler._catalog_name_lookup("CQ Researcher")["held"] is True
+    handler._catalog_cache["catalog"] = None
+    handler._catalog_cache["at"] = 0.0

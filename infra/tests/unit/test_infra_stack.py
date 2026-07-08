@@ -415,9 +415,9 @@ def test_bare_on_demand_model_id_falls_back_to_single_foundation_model_grant():
 
 def test_widget_bucket_is_private_and_oac_ready():
     template = _template()
-    # Two S3 buckets now (widget + KB source), both fully private: all public access blocked,
+    # Three S3 buckets now (widget + KB source + catalog), all fully private: public access blocked
     # and ACLs disabled via bucket-owner-enforced ownership (the ownership OAC requires).
-    template.resource_count_is("AWS::S3::Bucket", 2)
+    template.resource_count_is("AWS::S3::Bucket", 3)
     template.has_resource_properties(
         "AWS::S3::Bucket",
         {
@@ -439,7 +439,8 @@ def test_kb_source_bucket_blocks_public_access():
     # library content, never served publicly (the KB reads it, CloudFront does not).
     template = _template()
     buckets = template.find_resources("AWS::S3::Bucket")
-    assert len(buckets) == 2, list(buckets)
+    # KB source bucket + widget bucket + catalog bucket (Phase 2b).
+    assert len(buckets) == 3, list(buckets)
     for logical_id, res in buckets.items():
         assert res["Properties"]["PublicAccessBlockConfiguration"] == {
             "BlockPublicAcls": True,
@@ -789,3 +790,92 @@ def test_query_lambda_role_can_apply_both_guardrails():
     resource = apply_stmts[0]["Resource"]
     # Two ARNs: one per guardrail (each a GetAtt token to the guardrail's ARN attribute).
     assert isinstance(resource, list) and len(resource) == 2, resource
+
+
+# --- Phase 2b: self-updating database catalog (bucket, env, IAM) ----------------------------
+
+
+def _statements_for_handler(template, handler_name):
+    """IAM policy statements attached to the execution role of the Lambda with this handler."""
+    (fn,) = template.find_resources(
+        "AWS::Lambda::Function", {"Properties": {"Handler": handler_name}}
+    ).values()
+    role_id = fn["Properties"]["Role"]["Fn::GetAtt"][0]
+    stmts = []
+    for pol in template.find_resources("AWS::IAM::Policy").values():
+        if any(r.get("Ref") == role_id for r in pol["Properties"].get("Roles", [])):
+            stmts.extend(pol["Properties"]["PolicyDocument"]["Statement"])
+    return stmts
+
+
+def _env_for_handler(template, handler_name):
+    (fn,) = template.find_resources(
+        "AWS::Lambda::Function", {"Properties": {"Handler": handler_name}}
+    ).values()
+    return fn["Properties"]["Environment"]["Variables"]
+
+
+def test_dedicated_catalog_bucket_exists():
+    # A third private bucket for the catalog, separate from the KB source bucket (so the catalog
+    # JSON is never ingested into the vector store).
+    template = _template()
+    buckets = template.find_resources("AWS::S3::Bucket")
+    assert any(lid.startswith("CatalogBucket") for lid in buckets), list(buckets)
+
+
+def test_scraper_env_wires_catalog():
+    template = _template()
+    env = _env_for_handler(template, "lambda_function.handler")
+    assert "CATALOG_BUCKET" in env  # a Ref/GetAtt to the catalog bucket
+    assert env["CATALOG_KEY"] == CONFIG["catalog"]["s3_key"]
+    assert env["CATALOG_ENRICHMENT_MODEL_ID"] == CONFIG["catalog"]["enrichment_model_id"]
+    assert env["CATALOG_MIN_DATABASES"] == str(CONFIG["catalog"]["min_databases"])
+
+
+def test_query_env_wires_catalog():
+    template = _template()
+    env = _env_for_handler(template, "handler.lambda_handler")
+    assert "CATALOG_BUCKET" in env
+    assert env["CATALOG_KEY"] == CONFIG["catalog"]["s3_key"]
+    assert env["CATALOG_CACHE_TTL_SECONDS"] == str(CONFIG["catalog"]["cache_ttl_seconds"])
+
+
+def test_scraper_role_can_rw_catalog_and_invoke_enrichment_model():
+    template = _template()
+    stmts = _statements_for_handler(template, "lambda_function.handler")
+
+    # S3 read+write scoped to the catalog object (not "*").
+    s3_stmts = [
+        s for s in stmts
+        if set(s["Action"] if isinstance(s["Action"], list) else [s["Action"]])
+        == {"s3:GetObject", "s3:PutObject"}
+    ]
+    assert len(s3_stmts) == 1, s3_stmts
+    assert "CatalogBucket" in json.dumps(s3_stmts[0]["Resource"])
+
+    # Enrichment model invoke: InvokeModel* including the Nova Pro inference profile.
+    invoke = [
+        s for s in stmts
+        if "bedrock:InvokeModel*" in (s["Action"] if isinstance(s["Action"], list) else [s["Action"]])
+    ]
+    assert invoke, stmts
+    # The enrichment model's foundation-model/inference-profile ARN is in the grant.
+    base = CONFIG["catalog"]["enrichment_model_id"].split(".", 1)[1]  # drop the "us." geo prefix
+    assert any(base in json.dumps(s["Resource"]) for s in invoke)
+
+
+def test_query_role_can_read_catalog_object():
+    template = _template()
+    stmts = _statements_for_handler(template, "handler.lambda_handler")
+    get_stmts = [
+        s for s in stmts
+        if (s["Action"] if isinstance(s["Action"], list) else [s["Action"]]) == ["s3:GetObject"]
+        and "CatalogBucket" in json.dumps(s["Resource"])
+    ]
+    assert len(get_stmts) == 1, get_stmts
+    # Read-only: no PutObject to the catalog from the query role.
+    assert not any(
+        "s3:PutObject" in (s["Action"] if isinstance(s["Action"], list) else [s["Action"]])
+        and "CatalogBucket" in json.dumps(s.get("Resource"))
+        for s in stmts
+    )

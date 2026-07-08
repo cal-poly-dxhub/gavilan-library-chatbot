@@ -2,71 +2,70 @@
 
 **What:** RAG chatbot for Gavilan College Library. Answers operational questions (hours, checkout, textbooks, "what does the library offer"), routes research questions and out-of-scope issues.
 **Client:** Gavilan College Library via Cal Poly DxHub.
-**Status:** v1 built.
-**Updated:** 2026-07-02
+**Status:** built.
+**Updated:** 2026-07-08
 
 ---
 
-## Stack (v1)
+## Stack
 
-| Layer | Choice | Why / why not |
+| Layer | Choice | Notes |
 |---|---|---|
-| Ingestion | Bedrock KB **Web Crawler** connector | Seed URLs = sponsor list; exclusion regex = blacklist; citations built in. |
-| RAG engine | **Bedrock Managed Knowledge Base** | Managed chunk/embed/store. |
-| Vector store | **OpenSearch Serverless NextGen** | Scale-to-zero kills the idle cost floor. Not S3 Vectors: crawler is OSS-locked + S3 Vectors has no IaC support yet. |
+| Ingestion | Scraper Lambda -> S3 source bucket -> Bedrock KB (S3 data source) | Curated seed URLs scraped to clean markdown; KB re-ingests each run. Weekly EventBridge schedule + one-click deploy Trigger. |
+| RAG engine | Bedrock Managed Knowledge Base | Managed chunk/embed/store. FIXED_SIZE chunking (300 tokens, 20% overlap). |
+| Vector store | Amazon S3 Vectors | `s3vectors.CfnVectorBucket` + `CfnIndex`; KB `StorageConfiguration` type `S3_VECTORS`, referenced by `IndexArn`. 1024-dim, cosine, `float32`, semantic-only. |
 | Embeddings | Titan Text Embeddings v2 (1024-dim) | Managed default. |
-| Retrieval | KB **`Retrieve`** (NOT `RetrieveAndGenerate`) | Full system-prompt control required for out-of-scope + textbook behaviors. `RetrieveAndGenerate` doesn't allow this. |
-| LLM (generation) | Bedrock-hosted Claude via **Converse** (Haiku, TBD) | All-AWS, no external OpenAI dep, clean data posture. System prompt via Converse `system` param. |
-| Orchestration/API | **Lambda + HTTP API (API Gateway v2)** | Bot backend. Out-of-scope routing + textbook flow live in the system prompt. |
-| Guardrails | **Bedrock Guardrails** (content + PII) | Content filters (Hate/Sexual HIGH, Insults/Violence/Misconduct MEDIUM, Prompt Attack HIGH input-only) + PII (anonymize contact PII, block credential/financial PII), input and output. Attached to Converse via `guardrailConfig`. |
+| Query path | Agentic `Converse` tool-use loop (Lambda) | `run_agent`: the model calls tools; the loop feeds each `toolResult` back until `end_turn` (iteration cap). System prompt via the Converse `system` param. |
+| Tools | `search_library_info`, `database_catalog` | KB retrieval for general library questions; authoritative database availability + subject listing. Routing via tool descriptions + system-prompt guidance + `toolChoice` auto. |
+| LLM (generation) | Bedrock-hosted Claude Sonnet 4.6 via Converse | Invoked through a `us.`-prefixed cross-region inference profile. |
+| Database catalog | Self-updating JSON in a dedicated S3 bucket | Scraper derives the held list from databases.php (HTML anchor parse + Sonnet enrichment for subjects/aliases); the hand-authored not-held list is a bundled seed merged at read time; the tool reads from S3 with per-container TTL caching. |
+| Orchestration/API | Lambda + HTTP API (API Gateway v2) | `POST /query`, `GET /warm`. Stage-level throttling. |
+| Guardrails | Bedrock Guardrails (content + PII) | Input screen via `ApplyGuardrail` on the bare query before the loop; output guardrail attached to every Converse call. |
 | Widget | Custom vanilla-JS embed, Shadow DOM | Self-injecting single file, reads `data-api-url` from its script tag. Shadow DOM isolates from host-site CSS. |
-| Widget hosting | **S3 + CloudFront (OAC)**, same stack | One `cdk deploy` ships backend + widget. OAC (not OAI/S3Origin). Same stack because OAC has a cross-stack cyclical-dependency problem. |
-| Config | **`config.yaml` (declarative)** | Model IDs, chunking, retrieval, guardrail settings live in config, not code. Serves eval-driven iteration. |
-| Deploy | CloudFormation / CDK (Python, L1 constructs) | Serves one-click AWS install. |
-| Logs/eval | CloudWatch (structured logs); conversation logging TBD | Guardrail assessment logged per request. Conversation logging (DynamoDB vs CloudWatch) not yet decided. |
+| Widget hosting | S3 + CloudFront (OAC), same stack | One `cdk deploy` ships backend + widget. OAC (not OAI/S3Origin). Same stack because OAC has a cross-stack cyclical-dependency problem. |
+| Config | `config.yaml` (declarative) | Model IDs, vector store, scraper, chunking, retrieval, catalog, and guardrail settings live in config, not code. |
+| Deploy | CloudFormation / CDK (Python, L1 constructs) | One-click AWS install. |
+| Logs/eval | CloudWatch (structured logs); Bedrock RAG eval harness | Guardrail assessment logged per request. |
 
 ---
 
 ## Data flow
 
-**Ingest (on sync):** Crawler -> sponsor seed URLs, child links, include/exclude regex, robots.txt -> Smart Parsing -> FIXED_SIZE chunk -> Titan v2 embed -> writes vectors into OSS NextGen. Re-sync on schedule (weekly baseline).
+**Ingest (scheduled + on deploy):** Scraper Lambda fetches the curated library seed URLs -> extracts clean markdown -> uploads to the KB source bucket -> triggers a KB ingestion job (FIXED_SIZE chunk -> Titan v2 embed -> S3 Vectors). In the same run it regenerates the database catalog from databases.php (deterministic HTML anchor parse for names/descriptions/URLs + a Sonnet call for subjects/aliases, constrained to the parsed names), validates it, and writes it to the catalog S3 bucket - keeping the last-good copy if validation fails, and never blocking the KB scrape. Weekly EventBridge schedule + one-click deploy Trigger.
 
-**Query (runtime, v1):** Widget -> API Gateway (HTTP API, POST /query) -> Lambda. Lambda does (1) KB `Retrieve` -> chunks from OSS, then (2) Bedrock `Converse` with the system prompt in the `system` param and the `<context>`-wrapped chunks + question in the message. Guardrail (attached via `guardrailConfig`) screens input before generation and output after. Response `{answer, sources[]}` returns to the widget. On guardrail intervention, the blocked message returns with empty sources.
+**Query (runtime):** Widget -> API Gateway (HTTP API, POST /query) -> Lambda. An input guardrail (`ApplyGuardrail`, source=INPUT) screens the bare query. Then `run_agent` runs the Converse tool-use loop under the system prompt: the model decides when to call `search_library_info` (KB `Retrieve`) or `database_catalog` (reads the catalog from S3), the loop executes each `toolUse` and feeds the `toolResult` back, repeating until `end_turn` (or the iteration cap). The output guardrail is attached to every Converse call. Response `{answer, sources[]}` returns to the widget: `sources` accumulate from the loop's KB retrievals (deduped by uri) plus the A-Z databases page when the catalog tool was used. On a guardrail block, the blocked message returns with empty sources.
 
 **Widget delivery:** Browser loads the host library page -> its `<script>` tag fetches `widget.js` from CloudFront (served from private S3 via OAC) -> widget injects into the page -> widget calls the API Gateway `/query` (the query flow above).
 
 ---
 
-## Decisions (evaluated, resolved)
+## Decisions (resolved)
 
-1. **`Retrieve` over `RetrieveAndGenerate`.** Full system-prompt control is required for nuanced out-of-scope and textbook behaviors.
-2. **OpenSearch NextGen over S3 Vectors.** Web Crawler is OSS-locked; S3 Vectors has no CloudFormation/CDK support yet. Future swap if that changes.
-3. **L1 `Cfn*` constructs over higher-level abstractions.** `generative-ai-cdk-constructs` Bedrock L2s deprecated; `aws-bedrock-alpha` has no KB/DataSource constructs. L1 core covers everything. `CfnIndex` eliminates a custom Lambda index-creator.
-4. **Same-stack widget hosting, OAC not OAI.** OAC is the current best practice (`S3BucketOrigin.with_origin_access_control`); `S3Origin` is deprecated. Same stack because cross-stack OAC hits a cyclical dependency.
-5. **Contextual grounding EXCLUDED from guardrails.** AWS docs state grounding does not support conversational/chatbot use cases, and it requires fragile `guardContent` message-tagging (once any guardContent block is present, grounding evaluates only tagged blocks; documented silent-failure trap). The system prompt's hard-grounding covers v1. Revisit via the standalone `ApplyGuardrail` API if eval shows the prompt isn't holding. NOTE: v2 multi-turn would move the bot fully into the grounding-unsupported use case.
-6. **WAF EXCLUDED for v1.** HTTP API (v2) cannot take WAF directly (WAF attaches only to REST API / CloudFront / ALB / AppSync); adding it would require fronting the API with a second CloudFront distribution. Threat surface is thin (no injectable DB, widget uses textContent not innerHTML, no auth, no sensitive data). The real risk (Bedrock cost-abuse) is better handled by API Gateway throttling (native, free). OPEN: confirm no compliance mandate for a WAF (Darren/sponsor); if mandated, scope the CloudFront-front-the-API work.
-7. **Behavior in the system prompt, not routing code (v1).** Textbook clarifying questions and out-of-scope handling are prompt instructions, not Lambda branches. Escalate to deterministic routing only if eval shows unreliability.
+1. **`Retrieve` via a tool, not `RetrieveAndGenerate`.** Full system-prompt control over out-of-scope and textbook behavior; the model calls Retrieve through `search_library_info`.
+2. **Two tools, model-routed.** `database_catalog` is authoritative for database availability (confirms when a named database is not held and suggests held alternatives) and subject listings; `search_library_info` handles hours/services/policies/how-to/borrowing/contact. Routing is via the tool descriptions + system-prompt guidance + `toolChoice` auto, not Lambda branches.
+3. **Self-updating catalog with a robustness guard.** The held list is derived from the site on each scrape; the hand-authored not-held list is a bundled seed merged at read time; a minimum-count/required-field guard keeps the last-good catalog rather than overwrite it with garbage.
+4. **L1 `Cfn*` constructs.** L1 core covers KB, DataSource, S3 Vectors, and guardrails; the `generative-ai-cdk-constructs` Bedrock L2s are excluded (deprecated).
+5. **Same-stack widget hosting, OAC not OAI.** `S3BucketOrigin.with_origin_access_control`; one `cdk deploy`; cross-stack OAC hits a cyclical dependency.
+6. **Contextual grounding excluded from guardrails.** Not supported for conversational chatbot use (needs fragile `guardContent` tagging); the system prompt handles grounding. The output guardrail is content-filters-only.
+7. **WAF excluded.** HTTP API v2 cannot take WAF directly; API Gateway throttling is the cost-abuse control.
 
 ---
 
 ## Open decisions
 
-1. **Region** — verify KB + Web Crawler + OSS NextGen all available in one region before provisioning.
-2. **LLM model** — Haiku leaning for FAQ scale; confirm any DxHub/sponsor preference.
-3. **Refresh cadence** — crawler re-sync frequency (weekly baseline).
-4. **Log store** — DynamoDB vs CloudWatch for conversation logging.
+1. **LLM model** — Sonnet 4.6 in use; confirm any DxHub/sponsor preference.
+2. **Refresh cadence** — weekly scrape baseline.
+3. **CORS** — `allow_origins` currently permissive; lock to the widget domain before launch.
+4. **Log store** — DynamoDB vs CloudWatch for conversation logging (deferred with multi-turn).
 
 ---
 
 ## Verified (2026-07)
 
-- **Bedrock Managed KB:** GA June 2026. Web Crawler + 5 other connectors; managed chunk/embed/store/rerank; citations; native AgentCore integration.
-- **Web Crawler connector:** seed URLs + child traversal, include/exclude regex, robots.txt, citations via `x-amz-bedrock-kb-source-uri`. **Preview. OSS-only for vector store.** "Smart Parsing" preserves HTML structure.
-- **OSS NextGen:** GA May 28 2026. Scale-to-zero after 10min idle. ~$0.24/OCU-hr (active only) + ~$0.024/GB-mo storage. Cold start ~10-30s. Old ~$350/mo Classic floor gone.
-- **S3 Vectors:** GA Dec 2025, ~90% cheaper, no idle floor. NOT crawler-compatible + no CFN/CDK yet. Future swap only.
-- **Bedrock native RAG eval (BYOI):** LLM-as-judge, scores retrieval + generation separately, environment-agnostic since GA March 2025 (bring your own inference responses). `create_evaluation_job`: required jobName/roleArn/evaluationConfig/inferenceConfig/outputDataConfig; RAG uses `precomputedRagSourceConfig` with retrieve-only or retrieve-and-generate source config. Use `referenceResponses` (expected answers), not the old `referenceContexts`. Retrieve-only metrics ContextCoverage/ContextRelevance; R&G metrics Correctness/Completeness/Faithfulness/Helpfulness/Harmfulness + citation metrics.
-- **Bedrock Guardrails:** six policy types (content filters, denied topics, word filters, PII, contextual grounding, Automated Reasoning). Content filters: Hate/Insults/Sexual/Violence/Misconduct/Prompt Attack, strength NONE/LOW/MED/HIGH. PII: block or anonymize, separate input/output actions. Attached to Converse via `guardrailConfig` (id/version/trace); blocked -> `stopReason: guardrail_intervened`. Needs `bedrock:ApplyGuardrail` alongside `InvokeModel`. Contextual grounding: NOT supported for conversational chatbot use; needs guardContent tagging. PII masking does NOT apply to invocation logs.
-- **CloudFront + S3 (CDK):** OAC via `S3BucketOrigin.with_origin_access_control` (auto-creates the OAC + bucket policy). `S3Origin`/OAI deprecated. Bucket needs Bucket-owner-enforced ownership. CloudFront slow to create/destroy (~15-30 min). Cross-stack OAC = cyclical dependency; keep bucket + distribution in one stack.
-- **Custom transformation Lambda:** runs during ingestion, controls chunking, works with managed crawler. The L2 escape hatch. `trafilatura` (boilerplate removal) runs here or in an L3 scraper. Deferred to v2 unless eval shows boilerplate hurts retrieval.
-- **DxHub framework** (`cal-poly-dxhub/generic-chatbot-framework`): mineable for config-driven pattern, guardrail config, condensing-flow idea (multi-turn context). Stale on Bedrock/vector specifics (pre-2026, S3-ingest not web-crawl). Full control is ours.
-- **Deleting a KB does NOT delete the backing OSS collection.** Manual cleanup required (`cdk destroy` handles it; deleting the KB alone does not).
+- **Bedrock Managed KB:** managed chunk/embed/store; S3 data source; citations via `x-amz-bedrock-kb-source-uri`.
+- **S3 Vectors:** `CfnVectorBucket` + `CfnIndex`; KB `StorageConfiguration` type `S3_VECTORS` is a `oneOf` referenced by `IndexArn` alone (adding `IndexName`/`VectorBucketArn` is rejected at validation). 1024-dim, cosine, `float32`; `non_filterable_metadata_keys` set at index creation for the Bedrock-internal keys, or ingestion fails on the filterable-metadata limit. Semantic search only.
+- **Agentic Converse tool-use:** request carries `toolConfig` (`toolSpec` = name/description/`inputSchema.json`); the model returns `stopReason: tool_use` with a `toolUse` block; reply with a user message carrying a `toolResult`; loop until `end_turn`. `toolChoice` auto.
+- **Bedrock Guardrails:** content filters + PII. Input screen via the standalone `ApplyGuardrail` API; output backstop via `guardrailConfig` on Converse (blocked -> `stopReason: guardrail_intervened`). Needs `bedrock:ApplyGuardrail` alongside `InvokeModel`. Contextual grounding not supported for chatbot use.
+- **Bedrock native RAG eval (BYOI):** LLM-as-judge. `create_evaluation_job` with `precomputedRagSourceConfig`; retrieve-only metrics ContextCoverage/ContextRelevance; R&G metrics Correctness/Completeness/Faithfulness/Helpfulness/Harmfulness + citation metrics. Uses `referenceResponses`.
+- **CloudFront + S3 (CDK):** OAC via `S3BucketOrigin.with_origin_access_control` (auto-creates the OAC + bucket policy). Bucket needs bucket-owner-enforced ownership. Slow to create/destroy (~15-30 min).
+- **Scraper:** `httpx` + `trafilatura` for page markdown; `extract_database_catalog` parses the databases.php HTML table by link anchor (name = anchor text, description = the rest of the cell), which stays reliable even where the page has no name/description delimiter.

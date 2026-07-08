@@ -120,6 +120,7 @@ class GavilanChatbotStack(Stack):
         retrieval_cfg = config["retrieval"]
         generation_cfg = config["generation"]
         guardrail_cfg = config["guardrail"]
+        catalog_cfg = config["catalog"]
 
         kb_name = kb_cfg["name"]
         # S3 Vectors store knobs (replaces the OpenSearch Serverless collection/index).
@@ -191,6 +192,26 @@ class GavilanChatbotStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True,
         )
+
+        # --- Database-catalog bucket (Phase 2b) ---------------------------------------
+
+        # DEDICATED private bucket for the self-updating database catalog: the scraper writes the
+        # regenerated held list here, the query Lambda reads it. Deliberately NOT the KB source
+        # bucket - everything in that bucket gets ingested into the vector store, and the catalog
+        # JSON is not KB content. Same private posture; one-click uninstall parity. The robustness
+        # guard (in the scraper) keeps the last-good object rather than overwriting with garbage,
+        # so plain last-write-wins storage (no versioning) is sufficient.
+        catalog_bucket = s3.Bucket(
+            self,
+            "CatalogBucket",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            enforce_ssl=True,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+        )
+        catalog_key = catalog_cfg["s3_key"]
 
         # --- Knowledge Base execution role --------------------------------------------
 
@@ -360,6 +381,50 @@ class GavilanChatbotStack(Stack):
                 resources=[knowledge_base.attr_knowledge_base_arn],
             )
         )
+        # Catalog bucket (Phase 2b): read the previous catalog (enrichment reuse + last-good) and
+        # write the regenerated one. Scoped to the single catalog object.
+        scraper_lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject", "s3:PutObject"],
+                resources=[catalog_bucket.arn_for_objects(catalog_key)],
+            )
+        )
+        # Enrichment model (assigns subjects/aliases). Same cross-region inference-profile grant
+        # shape the query Lambda uses for generation: InvokeModel* on the profile ARN + the
+        # foundation-model ARNs across routed regions, plus profile-metadata read. Falls back to a
+        # single foundation-model grant for a bare (non-profile) id.
+        enrichment_model_id = catalog_cfg["enrichment_model_id"]
+        _enrich_head = enrichment_model_id.split(".", 1)[0]
+        if "." in enrichment_model_id and _enrich_head in ("us", "eu", "apac", "us-gov"):
+            _enrich_base = enrichment_model_id.split(".", 1)[1]
+            scraper_lambda_role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=["bedrock:InvokeModel*"],
+                    resources=[
+                        f"arn:{self.partition}:bedrock:{self.region}:{self.account}"
+                        f":inference-profile/{enrichment_model_id}",
+                        f"arn:{self.partition}:bedrock:{self.region}"
+                        f"::foundation-model/{_enrich_base}",
+                        f"arn:{self.partition}:bedrock:*::foundation-model/{_enrich_base}",
+                    ],
+                )
+            )
+            scraper_lambda_role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=["bedrock:GetInferenceProfile", "bedrock:ListInferenceProfiles"],
+                    resources=["*"],
+                )
+            )
+        else:
+            scraper_lambda_role.add_to_policy(
+                iam.PolicyStatement(
+                    actions=["bedrock:InvokeModel"],
+                    resources=[
+                        f"arn:{self.partition}:bedrock:{self.region}"
+                        f"::foundation-model/{enrichment_model_id}"
+                    ],
+                )
+            )
 
         scraper_log_group = logs.LogGroup(
             self,
@@ -392,6 +457,11 @@ class GavilanChatbotStack(Stack):
                 "SOURCE_BUCKET": source_bucket.bucket_name,
                 "KNOWLEDGE_BASE_ID": knowledge_base.attr_knowledge_base_id,
                 "DATA_SOURCE_ID": s3_data_source.attr_data_source_id,
+                # Phase 2b catalog regeneration.
+                "CATALOG_BUCKET": catalog_bucket.bucket_name,
+                "CATALOG_KEY": catalog_key,
+                "CATALOG_ENRICHMENT_MODEL_ID": enrichment_model_id,
+                "CATALOG_MIN_DATABASES": str(catalog_cfg["min_databases"]),
             },
         )
         # Needs the KB + data source (it calls StartIngestionJob on them at runtime).
@@ -659,6 +729,14 @@ class GavilanChatbotStack(Stack):
                 ],
             )
         )
+        # Read the self-updating database catalog the scraper writes (Phase 2b). Read-only, scoped
+        # to the single catalog object.
+        query_lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject"],
+                resources=[catalog_bucket.arn_for_objects(catalog_key)],
+            )
+        )
 
         # Explicit log group so retention is bounded and it is torn down with the stack,
         # rather than the implicit never-expiring group Lambda would create on first invoke
@@ -675,10 +753,18 @@ class GavilanChatbotStack(Stack):
             "QueryFunction",
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="handler.lambda_handler",
-            # Ship only the handler and the system prompt; keep __pycache__ / stray
-            # files out of the bundle so the asset hash tracks real source changes.
+            # Ship the handler, the system prompt, and the static database catalog (under data/);
+            # keep __pycache__ / stray files out so the asset hash tracks real source changes.
+            # Re-including a nested file needs its parent dir un-excluded too, hence "!data".
             code=_lambda.Code.from_asset(
-                str(_APP_DIR), exclude=["*", "!handler.py", "!system_prompt.md"]
+                str(_APP_DIR),
+                exclude=[
+                    "*",
+                    "!handler.py",
+                    "!system_prompt.md",
+                    "!data",
+                    "!data/database_catalog.json",
+                ],
             ),
             role=query_lambda_role,
             timeout=Duration.seconds(30),
@@ -701,6 +787,11 @@ class GavilanChatbotStack(Stack):
                 "OUTPUT_GUARDRAIL_ID": output_guardrail.attr_guardrail_id,
                 "OUTPUT_GUARDRAIL_VERSION": output_guardrail_version.attr_version,
                 "GUARDRAIL_TRACE": guardrail_cfg.get("trace", "enabled"),
+                # Phase 2b: read the self-updating held catalog from S3 (bundled JSON is the seed +
+                # not-held source + fallback). Cache TTL bounds per-container staleness.
+                "CATALOG_BUCKET": catalog_bucket.bucket_name,
+                "CATALOG_KEY": catalog_key,
+                "CATALOG_CACHE_TTL_SECONDS": str(catalog_cfg["cache_ttl_seconds"]),
             },
         )
         # The Lambda queries the KB at runtime, so it must not exist before the KB.
