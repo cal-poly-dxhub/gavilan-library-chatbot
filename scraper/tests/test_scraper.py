@@ -311,3 +311,73 @@ def test_write_result_skips_failed(tmp_path):
     result = scraper.ScrapeResult(url="u", slug="s", ok=False, error="HTTP 404")
     assert scraper.write_result(result, tmp_path) is None
     assert list(tmp_path.iterdir()) == []
+
+
+# --- Phase 2b: structured database-catalog extraction --------------------------------------
+
+from pathlib import Path
+
+_DB_FIXTURE = Path(__file__).resolve().parent / "fixtures_databases.html"
+
+# Focused synthetic table exercising the tricky patterns the flattened-markdown parse got wrong.
+_SYNTH_TABLE = """
+<table>
+  <tr><td>Alphabetical List</td></tr>
+  <tr><td></td><td><a href="http://ez/login?url=foo">Foo DB</a> -- a great database</td></tr>
+  <tr><td></td><td><a href="http://ez/login?url=bar">Bar Index with Full Text</a> covers everything about bars and more</td></tr>
+  <tr><td></td><td><a href="http://ez/login?url=hs">Health Source: Consumer Edition</a> -- consumer health mags</td></tr>
+  <tr><td></td><td><a id="bazanchor"></a> <a href="http://ez/login?url=baz">Baz</a>: some stuff</td></tr>
+  <tr><td></td><td><p>Qux Series -- <br/> <a href="http://ez/login?url=q1">Q One</a>, <a href="http://ez/login?url=q2">Q Two</a></p></td></tr>
+</table>
+"""
+
+
+def test_extract_catalog_synthetic_patterns():
+    held = scraper.extract_database_catalog(_SYNTH_TABLE)
+    by_name = {h["name"]: h for h in held}
+    # Normal delimiter row.
+    assert by_name["Foo DB"]["description"] == "a great database"
+    assert by_name["Foo DB"]["url"] == "http://ez/login?url=foo"
+    # NO-delimiter row: the anchor boundary isolates the name (the markdown parse garbled this).
+    assert "Bar Index with Full Text" in by_name
+    assert by_name["Bar Index with Full Text"]["description"].startswith("covers everything")
+    # Colon INSIDE the name is preserved (split on ' -- ', not ':').
+    assert "Health Source: Consumer Edition" in by_name
+    # Empty id-only anchor is skipped; the real link is the name.
+    assert by_name["Baz"]["description"] == "some stuff"
+    # Series row: name is the leading plain text, not the first sub-link.
+    assert "Qux Series" in by_name and "Q One" not in by_name
+
+
+def test_extract_catalog_against_real_page_fixture():
+    held = scraper.extract_database_catalog(_DB_FIXTURE.read_text(encoding="utf-8"))
+    names = {h["name"] for h in held}
+    # A healthy count from the real page.
+    assert len(held) >= 40
+    assert scraper.validate_held_list(held, 30) is True
+    # Known databases, including the no-delimiter ones that garbled under the markdown parse.
+    for expected in (
+        "CQ Researcher",
+        "Opposing Viewpoints In Context",
+        "Criminal Justice Abstracts with Full Text",  # no delimiter on the page
+        "Statista.com",                                # no delimiter on the page
+        "Business Source Complete",
+    ):
+        assert expected in names, expected
+    # No garbled names (a garble folds the description into the name -> very long), and every
+    # entry has a non-empty description + url.
+    assert all(len(h["name"].split()) <= 9 for h in held), [h["name"] for h in held if len(h["name"].split()) > 9]
+    assert all(h["description"] for h in held)
+    assert all(h["url"] for h in held)
+    # Replacement-char garbage is scrubbed from descriptions.
+    assert all("�" not in h["description"] for h in held)
+
+
+def test_validate_held_list_guard():
+    good = [{"name": f"DB {i}", "description": "d"} for i in range(30)]
+    assert scraper.validate_held_list(good, 30) is True
+    assert scraper.validate_held_list(good, 40) is False          # too few
+    assert scraper.validate_held_list([], 1) is False             # empty
+    assert scraper.validate_held_list("nonsense", 1) is False     # not a list
+    assert scraper.validate_held_list([{"name": "", "description": "d"}], 1) is False   # blank name
+    assert scraper.validate_held_list([{"name": "X", "description": 5}], 1) is False    # bad desc type

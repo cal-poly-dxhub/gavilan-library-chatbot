@@ -39,6 +39,7 @@ Wiring comes from env vars set by the CDK stack.
 import base64
 import json
 import os
+import time
 from pathlib import Path
 
 import boto3
@@ -124,23 +125,38 @@ _WARM_QUERY = "library hours"
 _PROMPT_PATH = Path(__file__).resolve().parent / "system_prompt.md"
 SYSTEM_PROMPT = _PROMPT_PATH.read_text(encoding="utf-8").strip()
 
-# Static database catalog, bundled with the Lambda (app/data/database_catalog.json). Read once at
-# cold start. Phase 2a: hand-maintained from the scraped databases.php; Phase 2b will regenerate it
-# from the scraper. Shape: {catalog_url, default_alternatives, held:[{name,subjects,description,
-# aliases}], not_held:[{name,aliases,suggested_alternatives}]}.
-_CATALOG_PATH = Path(__file__).resolve().parent / "data" / "database_catalog.json"
-CATALOG = json.loads(_CATALOG_PATH.read_text(encoding="utf-8"))
+# Database catalog (Phase 2b: self-updating).
+#   - The HELD list is regenerated weekly by the scraper and written to S3; this Lambda reads the
+#     fresh copy from CATALOG_BUCKET/CATALOG_KEY at query time (cached per container, see below).
+#   - The bundled app/data/database_catalog.json is the SEED: it provides the hand-authored NOT_HELD
+#     list + catalog_url + default_alternatives (merged in at read time, since absence can't be
+#     scraped), AND a fallback HELD list used before the first scrape or if the S3 read fails.
+# Shape (both S3 and seed): {catalog_url, default_alternatives, held:[{name,subjects,description,
+# aliases}], not_held:[{name,aliases,suggested_alternatives}]}. The S3 object carries only `held`.
+_SEED_CATALOG_PATH = Path(__file__).resolve().parent / "data" / "database_catalog.json"
+_SEED_CATALOG = json.loads(_SEED_CATALOG_PATH.read_text(encoding="utf-8"))
+
+CATALOG_BUCKET = os.environ.get("CATALOG_BUCKET")
+CATALOG_KEY = os.environ.get("CATALOG_KEY", "database_catalog.json")
+# Per-container cache TTL. The catalog changes at most weekly, so serving a copy up to this many
+# seconds stale (default 15 min) is fine and avoids an S3 GET on every query; the next lookup after
+# the TTL re-fetches, so weekly updates are picked up quickly without a redeploy. A cold container
+# always fetches fresh.
+CATALOG_CACHE_TTL_SECONDS = int(os.environ.get("CATALOG_CACHE_TTL_SECONDS", "900"))
 
 # A catalog answer isn't a scraped-page passage, so it never adds a KB `sources` excerpt. Instead a
 # substantive catalog lookup contributes ONE synthetic source: the library's A-Z database page,
 # where the data comes from and where the user can browse/verify. Deduped like any other source.
 _CATALOG_SOURCE = {
-    "uri": CATALOG.get("catalog_url", ""),
+    "uri": _SEED_CATALOG.get("catalog_url", ""),
     "excerpt": "Gavilan Library A-Z database list",
 }
 
 _agent_runtime = None
 _bedrock_runtime = None
+_catalog_s3 = None
+# Cached merged catalog: {"catalog": <dict>, "at": <monotonic seconds>}. None until first load.
+_catalog_cache = {"catalog": None, "at": 0.0}
 
 
 def _agent_client():
@@ -155,6 +171,48 @@ def _bedrock_client():
     if _bedrock_runtime is None:
         _bedrock_runtime = boto3.client("bedrock-runtime", region_name=REGION)
     return _bedrock_runtime
+
+
+def _catalog_s3_client():
+    global _catalog_s3
+    if _catalog_s3 is None:
+        _catalog_s3 = boto3.client("s3", region_name=REGION)
+    return _catalog_s3
+
+
+def _read_s3_held():
+    """The fresh held list the scraper wrote to S3, or None if unavailable (no bucket configured,
+    object missing before the first scrape, or a read error). None -> caller falls back to the
+    bundled seed held list, so the tool always works."""
+    if not CATALOG_BUCKET:
+        return None
+    try:
+        obj = _catalog_s3_client().get_object(Bucket=CATALOG_BUCKET, Key=CATALOG_KEY)
+        held = json.loads(obj["Body"].read()).get("held")
+        return held if isinstance(held, list) and held else None
+    except Exception as exc:  # noqa: BLE001 - degrade to the bundled seed, never hard-fail a query
+        print(json.dumps({"event": "catalog_s3_read_failed", "error": f"{type(exc).__name__}: {exc}"}))
+        return None
+
+
+def _get_catalog():
+    """The merged catalog the tool reads: the hand-authored not_held + catalog_url +
+    default_alternatives from the bundled seed, with the HELD list from S3 (falling back to the
+    seed's held if S3 is unavailable). Cached per container for CATALOG_CACHE_TTL_SECONDS so a
+    warm container doesn't GET S3 on every query but still picks up the weekly refresh."""
+    now = time.monotonic()
+    if _catalog_cache["catalog"] is not None and (now - _catalog_cache["at"]) < CATALOG_CACHE_TTL_SECONDS:
+        return _catalog_cache["catalog"]
+    held = _read_s3_held()
+    catalog = {
+        "catalog_url": _SEED_CATALOG.get("catalog_url", ""),
+        "default_alternatives": _SEED_CATALOG.get("default_alternatives", []),
+        "held": held if held is not None else _SEED_CATALOG.get("held", []),
+        "not_held": _SEED_CATALOG.get("not_held", []),
+    }
+    _catalog_cache["catalog"] = catalog
+    _catalog_cache["at"] = now
+    return catalog
 
 
 def _extract_source(result):
@@ -313,8 +371,9 @@ def _catalog_name_lookup(value):
     """Authoritatively answer whether a named database is held. Returns structured JSON (the model
     writes the prose). Held -> {held:true,...}; known-absent -> {held:false, suggested_alternatives};
     unknown -> {held:false, not in catalog, generic alternatives}."""
+    catalog = _get_catalog()
     query_norm = _norm(value)
-    for db in CATALOG.get("held", []):
+    for db in catalog.get("held", []):
         if _name_matches(query_norm, db["name"], db.get("aliases")):
             return {
                 "held": True,
@@ -322,7 +381,7 @@ def _catalog_name_lookup(value):
                 "subjects": db.get("subjects", []),
                 "description": db.get("description", ""),
             }
-    for db in CATALOG.get("not_held", []):
+    for db in catalog.get("not_held", []):
         if _name_matches(query_norm, db["name"], db.get("aliases")):
             return {
                 "held": False,
@@ -334,7 +393,7 @@ def _catalog_name_lookup(value):
     return {
         "held": False,
         "name": value,
-        "suggested_alternatives": CATALOG.get("default_alternatives", []),
+        "suggested_alternatives": catalog.get("default_alternatives", []),
         "note": "This database was not found in the library's catalog.",
     }
 
@@ -345,7 +404,7 @@ def _catalog_subject_lookup(value):
     description}], note?}."""
     query_norm = _norm(value)
     matches = []
-    for db in CATALOG.get("held", []):
+    for db in _get_catalog().get("held", []):
         for subject in db.get("subjects", []):
             sub = _norm(subject)
             if query_norm == sub or query_norm in sub or sub in query_norm:

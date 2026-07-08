@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html as _htmllib
 import json
 import logging
 import re
@@ -52,7 +53,12 @@ _HASH_LEN = 8
 
 @dataclass
 class ScrapeResult:
-    """Outcome of scraping one URL. `ok` gates whether markdown/metadata are populated."""
+    """Outcome of scraping one URL. `ok` gates whether markdown/metadata are populated.
+
+    `html` is the raw fetched HTML, kept so downstream steps that need STRUCTURE (e.g. the
+    database-catalog extraction on databases.php) can parse the real markup instead of the
+    boilerplate-stripped, table-flattened markdown the KB uses. It is transient (never written to
+    disk by write_result); only in-process consumers read it."""
 
     url: str
     slug: str
@@ -61,6 +67,7 @@ class ScrapeResult:
     markdown: Optional[str] = None
     metadata: Optional[dict] = None
     error: Optional[str] = None
+    html: Optional[str] = None
 
 
 def slugify_url(url: str) -> str:
@@ -189,6 +196,109 @@ def extract_markdown(html: str, url: Optional[str] = None) -> tuple[Optional[str
     return _scrub_replacement_chars(_extract_title(html)), markdown
 
 
+# --- Structured database-catalog extraction (databases.php) --------------------------------
+#
+# The KB pipeline above flattens tables/links to prose, which DESTROYS the structure we need for
+# the database catalog: it collapses `<a>Name</a> -- description` to `Name -- description`, and
+# some rows have NO name/description delimiter at all, so a text split garbles them. So the
+# catalog extraction works on the RAW HTML instead: in the databases.php A-Z table, each database
+# name is the anchor TEXT of its access link, which is an explicit boundary - reliable even with
+# no delimiter. Names + descriptions + URLs come out deterministically here; SUBJECTS and ALIASES
+# are added by a separate model-enrichment step in the Lambda (they require judgment the page's
+# structure can't provide). This function is pure (no network / AWS), so it is unit-testable.
+
+
+def _norm_db_name(text: Optional[str]) -> str:
+    """Normalize a database name for de-duplication/matching: lowercase alnum tokens."""
+    return " ".join("".join(c if c.isalnum() else " " for c in (text or "").lower()).split())
+
+
+def _html_to_text(fragment: str) -> str:
+    """Strip tags, unescape entities, drop nbsp, scrub replacement-char garbage, collapse space."""
+    text = re.sub(r"<[^>]+>", " ", fragment)
+    text = _htmllib.unescape(text).replace("\xa0", " ")
+    text = _scrub_replacement_chars(text) or ""
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _strip_leading_separator(text: str) -> str:
+    """Drop a leading name/description separator ('--', en-dash, '-', ':') + surrounding space."""
+    return re.sub(r"^\s*(?:--|–|-|:)\s*", "", text).strip()
+
+
+def extract_database_catalog(html_text: Optional[str]) -> list[dict]:
+    """Parse the databases.php A-Z table into a list of {name, description, url} (deterministic).
+
+    Per row: the database NAME is the text of the first anchor that has a real (non-'#') href;
+    the URL is that href; the DESCRIPTION is the rest of the cell after the name. If a row has
+    plain-text before that first link (the 'A to Z ... Series' pattern, where the series name is
+    text and the links are its sub-titles), that leading text is used as the name instead.
+    Returns [] if no table is found (caller's validation treats that as a failed extraction).
+    """
+    if not html_text:
+        return []
+    table_match = re.search(r"<table\b.*?</table>", html_text, re.S | re.I)
+    if not table_match:
+        return []
+
+    held: list[dict] = []
+    seen: set[str] = set()
+    for row in re.findall(r"<tr\b.*?</tr>", table_match.group(0), re.S | re.I):
+        cells = re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", row, re.S | re.I)
+        if not cells:
+            continue
+        cell = cells[-1]  # the content cell (a leading spacer cell precedes it)
+
+        link = None  # (match, anchor_text, href) for the first real database link
+        for a in re.finditer(r"<a\b([^>]*)>(.*?)</a>", cell, re.S | re.I):
+            inner = _html_to_text(a.group(2))
+            href_match = re.search(r'href\s*=\s*["\']([^"\']+)["\']', a.group(1))
+            href = href_match.group(1) if href_match else ""
+            if inner and href and not href.lstrip().startswith("#"):
+                link = (a, inner, _htmllib.unescape(href))
+                break
+        if link is None:
+            continue
+        anchor, link_text, url = link
+
+        # Leading plain text before the link -> the "series" name pattern; else the link text.
+        pre = re.sub(r"[\s\-–:]+$", "", _html_to_text(cell[: anchor.start()])).strip()
+        name = pre if pre else link_text
+
+        # Description = the cell text following the name.
+        full = _html_to_text(cell)
+        idx = full.find(name)
+        description = full[idx + len(name):] if idx != -1 else full
+        description = _strip_leading_separator(description)
+
+        key = _norm_db_name(name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        held.append({"name": name, "description": description, "url": url})
+    return held
+
+
+def validate_held_list(held, min_expected: int) -> bool:
+    """Robustness guard: is an extracted/enriched held list plausible enough to publish?
+
+    Requires a list of at least `min_expected` entries, each a dict with a non-empty string name
+    and a string description. A broken/restructured page (0 rows, or a garbled parse) fails this,
+    and the caller keeps the last-good catalog rather than overwriting it with garbage.
+    """
+    if not isinstance(held, list) or len(held) < min_expected:
+        return False
+    for entry in held:
+        if not isinstance(entry, dict):
+            return False
+        name = entry.get("name")
+        if not (isinstance(name, str) and name.strip()):
+            return False
+        if not isinstance(entry.get("description", ""), str):
+            return False
+    return True
+
+
 def scrape_url(url: str, client: httpx.Client) -> ScrapeResult:
     """Fetch + extract one URL. Never raises: fetch/extract failures become ok=False results."""
     slug = slugify_url(url)
@@ -216,7 +326,8 @@ def scrape_url(url: str, client: httpx.Client) -> ScrapeResult:
 
     metadata = build_metadata(url, str(response.url), title, markdown)
     return ScrapeResult(
-        url=url, slug=slug, ok=True, title=title, markdown=markdown, metadata=metadata
+        url=url, slug=slug, ok=True, title=title, markdown=markdown, metadata=metadata,
+        html=response.text,
     )
 
 

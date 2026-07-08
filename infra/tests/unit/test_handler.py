@@ -1370,3 +1370,91 @@ def test_both_tools_advertised_with_differentiated_descriptions(monkeypatch):
     assert set(cat_schema["properties"]) == {"query_type", "value"}
     assert cat_schema["properties"]["query_type"]["enum"] == ["name", "subject"]
     assert cat_schema["required"] == ["query_type", "value"]
+
+
+# --- Phase 2b: catalog read from S3 (with seed fallback + not-held merge) -------------------
+
+
+class _FakeBody:
+    def __init__(self, data):
+        self._data = data
+
+    def read(self):
+        return self._data
+
+
+class _FakeCatalogS3:
+    """Stand-in for the S3 client the catalog tool reads its held list from."""
+
+    def __init__(self, held=None, raise_exc=None):
+        self._held = held
+        self._raise = raise_exc
+        self.get_calls = 0
+
+    def get_object(self, Bucket, Key):
+        self.get_calls += 1
+        if self._raise is not None:
+            raise self._raise
+        return {"Body": _FakeBody(json.dumps({"held": self._held}).encode("utf-8"))}
+
+
+def _use_s3_catalog(monkeypatch, fake):
+    monkeypatch.setattr(handler, "CATALOG_BUCKET", "cat-bucket")
+    monkeypatch.setattr(handler, "_catalog_s3_client", lambda: fake)
+    handler._catalog_cache["catalog"] = None
+    handler._catalog_cache["at"] = 0.0
+
+
+def test_catalog_held_is_read_from_s3(monkeypatch):
+    # The held list comes from the scraper-written S3 object, not the bundled seed.
+    fake = _FakeCatalogS3(held=[
+        {"name": "Fresh DB", "subjects": ["freshtopic"], "description": "brand new", "aliases": ["FDB"]}
+    ])
+    _use_s3_catalog(monkeypatch, fake)
+
+    result = handler._catalog_name_lookup("Fresh DB")
+    assert result["held"] is True and result["name"] == "Fresh DB"
+    # Alias from S3 held matches too.
+    assert handler._catalog_name_lookup("FDB")["held"] is True
+    # Subject lookup uses the S3 held subjects.
+    subj = handler._catalog_subject_lookup("freshtopic")
+    assert {d["name"] for d in subj["databases"]} == {"Fresh DB"}
+
+
+def test_not_held_survives_from_seed_when_held_comes_from_s3(monkeypatch):
+    # The scraper only writes `held`; the hand-authored not_held stays in the bundled seed and is
+    # merged at read time - so "do you have JSTOR?" still returns not-held + alternatives.
+    _use_s3_catalog(monkeypatch, _FakeCatalogS3(held=[{"name": "Fresh DB", "subjects": [], "description": "d"}]))
+    jstor = handler._catalog_name_lookup("JSTOR")
+    assert jstor["held"] is False
+    assert "Psychology & Behavioral Sciences Collection" not in jstor["suggested_alternatives"]  # JSTOR's alts
+    assert jstor["suggested_alternatives"]  # has alternatives from the seed not_held
+
+
+def test_s3_read_failure_falls_back_to_seed_held(monkeypatch):
+    # If the S3 read fails (pre-first-scrape or an outage), the bundled seed held is used so the
+    # tool still works. A seed database resolves as held.
+    _use_s3_catalog(monkeypatch, _FakeCatalogS3(raise_exc=RuntimeError("no such key")))
+    assert handler._catalog_name_lookup("Opposing Viewpoints")["held"] is True
+
+
+def test_catalog_cache_avoids_repeated_s3_gets(monkeypatch):
+    fake = _FakeCatalogS3(held=[{"name": "Fresh DB", "subjects": [], "description": "d"}])
+    _use_s3_catalog(monkeypatch, fake)
+    handler._get_catalog()
+    handler._get_catalog()
+    handler._get_catalog()
+    assert fake.get_calls == 1  # cached within the TTL after the first fetch
+    # reset so later tests aren't served this cached S3 catalog
+    handler._catalog_cache["catalog"] = None
+    handler._catalog_cache["at"] = 0.0
+
+
+def test_no_catalog_bucket_uses_seed(monkeypatch):
+    # With no bucket configured (local/dev), the tool reads entirely from the bundled seed.
+    monkeypatch.setattr(handler, "CATALOG_BUCKET", None)
+    handler._catalog_cache["catalog"] = None
+    handler._catalog_cache["at"] = 0.0
+    assert handler._catalog_name_lookup("CQ Researcher")["held"] is True
+    handler._catalog_cache["catalog"] = None
+    handler._catalog_cache["at"] = 0.0

@@ -125,6 +125,31 @@ generation:
   max_tokens: 600
   temperature: 0.2
 
+# --- Database catalog (Phase 2b: self-updating) ---
+#
+# The database_catalog tool's HELD list is regenerated from databases.php on every scrape: the
+# scraper parses the A-Z table (deterministic names/descriptions/URLs) then a model enriches each
+# database with subjects + aliases, and writes the result to S3. The agent reads that fresh copy.
+# The hand-authored NOT-HELD list stays in the bundled app/data/database_catalog.json (absence
+# can't be scraped) and is merged in at read time.
+catalog:
+  # S3 object key for the regenerated held catalog (in the dedicated catalog bucket the stack
+  # creates). The bucket name is wired to both Lambdas as an env var by the stack.
+  s3_key: database_catalog.json
+  # Model that assigns subjects + aliases to each parsed database. Runs once per weekly scrape on
+  # ~one page, and only for newly-added databases, so cost is negligible. A live dry-run showed
+  # Sonnet 4.6 produces high-quality subjects AND aliases (e.g. "EBSCO", "OVIC", "PBSC"), matching
+  # the hand-built catalog; cheaper models gave good subjects but almost no aliases, which would
+  # break name-matching like "do you have EBSCO?". So use Sonnet.
+  enrichment_model_id: us.anthropic.claude-sonnet-4-6
+  # Robustness guard: the smallest plausible number of databases a good extraction yields. If a
+  # scrape parses fewer (page broken/restructured), the scraper KEEPS the last-good catalog instead
+  # of overwriting it. The real page currently lists ~46; 30 leaves headroom without accepting junk.
+  min_databases: 30
+  # Per-container cache TTL (seconds) for the agent's S3 read of the catalog. Weekly-changing data,
+  # so 15 min stale is fine and avoids an S3 GET per query.
+  cache_ttl_seconds: 900
+
 # --- Bedrock Guardrails ---
 #
 # TWO guardrails are built from this config:
