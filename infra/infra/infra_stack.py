@@ -675,10 +675,18 @@ class GavilanChatbotStack(Stack):
             "QueryFunction",
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="handler.lambda_handler",
-            # Ship only the handler and the system prompt; keep __pycache__ / stray
-            # files out of the bundle so the asset hash tracks real source changes.
+            # Ship the handler, the system prompt, and the static database catalog (under data/);
+            # keep __pycache__ / stray files out so the asset hash tracks real source changes.
+            # Re-including a nested file needs its parent dir un-excluded too, hence "!data".
             code=_lambda.Code.from_asset(
-                str(_APP_DIR), exclude=["*", "!handler.py", "!system_prompt.md"]
+                str(_APP_DIR),
+                exclude=[
+                    "*",
+                    "!handler.py",
+                    "!system_prompt.md",
+                    "!data",
+                    "!data/database_catalog.json",
+                ],
             ),
             role=query_lambda_role,
             timeout=Duration.seconds(30),

@@ -331,10 +331,11 @@ def test_tool_result_fed_back_to_model_with_passages_and_sources(monkeypatch):
 
     # Two converse calls: the tool request, then the final answer.
     assert len(bedrock.converse_calls) == 2
-    # The first call advertised exactly the one search tool.
-    tools = bedrock.converse_calls[0]["toolConfig"]["tools"]
-    assert len(tools) == 1
-    assert tools[0]["toolSpec"]["name"] == "search_library_info"
+    # The toolConfig advertises both tools; the search tool is present.
+    tool_names = {
+        t["toolSpec"]["name"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]
+    }
+    assert tool_names == {"search_library_info", "database_catalog"}
     # The initial user message is the bare question (not a context-wrapped prompt).
     assert _user_text(bedrock) == "What are the library hours?"
     # The second call's messages carry the assistant tool_use turn AND a user toolResult.
@@ -1143,3 +1144,229 @@ def test_unknown_tool_request_returns_error_tool_result(monkeypatch):
     ][0]
     assert tr["status"] == "error"
     assert "Unknown tool" in tr["content"][0]["json"]["error"]
+
+
+# --- Phase 2a: database_catalog tool -------------------------------------------
+
+
+CATALOG_TOOL = "database_catalog"
+
+
+def catalog_tool_use_turn(query_type="name", value="JSTOR", *, tool_use_id="tu-1"):
+    """A Converse response asking to call database_catalog."""
+    return {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "toolUse": {
+                            "toolUseId": tool_use_id,
+                            "name": CATALOG_TOOL,
+                            "input": {"query_type": query_type, "value": value},
+                        }
+                    }
+                ],
+            }
+        },
+        "stopReason": "tool_use",
+    }
+
+
+def _catalog_tool_results(bedrock, call_index=1):
+    """The toolResult json blocks carried into a later converse call's messages."""
+    return [
+        b["toolResult"]
+        for m in bedrock.converse_calls[call_index]["messages"]
+        for b in m.get("content", [])
+        if "toolResult" in b
+    ]
+
+
+# -- Catalog lookup functions (called directly; no loop) --
+
+
+def test_catalog_name_lookup_held_database():
+    result = handler._catalog_name_lookup("Opposing Viewpoints")
+    assert result["held"] is True
+    assert result["name"] == "Opposing Viewpoints In Context"
+    assert "controversial issues" in result["subjects"]
+
+
+def test_catalog_name_lookup_not_held_jstor_suggests_alternatives():
+    result = handler._catalog_name_lookup("JSTOR")
+    assert result["held"] is False
+    assert result["name"] == "JSTOR"
+    # A real held alternative is suggested.
+    assert "EbscoHost Core Search" in result["suggested_alternatives"]
+
+
+def test_catalog_name_lookup_psycinfo_alias_maps_to_held_neighbor():
+    # "PsychINFO" (a common misspelling / alias) resolves to the not-held PsycINFO entry, whose
+    # alternative is the held Psychology & Behavioral Sciences Collection.
+    result = handler._catalog_name_lookup("PsychINFO")
+    assert result["held"] is False
+    assert result["name"] == "PsycINFO"
+    assert result["suggested_alternatives"] == ["Psychology & Behavioral Sciences Collection"]
+
+
+def test_catalog_name_lookup_alias_matches_held_database():
+    # "EBSCO" is an alias of EbscoHost Core Search.
+    result = handler._catalog_name_lookup("EBSCO")
+    assert result["held"] is True
+    assert result["name"] == "EbscoHost Core Search"
+
+
+def test_catalog_name_lookup_unknown_is_authoritatively_not_held():
+    result = handler._catalog_name_lookup("Totally Made Up Database 9000")
+    assert result["held"] is False
+    assert "not found" in result["note"].lower()
+    # Falls back to the catalog's default alternative rather than a curated one.
+    assert result["suggested_alternatives"] == ["EbscoHost Core Search"]
+
+
+def test_catalog_subject_lookup_business_returns_business_databases():
+    result = handler._catalog_subject_lookup("business")
+    names = {db["name"] for db in result["databases"]}
+    assert "Business Source Complete" in names
+    assert "Statista.com" in names
+
+
+def test_catalog_subject_lookup_psychology_returns_the_psych_collection():
+    result = handler._catalog_subject_lookup("psychology")
+    names = {db["name"] for db in result["databases"]}
+    assert "Psychology & Behavioral Sciences Collection" in names
+
+
+def test_catalog_subject_lookup_unknown_subject_is_empty_with_note():
+    result = handler._catalog_subject_lookup("underwater basket weaving")
+    assert result["databases"] == []
+    assert "note" in result
+
+
+def test_run_catalog_tool_dispatches_name_vs_subject_and_bad_input():
+    name_res, src = handler._run_catalog_tool({"query_type": "name", "value": "JSTOR"})
+    assert name_res["held"] is False and src == handler._CATALOG_SOURCE
+    subj_res, src2 = handler._run_catalog_tool({"query_type": "subject", "value": "history"})
+    assert "databases" in subj_res and src2 == handler._CATALOG_SOURCE
+    # Missing value -> error result, and NO synthetic source contributed.
+    err, src3 = handler._run_catalog_tool({"query_type": "name", "value": ""})
+    assert "error" in err and src3 is None
+
+
+# -- Catalog tool inside the agent loop --
+
+
+def test_agent_routes_named_database_query_to_catalog_not_search(monkeypatch):
+    # The model requests database_catalog for "do you have JSTOR?"; the KB search tool is NOT run.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            catalog_tool_use_turn("name", "JSTOR"),
+            end_turn("We do not have JSTOR, but you can try EbscoHost Core Search."),
+        ]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "do you have JSTOR?"})), None)
+
+    body = json.loads(resp["body"])
+    assert body["answer"].startswith("We do not have JSTOR")
+    # KB retrieval never ran (catalog handled it).
+    assert agent.calls == []
+    # The catalog toolResult fed back reports not-held.
+    (tr,) = _catalog_tool_results(bedrock)
+    assert tr["status"] == "success"
+    assert tr["content"][0]["json"]["held"] is False
+
+
+def test_catalog_answer_contributes_synthetic_databases_source(monkeypatch):
+    # A catalog answer has no scraped-page passage, so its source is the A-Z databases page.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(
+        converse_script=[catalog_tool_use_turn("subject", "business"), end_turn("Here you go.")]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "what databases for business?"})), None
+    )
+
+    body = json.loads(resp["body"])
+    assert body["sources"] == [handler._CATALOG_SOURCE]
+    assert body["sources"][0]["uri"].endswith("databases.php")
+
+
+def test_catalog_and_search_sources_merge_and_dedupe(monkeypatch):
+    # Model uses BOTH tools: search (KB passages) + catalog (synthetic source). Sources merge.
+    agent = FakeAgentRuntime()  # default two KB chunks
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            tool_use_turn(query="library hours", tool_use_id="tu-1"),
+            catalog_tool_use_turn("name", "Opposing Viewpoints", tool_use_id="tu-2"),
+            end_turn("Combined answer."),
+        ]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours and databases"})), None)
+
+    uris = [s["uri"] for s in json.loads(resp["body"])["sources"]]
+    # Two KB sources + one catalog source, no duplicates.
+    assert "https://gav.edu/library/hours" in uris
+    assert "https://gav.edu/library/borrow" in uris
+    assert handler._CATALOG_SOURCE["uri"] in uris
+    assert len(uris) == len(set(uris)) == 3
+
+
+def test_catalog_source_deduped_across_multiple_catalog_calls(monkeypatch):
+    # Two catalog calls contribute only ONE synthetic databases source.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            catalog_tool_use_turn("name", "JSTOR", tool_use_id="tu-1"),
+            catalog_tool_use_turn("name", "PsycINFO", tool_use_id="tu-2"),
+            end_turn("Neither is held."),
+        ]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "jstor and psycinfo?"})), None)
+    assert json.loads(resp["body"])["sources"] == [handler._CATALOG_SOURCE]
+
+
+def test_guardrail_block_drops_catalog_source(monkeypatch):
+    # A guardrail block after a catalog call returns the block message with NO sources.
+    agent = FakeAgentRuntime()
+    blocked = "I'm not able to provide a response to that."
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            catalog_tool_use_turn("name", "JSTOR"),
+            {
+                "output": {"message": {"role": "assistant", "content": [{"text": blocked}]}},
+                "stopReason": "guardrail_intervened",
+            },
+        ]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "x"})), None)
+    body = json.loads(resp["body"])
+    assert body["answer"] == blocked
+    assert body["sources"] == []
+
+
+def test_both_tools_advertised_with_differentiated_descriptions(monkeypatch):
+    # The toolConfig carries both tools, and the catalog input schema uses query_type/value.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("hi")])
+    _wire(monkeypatch, agent, bedrock)
+
+    handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hi"})), None)
+
+    tools = {t["toolSpec"]["name"]: t["toolSpec"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]}
+    assert set(tools) == {"search_library_info", "database_catalog"}
+    cat_schema = tools["database_catalog"]["inputSchema"]["json"]
+    assert set(cat_schema["properties"]) == {"query_type", "value"}
+    assert cat_schema["properties"]["query_type"]["enum"] == ["name", "subject"]
+    assert cat_schema["required"] == ["query_type", "value"]
