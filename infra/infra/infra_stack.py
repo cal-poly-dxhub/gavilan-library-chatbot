@@ -1,14 +1,13 @@
 """Gavilan Library Chatbot infrastructure stack.
 
 Phase 0/1 foundation, all L1 Cfn* from aws-cdk-lib core (see docs/architecture.md).
-This stack stands up the full vector store, the Bedrock Knowledge Base, and its Web
-Crawler data source:
+This stack stands up the full vector store, the Bedrock Knowledge Base, and its S3
+data source:
 
-  encryption policy + network policy  ->  OpenSearch Serverless collection
-  KB execution role + data access policy
-  vector index (knn_vector, Titan v2 = 1024 dims)
-  Bedrock Knowledge Base (VECTOR, OpenSearch Serverless storage)
-  Web Crawler data source (type WEB, FIXED_SIZE chunking)
+  S3 Vectors bucket + vector index (dimension 1024 = Titan v2, cosine, float32)
+  KB execution role (embedding invoke + S3 source read + s3vectors data-plane)
+  Bedrock Knowledge Base (VECTOR, S3 Vectors storage)
+  S3 data source (type S3, FIXED_SIZE chunking) + scraper Lambda that fills it
   query-path Lambda (own role) + HTTP API (API Gateway v2), POST /query
   widget hosting: private S3 bucket + CloudFront (OAC) + BucketDeployment(widget.js)
 
@@ -28,7 +27,6 @@ from aws_cdk import (
     AssetHashType,
     BundlingOptions,
     CfnOutput,
-    DefaultStackSynthesizer,
     Duration,
     ILocalBundling,
     RemovalPolicy,
@@ -43,9 +41,9 @@ from aws_cdk import (
     aws_iam as iam,
     aws_lambda as _lambda,
     aws_logs as logs,
-    aws_opensearchserverless as oss,
     aws_s3 as s3,
     aws_s3_deployment as s3deploy,
+    aws_s3vectors as s3vectors,
     triggers,
 )
 from constructs import Construct
@@ -115,8 +113,6 @@ class GavilanChatbotStack(Stack):
 
         kb_cfg = config["knowledge_base"]
         vs_cfg = config["vector_store"]
-        fields = vs_cfg["fields"]
-        hnsw = vs_cfg["hnsw"]
         chunking_cfg = config["chunking"]
         scraper_cfg = config["scraper"]
         http_api_cfg = config["http_api"]
@@ -126,75 +122,58 @@ class GavilanChatbotStack(Stack):
         guardrail_cfg = config["guardrail"]
 
         kb_name = kb_cfg["name"]
-        collection_name = vs_cfg["collection_name"]
+        # S3 Vectors store knobs (replaces the OpenSearch Serverless collection/index).
+        vector_bucket_name = vs_cfg["vector_bucket_name"]
         index_name = vs_cfg["index_name"]
-        vector_field = fields["vector"]
-        text_field = fields["text"]
-        metadata_field = fields["metadata"]
+        data_type = vs_cfg["data_type"]
+        distance_metric = vs_cfg["distance_metric"]
+        non_filterable_keys = vs_cfg["non_filterable_metadata_keys"]
 
         embedding_model_arn = (
             f"arn:{self.partition}:bedrock:{self.region}"
             f"::foundation-model/{kb_cfg['embedding_model_id']}"
         )
 
-        # --- Security policies for the collection -------------------------------------
-
-        # Encryption: a VECTORSEARCH collection is invalid without one. AWS-owned key for
-        # v1; revisit if the sponsor requires a customer-managed KMS key.
-        encryption_policy = oss.CfnSecurityPolicy(
+        # --- Vector store: Amazon S3 Vectors ------------------------------------------
+        #
+        # S3 Vectors replaces the OpenSearch Serverless collection/index as the KB vector store:
+        # near-zero cost, no cluster / VPC / FGAC / security policies. SEMANTIC-SEARCH-ONLY (no
+        # hybrid) - the accepted tradeoff for the sponsor's cheap/light requirement; keyword
+        # coverage is added later by agentifying the bot with a structured lookup tool (out of
+        # scope here). Encryption defaults to SSE-S3 (AWS-managed keys); revisit if the sponsor
+        # requires a customer-managed KMS key.
+        vector_bucket = s3vectors.CfnVectorBucket(
             self,
-            "CollectionEncryptionPolicy",
-            name=f"{collection_name}-enc",
-            type="encryption",
-            policy=json.dumps(
-                {
-                    "Rules": [
-                        {
-                            "ResourceType": "collection",
-                            "Resource": [f"collection/{collection_name}"],
-                        }
-                    ],
-                    "AWSOwnedKey": True,
-                }
+            "VectorBucket",
+            vector_bucket_name=vector_bucket_name,
+        )
+
+        # The vector index.
+        #   - dimension MUST equal the embedding model's output (Titan Embed Text v2 = 1024) or
+        #     ingestion fails; sourced from knowledge_base.vector_dimension (single source of truth).
+        #   - data_type float32 is the only supported type.
+        #   - distance_metric cosine: Titan v2 embeddings are normalized, so cosine ranks
+        #     equivalently to the old OpenSearch l2.
+        #   - non_filterable_metadata_keys is a KNOWN TRAP and is IMMUTABLE after creation:
+        #     Bedrock's internal metadata keys are filterable by default and blow S3 Vectors'
+        #     ~1 KB / 35-key filterable-metadata limit, failing every ingestion with
+        #     ValidationException. Marking them non-filterable is the documented fix. Retrieval
+        #     never filters on these keys, so it costs nothing. (Max 10 non-filterable keys; 5 used.)
+        vector_index = s3vectors.CfnIndex(
+            self,
+            "VectorIndex",
+            vector_bucket_name=vector_bucket_name,
+            index_name=index_name,
+            data_type=data_type,
+            dimension=kb_cfg["vector_dimension"],
+            distance_metric=distance_metric,
+            metadata_configuration=s3vectors.CfnIndex.MetadataConfigurationProperty(
+                non_filterable_metadata_keys=non_filterable_keys,
             ),
         )
-
-        # Network: allow public (non-VPC) access to the collection endpoint only. Nothing in
-        # this system uses OpenSearch Dashboards (the KB talks to the collection API), so the
-        # dashboard endpoint is not exposed. Authorization is enforced by the data access
-        # policy + IAM below, NOT by network isolation. This is the AWS-recommended pattern for
-        # a Bedrock-backed collection serving public library-website content; VPC isolation is a
-        # compliance-only layer not needed here.
-        network_policy = oss.CfnSecurityPolicy(
-            self,
-            "CollectionNetworkPolicy",
-            name=f"{collection_name}-net",
-            type="network",
-            policy=json.dumps(
-                [
-                    {
-                        "Rules": [
-                            {
-                                "ResourceType": "collection",
-                                "Resource": [f"collection/{collection_name}"],
-                            },
-                        ],
-                        "AllowFromPublic": True,
-                    }
-                ]
-            ),
-        )
-
-        collection = oss.CfnCollection(
-            self,
-            "VectorCollection",
-            name=collection_name,
-            type="VECTORSEARCH",
-            description="Vector store for the Gavilan Library Bedrock Knowledge Base.",
-        )
-        # The collection cannot be created before its security policies exist.
-        collection.add_dependency(encryption_policy)
-        collection.add_dependency(network_policy)
+        # The index lives inside the bucket, so the bucket must exist first. vector_bucket_name is
+        # a literal (not a Ref), so this ordering edge is declared explicitly, not inferred.
+        vector_index.add_dependency(vector_bucket)
 
         # --- Knowledge Base source bucket ---------------------------------------------
 
@@ -230,13 +209,20 @@ class GavilanChatbotStack(Stack):
                 resources=[embedding_model_arn],
             )
         )
-        # Data-plane access to the collection. aoss:APIAccessAll is the IAM permission AWS
-        # requires for a principal to reach OpenSearch API operations on the collection;
-        # the fine-grained index/collection actions are granted in the data access policy.
+        # Data-plane access to the S3 Vectors index: read/write vectors + read the index. These
+        # are the actions the AWS "Create a service role for Bedrock Knowledge Bases" doc lists for
+        # an S3 Vectors store. Scoped to the specific index ARN (not a wildcard); the index ARN
+        # already nests the bucket name (arn:...:bucket/<bucket>/index/<index>).
         kb_role.add_to_policy(
             iam.PolicyStatement(
-                actions=["aoss:APIAccessAll"],
-                resources=[collection.attr_arn],
+                actions=[
+                    "s3vectors:PutVectors",
+                    "s3vectors:GetVectors",
+                    "s3vectors:DeleteVectors",
+                    "s3vectors:QueryVectors",
+                    "s3vectors:GetIndex",
+                ],
+                resources=[vector_index.attr_index_arn],
             )
         )
         # Read the S3 source content to ingest: ListBucket on the bucket, GetObject on its
@@ -249,117 +235,10 @@ class GavilanChatbotStack(Stack):
             )
         )
 
-        # --- Data access policy -------------------------------------------------------
-
-        # Two principals get data-plane access to the collection:
-        #  - the KB execution role, at runtime, to populate and query the vector index; and
-        #  - the CloudFormation execution (cfn-exec) role, at deploy time, because IT - not the
-        #    KB role - is the principal that actually creates, replaces, and deletes the
-        #    CfnIndex through the OSS data plane. It therefore needs the full index lifecycle
-        #    (create/update/delete/describe), or `cdk deploy` (index create/replace) and
-        #    `cdk destroy` (index delete) fail with an authorization error.
-        # The cfn-exec role ARN is built from the bootstrap qualifier + Stack account/region
-        # tokens (json.dumps embeds the tokens as placeholders CDK resolves at synth).
-        bootstrap_qualifier = (
-            getattr(self.synthesizer, "bootstrap_qualifier", None)
-            or DefaultStackSynthesizer.DEFAULT_QUALIFIER
-        )
-        cfn_exec_role_arn = (
-            f"arn:{self.partition}:iam::{self.account}:role/"
-            f"cdk-{bootstrap_qualifier}-cfn-exec-role-{self.account}-{self.region}"
-        )
-        data_access_policy = oss.CfnAccessPolicy(
-            self,
-            "CollectionDataAccessPolicy",
-            name=f"{collection_name}-data",
-            type="data",
-            policy=json.dumps(
-                [
-                    {
-                        "Rules": [
-                            {
-                                "ResourceType": "index",
-                                "Resource": [f"index/{collection_name}/*"],
-                                "Permission": [
-                                    "aoss:CreateIndex",
-                                    "aoss:DescribeIndex",
-                                    "aoss:ReadDocument",
-                                    "aoss:WriteDocument",
-                                    "aoss:UpdateIndex",
-                                ],
-                            },
-                            {
-                                "ResourceType": "collection",
-                                "Resource": [f"collection/{collection_name}"],
-                                "Permission": [
-                                    "aoss:CreateCollectionItems",
-                                    "aoss:DescribeCollectionItems",
-                                    "aoss:UpdateCollectionItems",
-                                ],
-                            },
-                        ],
-                        "Principal": [kb_role.role_arn],
-                    },
-                    {
-                        "Rules": [
-                            {
-                                "ResourceType": "index",
-                                "Resource": [f"index/{collection_name}/*"],
-                                "Permission": [
-                                    "aoss:CreateIndex",
-                                    "aoss:UpdateIndex",
-                                    "aoss:DeleteIndex",
-                                    "aoss:DescribeIndex",
-                                ],
-                            },
-                        ],
-                        "Principal": [cfn_exec_role_arn],
-                    },
-                ]
-            ),
-        )
-
-        # --- Vector index -------------------------------------------------------------
-
-        # knn_vector field at the configured dimension (Titan v2 = 1024), plus a text
-        # chunk field and a stored (non-indexed) metadata field. Field names come from
-        # config and MUST match the KB field_mapping below.
-        vector_index = oss.CfnIndex(
-            self,
-            "VectorIndex",
-            collection_endpoint=collection.attr_collection_endpoint,
-            index_name=index_name,
-            mappings=oss.CfnIndex.MappingsProperty(
-                properties={
-                    vector_field: oss.CfnIndex.PropertyMappingProperty(
-                        type="knn_vector",
-                        dimension=kb_cfg["vector_dimension"],
-                        method=oss.CfnIndex.MethodProperty(
-                            name="hnsw",
-                            engine=hnsw["engine"],
-                            space_type=hnsw["space_type"],
-                            parameters=oss.CfnIndex.ParametersProperty(
-                                ef_construction=hnsw["ef_construction"],
-                                m=hnsw["m"],
-                            ),
-                        ),
-                    ),
-                    text_field: oss.CfnIndex.PropertyMappingProperty(type="text"),
-                    metadata_field: oss.CfnIndex.PropertyMappingProperty(
-                        type="text",
-                        index=False,
-                    ),
-                }
-            ),
-            settings=oss.CfnIndex.IndexSettingsProperty(
-                index=oss.CfnIndex.IndexProperty(knn=True)
-            ),
-        )
-        # The index is created via the OSS data plane, which needs the collection to exist
-        # and the network + data access policies in place first.
-        vector_index.add_dependency(collection)
-        vector_index.add_dependency(network_policy)
-        vector_index.add_dependency(data_access_policy)
+        # (S3 Vectors needs no data-access policy and no separate index-creator: the vector
+        # bucket + index above are plain CloudFormation resources, and the KB reaches them through
+        # the IAM s3vectors grant on kb_role. The OpenSearch Serverless security/network/data
+        # policies and the cfn-exec-role data-access grant are gone entirely.)
 
         # --- Knowledge Base -----------------------------------------------------------
 
@@ -375,21 +254,21 @@ class GavilanChatbotStack(Stack):
                 ),
             ),
             storage_configuration=bedrock.CfnKnowledgeBase.StorageConfigurationProperty(
-                type="OPENSEARCH_SERVERLESS",
-                opensearch_serverless_configuration=bedrock.CfnKnowledgeBase.OpenSearchServerlessConfigurationProperty(
-                    collection_arn=collection.attr_arn,
-                    vector_index_name=index_name,
-                    field_mapping=bedrock.CfnKnowledgeBase.OpenSearchServerlessFieldMappingProperty(
-                        vector_field=vector_field,
-                        text_field=text_field,
-                        metadata_field=metadata_field,
-                    ),
+                type="S3_VECTORS",
+                # S3VectorsConfiguration is a oneOf: EITHER index_arn alone, OR
+                # index_name + vector_bucket_arn - never all three (all three matches BOTH
+                # subschemas and CloudFormation rejects it as ambiguous at validation, before
+                # anything is created). We pass index_arn alone: the index ARN already nests the
+                # bucket + index name, so it fully identifies the store, and the GetAtt keeps the
+                # dependency on the in-stack index (which itself depends on the bucket).
+                s3_vectors_configuration=bedrock.CfnKnowledgeBase.S3VectorsConfigurationProperty(
+                    index_arn=vector_index.attr_index_arn,
                 ),
             ),
         )
-        # The KB must not be created before the index exists, and needs its role (and the
-        # role's inline policy) in place. The index already depends on the data access
-        # policy, so that ordering is transitive.
+        # The KB must not be created before the index exists, and needs its role (and the role's
+        # inline policy) in place. The index already depends on the vector bucket, so that ordering
+        # is transitive.
         knowledge_base.add_dependency(vector_index)
         knowledge_base.node.add_dependency(kb_role)
 
@@ -855,8 +734,9 @@ class GavilanChatbotStack(Stack):
             methods=[apigwv2.HttpMethod.POST],
             integration=query_integration,
         )
-        # Lightweight pre-warm route: the widget pings GET /warm on load to wake the OSS
-        # collection (retrieve-only) before the student's first query.
+        # Lightweight pre-warm route: the widget pings GET /warm on load to warm the query
+        # Lambda (retrieve-only) before the student's first query. (S3 Vectors itself has no
+        # cluster to wake; this just avoids a cold Lambda on the first real query.)
         http_api.add_routes(
             path="/warm",
             methods=[apigwv2.HttpMethod.GET],

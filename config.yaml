@@ -11,22 +11,31 @@ knowledge_base:
   vector_dimension: 1024
 
 vector_store:
-  # OpenSearch Serverless names must be lowercase and <= 32 chars. The security-policy
-  # names are derived from this (<name>-enc / -net / -data).
-  collection_name: gavilan-library-kb
+  # Amazon S3 Vectors store (replaces OpenSearch Serverless). Semantic-search-only (no hybrid):
+  # the cheap/light tradeoff the sponsor chose. Keyword coverage is handled later by agentifying
+  # the bot with a structured lookup tool (out of scope here).
+  #
+  # Vector-bucket names follow S3-style rules (3-63 chars, lowercase letters/numbers/hyphens).
+  vector_bucket_name: gavilan-library-vectors
+  # Index name: 3-63 chars, lowercase letters/numbers/hyphens/dots.
   index_name: bedrock-knowledge-base-default-index
-  # Field names MUST stay identical between the index mappings and the KB field mapping.
-  # These are the Bedrock console defaults, kept for compatibility.
-  fields:
-    vector: bedrock-knowledge-base-default-vector
-    text: AMAZON_BEDROCK_TEXT_CHUNK
-    metadata: AMAZON_BEDROCK_METADATA
-  # knn (HNSW) index parameters.
-  hnsw:
-    engine: faiss
-    space_type: l2
-    ef_construction: 512
-    m: 16
+  # float32 is the only supported vector data type.
+  data_type: float32
+  # cosine: Titan Embed Text v2 embeddings are normalized, so cosine ranks equivalently to the
+  # old OpenSearch l2. (Index dimension is knowledge_base.vector_dimension = 1024, the single
+  # source of truth; it MUST equal the embedding model's output or ingestion fails.)
+  distance_metric: cosine
+  # Bedrock-internal metadata keys marked NON-filterable AT CREATION (IMMUTABLE afterward). Left
+  # filterable, they blow S3 Vectors' ~1 KB / 35-key filterable-metadata limit and every ingestion
+  # fails with ValidationException. AMAZON_BEDROCK_TEXT (chunk text) + AMAZON_BEDROCK_METADATA are
+  # the documented culprits; the x-amz-bedrock-kb-* keys are added defensively (max is 10 keys, we
+  # use 5). Retrieval never filters on any of these, so non-filterable costs nothing.
+  non_filterable_metadata_keys:
+    - AMAZON_BEDROCK_TEXT
+    - AMAZON_BEDROCK_METADATA
+    - x-amz-bedrock-kb-source-uri
+    - x-amz-bedrock-kb-chunk-id
+    - x-amz-bedrock-kb-data-source-id
 
 data_source:
   web_crawler:
