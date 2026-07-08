@@ -1,45 +1,42 @@
 """Gavilan Library Chatbot - AWS architecture diagram.
 
 Source of truth: this .py file. The PNG next to it (architecture_diagram.png) is the
-generated artifact. Render with:
+generated artifact - regenerate it after editing this file:
 
     python docs/architecture_diagram.py
 
 Requires Graphviz (`brew install graphviz`) and the `diagrams` library (`pip install
 diagrams`).
 
-Every node/edge below was verified against the ACTUAL deployed code on the
-feat/cdk-skeleton branch (infra/infra/infra_stack.py, config.yaml, app/handler.py), not
-from memory:
+Every node/edge below reflects the ACTUAL code (infra/infra/infra_stack.py, config.yaml,
+app/handler.py, scraper/):
 
-  - Web Crawler data source: CfnDataSource type WEB, seed https://www.gavilan.edu/library/,
-    include/exclude filters, HOST_ONLY scope.
-  - Knowledge Base: CfnKnowledgeBase VECTOR, embedding amazon.titan-embed-text-v2:0
-    (Titan Text Embeddings v2, 1024 dims); FIXED_SIZE chunking on the data source.
-  - Vector store: OpenSearch Serverless VECTORSEARCH collection + knn_vector index. The KB
+  - Ingestion: a scraper Lambda fetches the curated library seed URLs, extracts clean
+    markdown, uploads it to the KB source S3 bucket, and triggers a KB ingestion job. In the
+    same run it regenerates the database catalog from databases.php (HTML parse + a Sonnet
+    enrichment call) and writes it to a dedicated catalog S3 bucket. Runs on a weekly
+    EventBridge schedule and on the one-click deploy Trigger.
+  - Knowledge Base: CfnKnowledgeBase VECTOR, embedding amazon.titan-embed-text-v2:0 (1024
+    dims); FIXED_SIZE chunking on the S3 data source.
+  - Vector store: Amazon S3 Vectors (CfnVectorBucket + CfnIndex, cosine, float32). The KB
     WRITES to it during ingestion and READS from it during query.
-  - Query path: API Gateway HTTP API v2 (POST /query) -> Lambda python3.13. The handler
-    does step 1 Retrieve (KB Retrieve) then step 2 Generate (Bedrock Converse to
-    anthropic.claude-3-5-haiku-20241022-v1:0).
-  - Widget delivery: private S3 bucket (widget.js) fronted by a CloudFront distribution
-    with an OAC-secured origin, plus a BucketDeployment that uploads widget.js. Built in
-    THIS stack (infra/infra/infra_stack.py: WidgetBucket, WidgetDistribution,
-    S3BucketOrigin.with_origin_access_control). This is a SEPARATE concern from the query
-    path: CloudFront + S3 deliver the widget CODE to the browser; the injected widget then
-    uses the existing API Gateway query path for actual questions.
+  - Query path: API Gateway HTTP API v2 (POST /query) -> Lambda python3.13. The handler runs
+    an agentic Bedrock Converse tool-use loop (run_agent) with two tools:
+    search_library_info (KB Retrieve) and database_catalog (reads the catalog from S3). The
+    output guardrail is attached to every Converse call.
+  - Widget delivery: private S3 bucket (widget.js) fronted by a CloudFront distribution with
+    an OAC-secured origin, built in the SAME stack. Separate concern from the query path:
+    CloudFront + S3 deliver the widget CODE to the browser; the injected widget then uses the
+    API Gateway query path.
 
-Bedrock Guardrails IS built now: a guardrail (content filters + PII) wraps the Lambda's
-Bedrock Converse call, screening the input before generation and the output after, so it is
-drawn as a real current component on the generation step (not planned). WAF is still NOT
-deployed today, so it alone remains in the distinct "Planned" group (per the stack
-docstring). Widget hosting IS built too, so the widget and its CDN are real current
-components.
+Bedrock Guardrails is a real current component (content filters + PII), screening the input
+before the loop and the output on every Converse call. WAF is NOT deployed today, so it
+alone remains in the "Planned" group.
 """
 
 import os
 
 from diagrams import Cluster, Diagram, Edge
-from diagrams.aws.analytics import ElasticsearchService  # OpenSearch/Elasticsearch icon
 from diagrams.aws.compute import Lambda
 from diagrams.aws.general import Client, InternetAlt1, Users
 from diagrams.aws.ml import Bedrock
@@ -50,49 +47,41 @@ from diagrams.aws.storage import S3
 # Write the PNG next to this file (docs/) regardless of the current working directory.
 _OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "architecture_diagram")
 
-# Edge color/style conventions.
-INGEST = Edge(color="darkorange")          # ingestion data flow
-QUERY = Edge(color="darkblue")             # query request flow
-MODEL_CALL = Edge(style="dashed")          # a Bedrock foundation-model invocation
-RESPONSE = Edge(color="darkgreen", style="dotted")  # response back to the user
-DELIVERY = Edge(color="purple")            # widget-code delivery (CloudFront + S3)
-PLANNED = Edge(color="gray", style="dotted", label="planned")
-
 graph_attr = {"fontsize": "20", "labelloc": "t", "pad": "0.5", "nodesep": "0.8", "ranksep": "1.1"}
 
 with Diagram(
-    "Gavilan Library Chatbot - AWS Architecture (as deployed on feat/cdk-skeleton)",
+    "Gavilan Library Chatbot - AWS Architecture",
     filename=_OUTPUT,
     outformat="png",
     show=False,
     direction="LR",
     graph_attr=graph_attr,
 ):
-    # External library website that the crawler seeds from.
-    library_site = InternetAlt1("Library website\n(seed URLs)")
+    # External library website the scraper pulls from.
+    library_site = InternetAlt1("Library website\n(curated seed URLs)")
 
-    with Cluster("Ingestion  (scheduled sync, offline)"):
-        crawler = Bedrock("Web Crawler\ndata source\n(WEB, HOST_ONLY)")
+    with Cluster("Ingestion  (weekly schedule + on deploy)"):
+        scraper = Lambda("Scraper Lambda\n(fetch + extract;\nregenerate catalog)")
+        source_bucket = S3("KB source bucket\n(markdown)")
+        catalog_bucket = S3("Catalog bucket\n(database_catalog.json)")
         titan = Bedrock("Titan Text\nEmbeddings v2\n(1024-dim)")
 
     # The KB + vector store are the hub shared by BOTH flows.
-    with Cluster("Shared RAG core  (Amazon Bedrock KB + vector store)"):
-        kb = Bedrock("Bedrock\nKnowledge Base\n(FIXED_SIZE chunk)")
-        opensearch = ElasticsearchService(
-            "OpenSearch Serverless\nvector collection + index"
-        )
+    with Cluster("Shared RAG core  (Bedrock KB + S3 Vectors)"):
+        kb = Bedrock("Bedrock\nKnowledge Base\n(S3 data source,\nFIXED_SIZE chunk)")
+        s3vectors = S3("S3 Vectors\nbucket + index\n(1024-dim, cosine)")
 
     with Cluster("Query  (per request, runtime)"):
         student = Users("Student")
         widget = Client("Chat widget\n(embedded JS,\ninjected into page)")
         api = APIGateway("API Gateway\nHTTP API v2\nPOST /query")
-        query_fn = Lambda("Lambda (python3.13)\nretrieve + generate")
+        query_fn = Lambda("Lambda (python3.13)\nagentic Converse\ntool-use loop")
         guardrails = Shield("Bedrock\nGuardrails\n(content + PII)")
-        claude = Bedrock("Claude\n(Converse)\ngeneration")
+        claude = Bedrock("Claude Sonnet 4.6\n(Converse)\ngeneration")
 
-    # Widget CODE delivery. SEPARATE concern from the query flow above: CloudFront + S3
-    # ship widget.js to the browser; the injected widget then rides the query path.
-    with Cluster("Widget delivery  (deployed: CloudFront + S3, OAC origin)"):
+    # Widget CODE delivery. SEPARATE concern from the query flow: CloudFront + S3 ship
+    # widget.js to the browser; the injected widget then rides the query path.
+    with Cluster("Widget delivery  (CloudFront + S3, OAC origin)"):
         host_page = InternetAlt1("Library web page\n(host site)\n<script src=.../widget.js>")
         cdn = CloudFront("CloudFront\ndistribution\n(OAC origin)")
         widget_bucket = S3("Private S3 bucket\nwidget.js\n(CloudFront-only)")
@@ -100,34 +89,35 @@ with Diagram(
     with Cluster("Planned  (not deployed today)", graph_attr={"style": "dashed", "bgcolor": "gray95"}):
         waf = WAF("AWS WAF")
 
-    # --- Ingestion flow: crawl -> parse/chunk -> embed -> WRITE vectors ---
-    library_site >> Edge(color="darkorange", label="crawl seeds\n+ child links") >> crawler
-    crawler >> Edge(color="darkorange", label="Smart Parsing\n+ FIXED_SIZE chunk") >> kb
+    # --- Ingestion flow: scrape -> S3 markdown + catalog -> KB ingest -> embed -> WRITE vectors ---
+    library_site >> Edge(color="darkorange", label="scrape\nseed URLs") >> scraper
+    scraper >> Edge(color="darkorange", label="upload\nmarkdown") >> source_bucket
+    scraper >> Edge(color="darkorange", label="parse + enrich\n-> catalog JSON") >> catalog_bucket
+    source_bucket >> Edge(color="darkorange", label="S3 data source\ningest (FIXED_SIZE)") >> kb
     kb >> Edge(style="dashed", label="embed chunks") >> titan
-    kb >> Edge(color="darkorange", label="write vectors") >> opensearch
+    kb >> Edge(color="darkorange", label="write vectors") >> s3vectors
 
-    # --- Query flow: widget -> API GW -> Lambda -> (Retrieve, Generate) ---
+    # --- Query flow: widget -> API GW -> Lambda -> agentic tool-use loop ---
     student >> Edge(color="darkblue", label="asks question") >> widget
     widget >> Edge(color="darkblue", label="POST /query") >> api
     api >> Edge(color="darkblue", label="proxy\n(payload 2.0)") >> query_fn
-    query_fn >> Edge(color="darkblue", label="1. Retrieve") >> kb
-    # Same KB, but now READING the store (distinct from the ingestion write above).
-    kb >> Edge(color="darkblue", style="dashed", label="read vectors") >> opensearch
-    # Generation is screened by Bedrock Guardrails: the Converse call passes through the
-    # guardrail, which checks the input before generation and the output after.
-    query_fn >> Edge(style="dashed", label="2. Generate (Converse)") >> guardrails
+    # Tool 1 - search_library_info: KB Retrieve (which READS the vector store).
+    query_fn >> Edge(color="darkblue", label="search_library_info\n(KB Retrieve)") >> kb
+    kb >> Edge(color="darkblue", style="dashed", label="read vectors") >> s3vectors
+    # Tool 2 - database_catalog: read the catalog from S3.
+    query_fn >> Edge(color="darkblue", style="dashed", label="database_catalog\n(read catalog)") >> catalog_bucket
+    # Generation is screened by Bedrock Guardrails on every Converse call in the loop.
+    query_fn >> Edge(style="dashed", label="Converse\n(each loop turn)") >> guardrails
     guardrails >> Edge(style="dashed", dir="both", label="screen input\n+ output") >> claude
 
     # --- Response back to the user ---
-    query_fn >> Edge(color="darkgreen", style="dotted", label="answer JSON\n(via API GW + widget)") >> student
+    query_fn >> Edge(color="darkgreen", style="dotted", label="{answer, sources}\n(via API GW + widget)") >> student
 
     # --- Widget delivery flow: how the widget CODE reaches the browser (purple) ---
-    # Separate from the query flow: this ships widget.js; the injected widget then queries.
     student >> Edge(color="purple", label="visits page") >> host_page
     host_page >> Edge(color="purple", label="<script> GET\nwidget.js") >> cdn
     cdn >> Edge(color="purple", style="dashed", label="origin fetch\n(OAC, private)") >> widget_bucket
     cdn >> Edge(color="purple", style="dotted", label="serves widget.js\n(cached at edge)") >> host_page
-    # The delivered widget injects into the host page and then uses the EXISTING query path.
     host_page >> Edge(color="purple", style="dashed", label="widget injects,\nthen POST /query") >> widget
 
     # --- Planned components (drawn distinct; no real traffic today) ---

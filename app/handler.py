@@ -113,10 +113,10 @@ _MAX_ITERS_FALLBACK_MESSAGE = (
 # Max characters of a passage surfaced as a source excerpt in the response.
 _EXCERPT_CHARS = 300
 
-# Warm path. The widget fires GET /warm on page load to wake the OpenSearch Serverless
-# collection before the first real query. WARM_PATH is matched against the request
-# path; _WARM_QUERY is a throwaway retrieval query (the goal is to spin OSS up, not to get
-# useful results).
+# Warm path. The widget fires GET /warm on page load to warm the query Lambda container (and
+# exercise the KB Retrieve path) before the first real query. WARM_PATH is matched against the
+# request path; _WARM_QUERY is a throwaway retrieval query (the goal is to warm the path, not to
+# get useful results).
 WARM_PATH = "/warm"
 _WARM_QUERY = "library hours"
 
@@ -847,11 +847,10 @@ def _request_path(event):
 
 
 def _handle_warm():
-    """Warm path (GET /warm): a single KB Retrieve to wake the OpenSearch Serverless
-    collection (which scales to zero after ~10min idle) before the student's first real
-    query. No generation and no guardrail input screen - there is no user query to screen,
-    and OSS scale-to-zero is the dominant cold-start cost, so warming retrieval is the whole
-    point. The Bedrock Converse path is deliberately left cold."""
+    """Warm path (GET /warm): a single KB Retrieve to warm the query Lambda container and the
+    retrieval path before the student's first real query. No generation and no guardrail input
+    screen - there is no user query to screen. The Bedrock Converse path is deliberately left
+    cold."""
     try:
         retrieve(_WARM_QUERY)
     except Exception as exc:  # noqa: BLE001 - warm is fire-and-forget; return a clean error
