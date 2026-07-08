@@ -110,10 +110,13 @@ def test_knowledge_base_storage_is_s3_vectors_pointing_at_the_index():
     storage = kb["Properties"]["StorageConfiguration"]
     assert storage["Type"] == "S3_VECTORS"
     s3v = storage["S3VectorsConfiguration"]
-    assert s3v["IndexName"] == CONFIG["vector_store"]["index_name"]
-    # Bucket ARN + index ARN are GetAtt refs to the vector bucket + index (not hardcoded).
-    assert s3v["VectorBucketArn"]["Fn::GetAtt"][0].startswith("VectorBucket"), s3v
+    # S3VectorsConfiguration is a oneOf: EITHER IndexArn alone, OR IndexName + VectorBucketArn.
+    # We use IndexArn alone; passing all three matches both subschemas and CloudFormation rejects
+    # it at validation ("2 subschemas matched instead of one"). Lock that in: IndexArn present
+    # (GetAtt on the in-stack index), IndexName + VectorBucketArn absent.
     assert s3v["IndexArn"]["Fn::GetAtt"][0].startswith("VectorIndex"), s3v
+    assert "IndexName" not in s3v, s3v
+    assert "VectorBucketArn" not in s3v, s3v
     # S3 Vectors has no field mapping (unlike OpenSearch Serverless).
     assert "FieldMapping" not in s3v
 

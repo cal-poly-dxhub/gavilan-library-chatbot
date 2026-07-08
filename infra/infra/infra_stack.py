@@ -255,10 +255,14 @@ class GavilanChatbotStack(Stack):
             ),
             storage_configuration=bedrock.CfnKnowledgeBase.StorageConfigurationProperty(
                 type="S3_VECTORS",
+                # S3VectorsConfiguration is a oneOf: EITHER index_arn alone, OR
+                # index_name + vector_bucket_arn - never all three (all three matches BOTH
+                # subschemas and CloudFormation rejects it as ambiguous at validation, before
+                # anything is created). We pass index_arn alone: the index ARN already nests the
+                # bucket + index name, so it fully identifies the store, and the GetAtt keeps the
+                # dependency on the in-stack index (which itself depends on the bucket).
                 s3_vectors_configuration=bedrock.CfnKnowledgeBase.S3VectorsConfigurationProperty(
-                    vector_bucket_arn=vector_bucket.attr_vector_bucket_arn,
                     index_arn=vector_index.attr_index_arn,
-                    index_name=index_name,
                 ),
             ),
         )
