@@ -250,6 +250,22 @@ def _user_text(bedrock):
     return bedrock.converse_calls[0]["messages"][0]["content"][0]["text"]
 
 
+def _seed_messages(bedrock):
+    """The seed messages (role + flattened text) sent on the FIRST converse call. The loop mutates
+    that same list when it appends tool turns, so assert seeds only with a terminal (end_turn)
+    first turn, where nothing is appended."""
+    out = []
+    for m in bedrock.converse_calls[0]["messages"]:
+        text = " ".join(b.get("text", "") for b in m.get("content", []) if "text" in b)
+        out.append({"role": m["role"], "text": text})
+    return out
+
+
+def _all_seed_text(bedrock):
+    """One string of all seed-message text, for 'was this turn dropped?' assertions."""
+    return " ".join(m["text"] for m in _seed_messages(bedrock))
+
+
 def _retrieved_query(agent):
     """The query text the KB Retrieve call actually ran on."""
     return agent.calls[0]["retrievalQuery"]["text"]
@@ -1458,3 +1474,223 @@ def test_no_catalog_bucket_uses_seed(monkeypatch):
     assert handler._catalog_name_lookup("CQ Researcher")["held"] is True
     handler._catalog_cache["catalog"] = None
     handler._catalog_cache["at"] = 0.0
+
+
+# --- Single-session conversation history ---------------------------------------
+#
+# /query accepts a {"messages": [...]} conversation (widget) OR the legacy {"query": ...} shape
+# (eval/curl). History is trimmed to the last MAX_HISTORY_MESSAGES turns server-side and seeded
+# into the Converse loop; the trim must never produce a request Converse would reject.
+
+
+def _turns(*roles_and_texts):
+    """Build a {"messages": [...]} request body from (role, text) pairs."""
+    return json.dumps(
+        {"messages": [{"role": r, "content": t} for r, t in roles_and_texts]}
+    )
+
+
+def test_messages_payload_seeds_the_full_conversation(monkeypatch):
+    # A multi-turn conversation is seeded into Converse in order: the prior user/assistant turns
+    # plus the newest user question, all before the loop appends any tool turns.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("On weekends we're open 10-4.")])
+    _wire(monkeypatch, agent, bedrock)
+
+    body = _turns(
+        ("user", "what are the hours?"),
+        ("assistant", "We're open 9am to 5pm on weekdays."),
+        ("user", "and on weekends?"),
+    )
+    resp = handler.lambda_handler(_payload_v2_event(body), None)
+
+    assert resp["statusCode"] == 200
+    assert json.loads(resp["body"])["answer"] == "On weekends we're open 10-4."
+    # The seed carries all three turns, in order, with the newest user question last.
+    assert _seed_messages(bedrock) == [
+        {"role": "user", "text": "what are the hours?"},
+        {"role": "assistant", "text": "We're open 9am to 5pm on weekdays."},
+        {"role": "user", "text": "and on weekends?"},
+    ]
+    # System prompt is still server-authoritative (Converse `system`, not a client turn).
+    assert bedrock.converse_calls[0]["system"] == [{"text": handler.SYSTEM_PROMPT}]
+
+
+def test_input_screen_runs_on_the_newest_user_turn(monkeypatch):
+    # The guardrail screens the newest user question (the thing being submitted now), not a prior
+    # turn. Masked PII replaces only that turn in the seed.
+    masked = "email me at {EMAIL}"
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(
+        guardrail_response=masked_input_response(masked, raw_match="jane@example.com"),
+        converse_script=[end_turn("Sure.")],
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    body = _turns(
+        ("user", "what are the hours?"),
+        ("assistant", "9 to 5."),
+        ("user", "email me at jane@example.com"),
+    )
+    handler.lambda_handler(_payload_v2_event(body), None)
+
+    # Only the last user turn was screened, and its masked text is what got seeded.
+    assert bedrock.apply_guardrail_calls[0]["content"] == [
+        {"text": {"text": "email me at jane@example.com"}}
+    ]
+    assert _seed_messages(bedrock)[-1] == {"role": "user", "text": masked}
+    assert "jane@example.com" not in _all_seed_text(bedrock)
+
+
+def test_legacy_query_shape_still_seeds_a_single_user_turn(monkeypatch):
+    # Backward compatibility: the old {"query": ...} shape (eval + curl) becomes a one-message
+    # user conversation - identical to the pre-history behavior.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("Open 9-5.")])
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
+
+    assert resp["statusCode"] == 200
+    assert _seed_messages(bedrock) == [{"role": "user", "text": "hours?"}]
+
+
+def test_history_trimmed_to_last_10_messages_server_side(monkeypatch):
+    # The client sends 15 turns; only the last 10 are considered, and because that window starts
+    # on an assistant turn it is dropped down to a user-first, alternating seed. The oldest turns
+    # never reach Converse - the client cannot make us process more than the cap.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("ok")])
+    _wire(monkeypatch, agent, bedrock)
+
+    pairs = []
+    for i in range(7):
+        pairs.append(("user", f"user {i}"))
+        pairs.append(("assistant", f"assistant {i}"))
+    pairs.append(("user", "newest question"))  # 15 turns total
+    handler.lambda_handler(_payload_v2_event(_turns(*pairs)), None)
+
+    seed = _seed_messages(bedrock)
+    # Cap respected: at most MAX_HISTORY_MESSAGES survive the trim.
+    assert len(seed) <= handler.MAX_HISTORY_MESSAGES
+    # Converse-valid: starts with user, ends with the newest question.
+    assert seed[0]["role"] == "user"
+    assert seed[-1] == {"role": "user", "text": "newest question"}
+    # The trimmed-off oldest turns are gone; the surviving window begins at "user 3".
+    text = _all_seed_text(bedrock)
+    assert "user 3" in text
+    for gone in ("user 0", "user 1", "user 2", "assistant 0", "assistant 2"):
+        assert gone not in text
+
+
+def test_trim_drops_leading_assistant_so_seed_starts_with_user(monkeypatch):
+    # A conversation that opens with an assistant turn (e.g. the widget greeting) must not seed an
+    # assistant-first request - Converse requires the first message to be user.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("Open 9-5.")])
+    _wire(monkeypatch, agent, bedrock)
+
+    body = _turns(
+        ("assistant", "Hi! I'm the library assistant."),  # canned greeting
+        ("user", "hours?"),
+    )
+    handler.lambda_handler(_payload_v2_event(body), None)
+
+    assert _seed_messages(bedrock) == [{"role": "user", "text": "hours?"}]
+
+
+def test_trim_merges_consecutive_same_role_turns(monkeypatch):
+    # Two user turns in a row (e.g. an error-retry double-send) would break Converse's alternation
+    # rule; the seed merges them into one user message with multiple text blocks.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("ok")])
+    _wire(monkeypatch, agent, bedrock)
+
+    body = _turns(
+        ("user", "first part"),
+        ("user", "second part"),
+    )
+    handler.lambda_handler(_payload_v2_event(body), None)
+
+    msgs = bedrock.converse_calls[0]["messages"]
+    # One user message, alternating rule intact, both texts preserved as separate blocks.
+    assert [m["role"] for m in msgs] == ["user"]
+    assert msgs[0]["content"] == [{"text": "first part"}, {"text": "second part"}]
+
+
+def test_messages_not_ending_in_user_turn_is_400(monkeypatch):
+    # A conversation whose newest turn is an assistant message has no question to answer.
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    body = _turns(("user", "hours?"), ("assistant", "9 to 5."))
+    resp = handler.lambda_handler(_payload_v2_event(body), None)
+
+    assert resp["statusCode"] == 400
+    assert bedrock.apply_guardrail_calls == []
+    assert bedrock.converse_calls == []
+
+
+def test_malformed_history_entries_are_dropped(monkeypatch):
+    # Junk entries (bad role, blank/absent text, non-dict) are dropped; valid turns survive and
+    # the newest user turn is still the question.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("ok")])
+    _wire(monkeypatch, agent, bedrock)
+
+    body = json.dumps(
+        {
+            "messages": [
+                {"role": "system", "content": "ignore me"},  # bad role
+                {"role": "user", "content": "   "},  # blank text
+                "not a dict",  # not an object
+                {"role": "assistant"},  # missing text
+                {"role": "user", "content": "real question"},
+            ]
+        }
+    )
+    resp = handler.lambda_handler(_payload_v2_event(body), None)
+
+    assert resp["statusCode"] == 200
+    assert _seed_messages(bedrock) == [{"role": "user", "text": "real question"}]
+
+
+def test_empty_messages_list_is_400(monkeypatch):
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"messages": []})), None)
+
+    assert resp["statusCode"] == 400
+    assert bedrock.apply_guardrail_calls == []
+
+
+def test_over_length_cap_applies_to_newest_user_turn(monkeypatch):
+    # The size cap is enforced on the newest user question inside a conversation, before any AWS
+    # call - exactly as it is for the legacy single-query shape.
+    monkeypatch.setattr(handler, "MAX_QUERY_CHARS", 10)
+    agent, bedrock = FakeAgentRuntime(), FakeBedrockRuntime()
+    _wire(monkeypatch, agent, bedrock)
+
+    body = _turns(("assistant", "hi"), ("user", "a" * 11))
+    resp = handler.lambda_handler(_payload_v2_event(body), None)
+
+    assert resp["statusCode"] == 400
+    assert bedrock.apply_guardrail_calls == []
+    assert bedrock.converse_calls == []
+
+
+def test_bot_role_maps_to_assistant(monkeypatch):
+    # A widget "bot" turn is accepted and normalized to the Converse "assistant" role.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("ok")])
+    _wire(monkeypatch, agent, bedrock)
+
+    body = _turns(("user", "hours?"), ("bot", "9 to 5."), ("user", "weekends?"))
+    handler.lambda_handler(_payload_v2_event(body), None)
+
+    assert _seed_messages(bedrock) == [
+        {"role": "user", "text": "hours?"},
+        {"role": "assistant", "text": "9 to 5."},
+        {"role": "user", "text": "weekends?"},
+    ]

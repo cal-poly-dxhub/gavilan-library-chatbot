@@ -208,7 +208,19 @@
     if (!init || typeof init.body !== "string") return "";
     try {
       var parsed = JSON.parse(init.body);
-      return parsed && typeof parsed.query === "string" ? parsed.query : "";
+      if (!parsed) return "";
+      // New shape: the widget posts { messages: [...] }; the question is the newest
+      // user turn. Legacy shape: { query: <text> } (still used by eval/curl).
+      if (Array.isArray(parsed.messages)) {
+        for (var i = parsed.messages.length - 1; i >= 0; i--) {
+          var m = parsed.messages[i];
+          if (m && m.role === "user" && typeof m.content === "string") {
+            return m.content;
+          }
+        }
+        return "";
+      }
+      return typeof parsed.query === "string" ? parsed.query : "";
     } catch (e) {
       return "";
     }

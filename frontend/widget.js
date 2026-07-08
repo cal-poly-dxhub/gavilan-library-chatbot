@@ -14,7 +14,10 @@
  *     { "answer": "<text>", "sources": [ { "uri": "...", "excerpt": "..." } ] }
  *
  * No browser storage is used; conversation state is kept in memory for the
- * session only.
+ * session only. On every send it posts the WHOLE in-memory transcript as a
+ * `messages` array ({ role: "user"|"assistant", content }) so the bot remembers
+ * earlier turns within the session; closing the tab discards it. The server caps
+ * and trims the history, so the widget just sends what it has.
  * ===========================================================================
  */
 (function () {
@@ -73,10 +76,12 @@
   }
 
   /**
-   * The single entry point the UI calls. Returns a Promise for the locked
-   * { answer, sources } contract. Always a normal fetch to the configured URL.
+   * The single entry point the UI calls. Takes the full conversation so far as a
+   * `messages` array ({ role, content }, oldest first, newest user turn last) and
+   * returns a Promise for the locked { answer, sources } contract. Always a normal
+   * fetch to the configured URL.
    */
-  function sendQuery(question) {
+  function sendQuery(messages) {
     var url = apiUrl();
     if (!url) {
       return Promise.resolve({
@@ -85,14 +90,15 @@
         sources: []
       });
     }
-    return realQuery(url, question);
+    return realQuery(url, messages);
   }
 
   /**
-   * Real backend call. Matches app/handler.py: POST JSON { "query": <text> }
-   * to `/query`; expects { "answer", "sources": [{ uri, excerpt }] } back.
+   * Real backend call. Matches app/handler.py: POST JSON { "messages": [...] } to
+   * `/query` (the whole session transcript; the server trims it) and expects
+   * { "answer", "sources": [{ uri, excerpt }] } back.
    */
-  function realQuery(url, question) {
+  function realQuery(url, messages) {
     var controller =
       typeof AbortController !== "undefined" ? new AbortController() : null;
     var timer = null;
@@ -104,7 +110,7 @@
     return fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: question }),
+      body: JSON.stringify({ messages: messages }),
       signal: controller ? controller.signal : undefined
     })
       .then(function (res) {
@@ -579,6 +585,26 @@
 
     // ---- interaction ----
 
+    /**
+     * The in-memory transcript as the backend's { role, content } messages array:
+     * oldest first, newest user turn last. The widget's internal "bot" role maps to
+     * "assistant"; the canned greeting rides along as the leading assistant turn (the
+     * server drops a leading assistant turn and trims the rest). This is the whole of
+     * the single-session memory - no storage, gone when the tab closes.
+     */
+    function conversationForRequest() {
+      var out = [];
+      for (var i = 0; i < state.messages.length; i++) {
+        var m = state.messages[i];
+        if (!m || typeof m.text !== "string" || !m.text) continue;
+        out.push({
+          role: m.role === "user" ? "user" : "assistant",
+          content: m.text
+        });
+      }
+      return out;
+    }
+
     function submitQuestion(question) {
       var text = String(question == null ? "" : question).trim();
       if (!text || state.pending) return;
@@ -587,7 +613,8 @@
       setPending(true);
       var typing = showTyping();
 
-      sendQuery(text).then(
+      // Send the whole transcript (the new user turn is already appended above).
+      sendQuery(conversationForRequest()).then(
         function (result) {
           typing.done();
           appendBotMessage(result.answer, result.sources);

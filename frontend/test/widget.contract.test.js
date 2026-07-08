@@ -163,10 +163,30 @@ test("source never uses unsafe HTML sinks (innerHTML/outerHTML/document.write/in
   assert.ok(!/document\.write\s*\(/.test(SOURCE), "must not call document.write");
 });
 
-test("source sends the request shape the handler reads: JSON body { query }", () => {
-  assert.ok(/JSON\.stringify\(\{\s*query:\s*question\s*\}\)/.test(SOURCE), "must POST { query: <text> }");
+test("source sends the request shape the handler reads: JSON body { messages }", () => {
+  // Single-session history: the widget POSTs the whole conversation as a `messages` array,
+  // not a single { query }. The server trims/caps it.
+  assert.ok(
+    /JSON\.stringify\(\{\s*messages:\s*messages\s*\}\)/.test(SOURCE),
+    "must POST { messages: [...] }"
+  );
+  assert.ok(!/JSON\.stringify\(\{\s*query:/.test(SOURCE), "must not POST the legacy { query } shape");
   assert.ok(/"Content-Type":\s*"application\/json"/.test(SOURCE), "must set JSON content-type");
   assert.ok(/method:\s*"POST"/.test(SOURCE), "must POST");
+});
+
+test("source builds the messages array from the in-memory transcript (role + content)", () => {
+  // The transcript is mapped to { role, content } turns and the whole thing is sent on each
+  // send - that IS the single-session memory (no storage).
+  assert.ok(/conversationForRequest\s*\(/.test(SOURCE), "maps the transcript to a messages array");
+  assert.ok(
+    /role:\s*m\.role\s*===\s*"user"\s*\?\s*"user"\s*:\s*"assistant"/.test(SOURCE),
+    "maps the internal 'bot' role to 'assistant'"
+  );
+  assert.ok(
+    /sendQuery\(\s*conversationForRequest\(\)\s*\)/.test(SOURCE),
+    "sends the full conversation, not just the latest text"
+  );
 });
 
 test("widget.js reads its endpoint from the data-api-url attribute (the swap point)", () => {
