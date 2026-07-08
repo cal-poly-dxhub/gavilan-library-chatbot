@@ -60,6 +60,16 @@ GENERATION_TEMPERATURE = float(os.environ.get("GENERATION_TEMPERATURE", "0.2"))
 # and the platform limits (API GW 10MB / Lambda 6MB) are far too high to protect.
 MAX_QUERY_CHARS = int(os.environ.get("MAX_QUERY_CHARS", "2000"))
 
+# Max number of conversation turns (prior + current) used from a request. Single-session history
+# is trimmed to the LAST this-many messages SERVER-SIDE before seeding the Converse loop - the
+# client is never trusted to cap it. Older turns are dropped. See _seed_messages for why the trim
+# can never yield a request Converse rejects (it drops a leading assistant turn and merges any
+# consecutive same-role turns, so the seed always starts with user and stays alternating).
+MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "10"))
+
+# The only conversation roles accepted from the client. A widget "bot" turn maps to "assistant".
+_VALID_ROLES = ("user", "assistant")
+
 # Two Bedrock guardrails, set by the CDK stack from config.yaml. Either pair may be unset
 # locally, in which case that screen is skipped rather than failing:
 #   INPUT  - screened on the bare user query BEFORE retrieval via the ApplyGuardrail API
@@ -637,11 +647,13 @@ def _log_guardrail_assessment(response):
     )
 
 
-def run_agent(query):
+def run_agent(messages):
     """Agentic Bedrock Converse tool-use loop with KB semantic retrieval as the only tool.
 
-    The system prompt goes in Converse `system`; the user's (already input-screened) query is
-    the initial user message. Each turn:
+    `messages` is the seed conversation in Converse shape (a list of {role, content} turns,
+    starting with user and ending with the newest user turn - see _seed_messages), already
+    input-screened. The system prompt goes in Converse `system`, never into these messages. The
+    loop mutates its own copy of `messages`, so callers should pass a fresh list. Each turn:
       - call Converse with the one-tool toolConfig + the OUTPUT guardrail (backstop on every turn);
       - if the OUTPUT guardrail intervenes -> return the blocked message, no sources;
       - if stopReason == "tool_use" -> run the tool for EACH toolUse block the model requested
@@ -655,7 +667,6 @@ def run_agent(query):
     Returns {"answer", "blocked", "chunks", "catalog_sources"}: `chunks` are the KB passages from
     search_library_info (drive `sources` + eval full_context); `catalog_sources` are synthetic
     source entries a substantive database_catalog lookup contributed."""
-    messages = [{"role": "user", "content": [{"text": query}]}]
     collected_chunks = []
     catalog_sources = []
     answer = ""
@@ -794,6 +805,83 @@ def _extract_query(data):
     return query or None
 
 
+def _normalize_message(item):
+    """Coerce one client-supplied history entry into {"role", "text"}, or None if unusable.
+
+    Accepts a role of "user" or "assistant" (a widget "bot" turn maps to "assistant"); the text
+    may arrive as `content` or `text` and must be a non-empty string once stripped. Anything
+    malformed returns None so the caller can drop it rather than forwarding junk to Converse."""
+    if not isinstance(item, dict):
+        return None
+    role = item.get("role")
+    if not isinstance(role, str):
+        return None
+    role = role.strip().lower()
+    if role == "bot":
+        role = "assistant"
+    if role not in _VALID_ROLES:
+        return None
+    text = item.get("content")
+    if text is None:
+        text = item.get("text")
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    return {"role": role, "text": text}
+
+
+def _extract_conversation(data):
+    """The user/assistant conversation from a parsed request body (newest turn last), or None if
+    there is no usable user question to answer (-> the caller returns a clean 400).
+
+    Two accepted request shapes:
+      - {"messages": [{"role", "content"}, ...]} - single-session history. Malformed entries are
+        dropped; the conversation MUST end with a user turn (the new question).
+      - {"query": "..."} / {"question": "..."} - the legacy single-turn shape (eval + curl), which
+        becomes a one-message user conversation. Kept working for backward compatibility."""
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("messages")
+    if isinstance(raw, list):
+        msgs = [m for m in (_normalize_message(x) for x in raw) if m]
+        # The newest turn must be the user's question; otherwise there is nothing to answer.
+        if not msgs or msgs[-1]["role"] != "user":
+            return None
+        return msgs
+    # Legacy single-query shape.
+    query = _extract_query(data)
+    if not query:
+        return None
+    return [{"role": "user", "text": query}]
+
+
+def _seed_messages(conversation):
+    """Build the Converse `messages` seed from a normalized conversation, guaranteeing a request
+    Converse will accept (start with user, roles strictly alternate):
+      1. keep only the last MAX_HISTORY_MESSAGES turns (the server-side cap; the client is never
+         trusted to limit history);
+      2. drop any leading assistant turn(s) so the seed starts with a user message (a trailing
+         window of an alternating chat, or a widget greeting, can begin with assistant);
+      3. merge any consecutive same-role turns into one message with multiple text blocks, since
+         Converse/Anthropic reject repeated roles - this covers both a buggy client and any
+         adjacency the trim/drop introduced.
+    The result always starts with user and ends with the newest user turn."""
+    trimmed = conversation[-MAX_HISTORY_MESSAGES:]
+    start = 0
+    while start < len(trimmed) and trimmed[start]["role"] != "user":
+        start += 1
+    trimmed = trimmed[start:]
+    messages = []
+    for msg in trimmed:
+        if messages and messages[-1]["role"] == msg["role"]:
+            messages[-1]["content"].append({"text": msg["text"]})
+        else:
+            messages.append({"role": msg["role"], "content": [{"text": msg["text"]}]})
+    return messages
+
+
 # Optional request flag: when true, /query additionally returns the full retrieved passages
 # (what the model actually saw). The answer-quality eval sets it; the widget never does.
 _FULL_CONTEXT_FLAG = "include_full_context"
@@ -859,11 +947,18 @@ def _handle_warm():
 
 
 def _handle_query(event):
-    """Query path (POST /query): validate -> input screen -> retrieve -> generate."""
+    """Query path (POST /query): validate -> input screen -> retrieve -> generate.
+
+    Accepts either the single-session history shape ({"messages": [...]}) or the legacy single
+    {"query": ...} shape; both collapse to a normalized conversation whose newest turn is the
+    user's current question."""
     data = _parse_body(event)
-    query = _extract_query(data)
-    if not query:
+    conversation = _extract_conversation(data)
+    if not conversation:
         return _response(400, {"error": "Missing 'query' in request body."})
+    # The newest user turn is the question being asked now; it drives the size cap and the input
+    # screen. Prior turns were already screened when they were first sent, one request each.
+    query = conversation[-1]["text"]
     # Server-side size cap: reject an oversized query BEFORE any retrieval or guardrail call.
     # This is a clean 400, distinct from a guardrail block (a 200 carrying the block message).
     if len(query) > MAX_QUERY_CHARS:
@@ -887,11 +982,14 @@ def _handle_query(event):
         decision, screened_query = _apply_input_guardrail(query)
         if decision == "block":
             return _response(200, {"answer": screened_query, "sources": []})
+        # Replace the newest user turn with the screened text (masked, if the guardrail
+        # anonymized PII) before seeding, so the agent runs on the screened question.
+        conversation[-1]["text"] = screened_query
         # The agentic loop: Converse tool-use with KB retrieval as the sole tool. Retrieval,
         # generation, and the output-guardrail backstop all happen inside; on any fault this
-        # whole step reports as the "agent" stage.
+        # whole step reports as the "agent" stage. Seed it with the trimmed conversation history.
         stage = "agent"
-        result = run_agent(screened_query)
+        result = run_agent(_seed_messages(conversation))
     except Exception as exc:  # noqa: BLE001 - deliberately broad: any AWS/runtime fault
         return _error_response(stage, exc)
 
