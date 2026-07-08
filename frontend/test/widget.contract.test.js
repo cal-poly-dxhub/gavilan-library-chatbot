@@ -289,4 +289,286 @@ test("apiUrl fallback selector is scoped to the widget's own script tag", () => 
   );
 });
 
+// =========================================================================
+// ===  tiny dependency-free DOM fake (jsdom is not available offline)  ====
+// =========================================================================
+// Enough of the DOM for mount() and the markdown renderer: elements with
+// children, className/classList, attributes, textContent, and event
+// listeners you can fire(). Text nodes are {nodeType:3}. This lets the
+// contract test exercise real widget behavior without any dependency.
+
+function makeEl(tagName) {
+  var el = {
+    tagName: tagName,
+    nodeType: 1,
+    children: [],
+    _text: "",
+    attrs: {},
+    listeners: {},
+    style: {},
+    hidden: false,
+    disabled: false,
+    className: "",
+    parentNode: null
+  };
+  el.classList = {
+    _s: {},
+    add: function (c) { this._s[c] = true; },
+    remove: function (c) { delete this._s[c]; },
+    contains: function (c) { return !!this._s[c]; }
+  };
+  el.appendChild = function (c) { c.parentNode = el; el.children.push(c); return c; };
+  el.removeChild = function (c) {
+    var i = el.children.indexOf(c);
+    if (i >= 0) el.children.splice(i, 1);
+    c.parentNode = null;
+    return c;
+  };
+  el.setAttribute = function (k, v) { el.attrs[k] = String(v); };
+  el.getAttribute = function (k) {
+    return Object.prototype.hasOwnProperty.call(el.attrs, k) ? el.attrs[k] : null;
+  };
+  el.addEventListener = function (t, fn) { (el.listeners[t] = el.listeners[t] || []).push(fn); };
+  el.attachShadow = function () { el.shadow = makeEl("#shadow"); return el.shadow; };
+  el.focus = function () {};
+  el.querySelector = function () { return null; };
+  el.fire = function (t, ev) {
+    ev = ev || {};
+    ev.preventDefault = ev.preventDefault || function () {};
+    ev.stopPropagation = ev.stopPropagation || function () {};
+    (el.listeners[t] || []).slice().forEach(function (fn) { fn(ev); });
+  };
+  Object.defineProperty(el, "textContent", {
+    get: function () {
+      if (el.children.length === 0) return el._text;
+      return el.children.map(function (c) { return c.textContent; }).join("");
+    },
+    set: function (v) { el._text = String(v); el.children = []; }
+  });
+  Object.defineProperty(el, "scrollHeight", { get: function () { return 40; } });
+  el.scrollTop = 0;
+  return el;
+}
+
+function makeDoc() {
+  var doc = {
+    createElement: function (tag) { return makeEl(tag); },
+    createTextNode: function (t) {
+      var n = { nodeType: 3, tagName: "#text", children: [], _t: String(t) };
+      Object.defineProperty(n, "textContent", { get: function () { return n._t; } });
+      return n;
+    },
+    getElementById: function () { return null; }
+  };
+  doc.body = makeEl("body");
+  return doc;
+}
+
+function collectByTag(node, tag) {
+  var out = [];
+  (node.children || []).forEach(function (c) {
+    if (c.tagName === tag) out.push(c);
+    out = out.concat(collectByTag(c, tag));
+  });
+  return out;
+}
+
+function allText(node) {
+  if (node.nodeType === 3) return node.textContent;
+  var s = node._text || "";
+  (node.children || []).forEach(function (c) { s += allText(c); });
+  return s;
+}
+
+function findByClass(node, cls) {
+  if (!node) return null;
+  var cn = node.className || "";
+  if ((" " + cn + " ").indexOf(" " + cls + " ") >= 0) return node;
+  if (node.classList && node.classList.contains(cls)) return node;
+  var kids = node.children || [];
+  for (var i = 0; i < kids.length; i++) {
+    var f = findByClass(kids[i], cls);
+    if (f) return f;
+  }
+  return node.shadow ? findByClass(node.shadow, cls) : null;
+}
+
+function countUserTurns(state) {
+  return state.messages.filter(function (m) { return m.role === "user"; }).length;
+}
+
+// Let one microtask/timer cycle drain so settled fetch promises run their handlers.
+function flush() {
+  return new Promise(function (r) { setTimeout(r, 0); });
+}
+
+// Install browser-ish globals (document for apiUrl, a fetch stub) for the duration of a
+// test; returns a restore fn. `fetchImpl` decides success vs failure.
+function withNetwork(fetchImpl) {
+  var priorDoc = global.document;
+  var priorFetch = global.fetch;
+  var priorErr = console.error;
+  global.document = {
+    querySelector: function () {
+      return { getAttribute: function () { return "https://api.test/query"; } };
+    }
+  };
+  global.fetch = fetchImpl;
+  console.error = function () {}; // silence the widget's expected failure log; not a test failure
+  return function restore() {
+    global.document = priorDoc;
+    global.fetch = priorFetch;
+    console.error = priorErr;
+  };
+}
+
+// --- markdown rendering: safe DOM, correct structure --------------------
+test("renderMarkdown renders bold, links, and lists as real DOM nodes", () => {
+  var doc = makeDoc();
+  var root = doc.createElement("div");
+  widget.renderMarkdown(
+    root,
+    "See **hours** and [the page](https://gav.edu/x).\n\n- one\n- two",
+    doc
+  );
+  var strong = collectByTag(root, "strong");
+  assert.strictEqual(strong.length, 1);
+  assert.strictEqual(strong[0].textContent, "hours");
+
+  var links = collectByTag(root, "a");
+  assert.strictEqual(links.length, 1);
+  assert.strictEqual(links[0].href, "https://gav.edu/x");
+  assert.strictEqual(links[0].target, "_blank");
+  assert.match(links[0].rel, /noopener noreferrer/);
+  assert.strictEqual(links[0].textContent, "the page");
+
+  var lists = collectByTag(root, "ul");
+  assert.strictEqual(lists.length, 1);
+  var items = collectByTag(lists[0], "li");
+  assert.deepStrictEqual(items.map(function (li) { return li.textContent; }), ["one", "two"]);
+});
+
+test("renderMarkdown renders numbered lists as <ol>", () => {
+  var doc = makeDoc();
+  var root = doc.createElement("div");
+  widget.renderMarkdown(root, "1. first\n2. second", doc);
+  var ol = collectByTag(root, "ol");
+  assert.strictEqual(ol.length, 1);
+  assert.strictEqual(collectByTag(ol[0], "li").length, 2);
+});
+
+test("renderMarkdown is injection-safe: no markup or scripts from message content", () => {
+  var doc = makeDoc();
+  var root = doc.createElement("div");
+  widget.renderMarkdown(
+    root,
+    "<script>alert(1)</script> <b>x</b> [evil](javascript:alert(1)) [data](data:text/html,x)",
+    doc
+  );
+  // Nothing from the content becomes an element: no <script>, no <b>, and dangerous
+  // link schemes are NOT linkified (label kept as text).
+  assert.strictEqual(collectByTag(root, "script").length, 0);
+  assert.strictEqual(collectByTag(root, "b").length, 0);
+  assert.strictEqual(collectByTag(root, "a").length, 0, "javascript:/data: URLs are never linkified");
+  var text = allText(root);
+  assert.ok(/<script>alert\(1\)<\/script>/.test(text), "angle brackets survive as literal text");
+  assert.ok(/evil/.test(text) && /data/.test(text), "unsafe link labels kept as text");
+});
+
+// --- double-append fix: a retry must not duplicate the user turn --------
+test("a failed send followed by retry does NOT duplicate the user turn in the transcript", async () => {
+  var restore = withNetwork(function () {
+    return Promise.reject(new Error("network down"));
+  });
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    assert.ok(handle, "widget mounted");
+
+    handle.submit("what are the hours?");
+    await flush();
+
+    var state = handle.getState();
+    // greeting(bot) + one user turn; the failed send appends no bot turn.
+    assert.strictEqual(countUserTurns(state), 1, "one user turn after the first failed send");
+
+    // Click the retry button in the rendered error bubble.
+    var retryBtn = findByClass(handle.shadow, "retry");
+    assert.ok(retryBtn, "an error/retry button is shown after a failed send");
+    retryBtn.fire("click");
+    await flush();
+
+    // THE regression: retry resends the existing transcript; it must not append a 2nd user turn.
+    assert.strictEqual(
+      countUserTurns(handle.getState()),
+      1,
+      "retry must not add a phantom duplicate user turn"
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("a successful send records exactly one user turn and one new bot turn", async () => {
+  var restore = withNetwork(function () {
+    return Promise.resolve({
+      ok: true,
+      json: function () {
+        return Promise.resolve({ answer: "Open **9-5**.", sources: [] });
+      }
+    });
+  });
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    var before = handle.getState().messages.length; // greeting only
+    handle.submit("hours?");
+    await flush();
+    var msgs = handle.getState().messages;
+    assert.strictEqual(countUserTurns(handle.getState()), 1);
+    // greeting + user + bot answer
+    assert.strictEqual(msgs.length, before + 2);
+    assert.strictEqual(msgs[msgs.length - 1].role, "bot");
+    // The bot turn stores the RAW markdown (what we echo back to the server), not rendered HTML.
+    assert.strictEqual(msgs[msgs.length - 1].text, "Open **9-5**.");
+  } finally {
+    restore();
+  }
+});
+
+// --- expandable window --------------------------------------------------
+test("the header expand control toggles the expanded size class and aria-pressed", () => {
+  var doc = makeDoc();
+  var handle = widget.mount(doc);
+  var panel = findByClass(handle.shadow, "panel");
+  var expandBtn = findByClass(handle.shadow, "header__expand");
+  assert.ok(panel && expandBtn, "panel and expand control exist");
+
+  assert.ok(!panel.classList.contains("panel--expanded"), "starts at default size");
+  assert.strictEqual(expandBtn.getAttribute("aria-pressed"), "false");
+
+  expandBtn.fire("click");
+  assert.ok(panel.classList.contains("panel--expanded"), "expands on click");
+  assert.strictEqual(expandBtn.getAttribute("aria-pressed"), "true");
+
+  expandBtn.fire("click");
+  assert.ok(!panel.classList.contains("panel--expanded"), "collapses on second click");
+  assert.strictEqual(expandBtn.getAttribute("aria-pressed"), "false");
+});
+
+test("expanded dimensions clamp to the viewport (usable on mobile)", () => {
+  // The .panel--expanded rule sizes with min(...) against the viewport, so a phone can't
+  // get an off-screen panel.
+  assert.ok(/\.panel--expanded\s*\{[^}]*min\(/.test(SOURCE), "expanded width/height clamp with min()");
+});
+
+// --- brand color: one swappable token -----------------------------------
+test("the primary color is a single --brand token, reused (not hardcoded per spot)", () => {
+  assert.ok(/--brand:\s*#[0-9a-fA-F]{3,8}\s*;/.test(SOURCE), "defines a single --brand token");
+  assert.ok(/--accent:\s*var\(--brand\)/.test(SOURCE), "accent derives from --brand");
+  assert.ok(/--user-bg:\s*var\(--brand\)/.test(SOURCE), "user bubble derives from --brand");
+  // The old hardcoded blue is fully gone.
+  assert.ok(!/#1f4e79/i.test(SOURCE), "old blue accent value removed");
+});
+
 run();

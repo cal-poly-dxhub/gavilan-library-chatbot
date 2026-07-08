@@ -210,15 +210,151 @@
     }
   }
 
+  // ---- minimal, safe markdown renderer ------------------------------------
+  //
+  // Renders a small, well-defined markdown subset (bold, italic, inline code,
+  // links, bullet/numbered lists, headings, paragraphs with soft breaks) into
+  // real DOM nodes. It builds every node with createElement + createTextNode
+  // ONLY - never innerHTML - so message content can never inject markup or run
+  // scripts, and link targets are passed through safeHttpUrl (javascript:/data:/
+  // relative URLs degrade to plain text). Anything unrecognized renders as literal
+  // text. The model's answers are the only input; user messages stay plain text.
+
+  // Inline rules, in scan-precedence order: code first (its contents are never
+  // re-parsed), then links, then bold, then italic.
+  var MD_INLINE = [
+    { re: /`([^`]+)`/, kind: "code" },
+    { re: /\[([^\]]+)\]\(([^)\s]+)\)/, kind: "link" },
+    { re: /\*\*([^*]+)\*\*/, kind: "strong" },
+    { re: /__([^_]+)__/, kind: "strong" },
+    { re: /\*([^*]+)\*/, kind: "em" },
+    { re: /_([^_]+)_/, kind: "em" }
+  ];
+
+  /** Render inline markdown in `text` as child nodes appended to `parent`. */
+  function renderInline(parent, text, doc) {
+    var remaining = String(text == null ? "" : text);
+    while (remaining) {
+      var best = null;
+      for (var i = 0; i < MD_INLINE.length; i++) {
+        var m = MD_INLINE[i].re.exec(remaining);
+        if (m && (best === null || m.index < best.match.index)) {
+          best = { spec: MD_INLINE[i], match: m };
+        }
+      }
+      if (!best) {
+        parent.appendChild(doc.createTextNode(remaining));
+        break;
+      }
+      var match = best.match;
+      if (match.index > 0) {
+        parent.appendChild(doc.createTextNode(remaining.slice(0, match.index)));
+      }
+      var kind = best.spec.kind;
+      if (kind === "link") {
+        var href = safeHttpUrl(match[2]);
+        if (href) {
+          var a = doc.createElement("a");
+          a.className = "md-link";
+          a.href = href;
+          a.target = "_blank";
+          a.rel = "noopener noreferrer nofollow";
+          renderInline(a, match[1], doc);
+          parent.appendChild(a);
+        } else {
+          // Unsafe/relative URL: never linkify; keep the label as plain text.
+          parent.appendChild(doc.createTextNode(match[1]));
+        }
+      } else if (kind === "code") {
+        var code = doc.createElement("code");
+        code.className = "md-code";
+        code.textContent = match[1]; // literal, never re-parsed
+        parent.appendChild(code);
+      } else {
+        var el = doc.createElement(kind === "strong" ? "strong" : "em");
+        renderInline(el, match[1], doc);
+        parent.appendChild(el);
+      }
+      remaining = remaining.slice(match.index + match[0].length);
+    }
+  }
+
+  var MD_BULLET = /^\s*[-*+]\s+(.*)$/;
+  var MD_ORDERED = /^\s*\d+[.)]\s+(.*)$/;
+  var MD_HEADING = /^\s*#{1,6}\s+(.*)$/;
+
+  /** Render block-level markdown from `md` as child nodes appended to `parent`. */
+  function renderMarkdown(parent, md, doc) {
+    var lines = String(md == null ? "" : md).replace(/\r\n?/g, "\n").split("\n");
+    var i = 0;
+    while (i < lines.length) {
+      if (/^\s*$/.test(lines[i])) { i++; continue; } // skip blank lines between blocks
+
+      var ordered = MD_ORDERED.test(lines[i]);
+      var bullet = MD_BULLET.test(lines[i]);
+      if (ordered || bullet) {
+        var list = doc.createElement(ordered ? "ol" : "ul");
+        list.className = "md-list";
+        var itemRe = ordered ? MD_ORDERED : MD_BULLET;
+        while (i < lines.length) {
+          var im = itemRe.exec(lines[i]);
+          if (!im) break;
+          var li = doc.createElement("li");
+          renderInline(li, im[1], doc);
+          list.appendChild(li);
+          i++;
+        }
+        parent.appendChild(list);
+        continue;
+      }
+
+      var hm = MD_HEADING.exec(lines[i]);
+      if (hm) {
+        var heading = doc.createElement("p");
+        heading.className = "md-heading";
+        renderInline(heading, hm[1], doc);
+        parent.appendChild(heading);
+        i++;
+        continue;
+      }
+
+      // Paragraph: consecutive non-blank lines that aren't a list/heading; a single
+      // newline inside becomes a soft <br> break.
+      var para = [];
+      while (
+        i < lines.length &&
+        !/^\s*$/.test(lines[i]) &&
+        !MD_BULLET.test(lines[i]) &&
+        !MD_ORDERED.test(lines[i]) &&
+        !MD_HEADING.test(lines[i])
+      ) {
+        para.push(lines[i]);
+        i++;
+      }
+      var p = doc.createElement("p");
+      p.className = "md-p";
+      for (var k = 0; k < para.length; k++) {
+        if (k > 0) p.appendChild(doc.createElement("br"));
+        renderInline(p, para[k], doc);
+      }
+      parent.appendChild(p);
+    }
+  }
+
   // ---- styles (scoped inside the shadow root) -----------------------------
 
   var STYLES = [
     ":host { all: initial; }",
     "*, *::before, *::after { box-sizing: border-box; }",
     ".root {",
-    "  --accent: #1f4e79; --accent-ink: #ffffff;",
+    // PRIMARY BRAND COLOR - the single source of truth. Everything that reads as
+    // "brand" (header, launcher, buttons, user bubbles, links) derives from --brand,
+    // so swapping this one value re-skins the widget. Placeholder maroon; replace with
+    // the real Gavilan brand value later.
+    "  --brand: #7b1e2b;",
+    "  --accent: var(--brand); --accent-ink: #ffffff;",
     "  --bg: #ffffff; --panel-border: #d9dee5;",
-    "  --user-bg: #1f4e79; --user-ink: #ffffff;",
+    "  --user-bg: var(--brand); --user-ink: #ffffff;",
     "  --bot-bg: #f1f3f6; --bot-ink: #1a1d21;",
     "  --muted: #5b6570; --error-bg: #fdecea; --error-ink: #8a1c12;",
     "  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;",
@@ -251,6 +387,13 @@
     "  border-radius: 14px; overflow: hidden;",
     "  box-shadow: 0 12px 40px rgba(0,0,0,0.24);",
     "}",
+    // Expanded size, toggled from the header. width/height both clamp to the viewport
+    // via min(), so on a phone this collapses to the same near-full-width panel and the
+    // gain is mostly extra height - usable on desktop and mobile alike.
+    ".panel--expanded {",
+    "  width: min(720px, calc(100vw - 24px));",
+    "  height: min(860px, calc(100vh - 32px));",
+    "}",
     ".panel[hidden], .launcher[hidden] { display: none !important; }",
     // header
     ".header {",
@@ -265,6 +408,14 @@
     "}",
     ".header__close:hover { background: rgba(255,255,255,0.18); }",
     ".header__close:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }",
+    ".header__actions { display: inline-flex; align-items: center; gap: 2px; }",
+    ".header__expand {",
+    "  appearance: none; border: none; background: transparent;",
+    "  color: var(--accent-ink); font-size: 17px; line-height: 1;",
+    "  cursor: pointer; padding: 2px 6px; border-radius: 6px;",
+    "}",
+    ".header__expand:hover { background: rgba(255,255,255,0.18); }",
+    ".header__expand:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }",
     // thread
     ".thread {",
     "  flex: 1 1 auto; overflow-y: auto; padding: 14px;",
@@ -291,6 +442,22 @@
     ".sources__link:hover { text-decoration: underline; }",
     ".sources__link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }",
     ".sources__excerpt { color: var(--muted); font-size: 12.5px; margin-top: 2px; }",
+    // rendered markdown (assistant messages). Block spacing is tight; first/last
+    // children lose their outer margin so the bubble stays snug.
+    ".md { white-space: normal; }",
+    ".md > :first-child { margin-top: 0; }",
+    ".md > :last-child { margin-bottom: 0; }",
+    ".md-p { margin: 0 0 8px; }",
+    ".md-heading { margin: 0 0 8px; font-weight: 700; }",
+    ".md-list { margin: 0 0 8px; padding-left: 20px; }",
+    ".md-list li { margin: 2px 0; }",
+    ".md-code {",
+    "  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;",
+    "  font-size: 0.9em; background: rgba(0,0,0,0.06); padding: 1px 4px; border-radius: 4px;",
+    "}",
+    ".md-link { color: var(--accent); font-weight: 600; text-decoration: underline; word-break: break-word; }",
+    ".md-link:hover { text-decoration: none; }",
+    ".md-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }",
     // typing indicator
     ".typing { display: inline-flex; gap: 4px; align-items: center; padding: 4px 2px; }",
     ".typing .dot { width: 7px; height: 7px; border-radius: 50%; background: #9aa4b0; animation: gv-blink 1.2s infinite ease-in-out; }",
@@ -361,7 +528,7 @@
     shadow.appendChild(root);
 
     // in-memory session state (no storage)
-    var state = { open: false, pending: false, messages: [], lastQuestion: null };
+    var state = { open: false, pending: false, expanded: false, messages: [], lastQuestion: null };
 
     // launcher
     var launcher = doc.createElement("button");
@@ -390,13 +557,23 @@
     var hTitle = doc.createElement("span");
     hTitle.className = "header__title";
     hTitle.textContent = CONFIG.title;
+    var hExpand = doc.createElement("button");
+    hExpand.type = "button";
+    hExpand.className = "header__expand";
+    hExpand.setAttribute("aria-label", "Expand chat");
+    hExpand.setAttribute("aria-pressed", "false");
+    hExpand.textContent = "⤢"; // diagonal resize glyph
     var hClose = doc.createElement("button");
     hClose.type = "button";
     hClose.className = "header__close";
     hClose.setAttribute("aria-label", "Close chat");
     hClose.textContent = "×"; // ×
+    var hActions = doc.createElement("div");
+    hActions.className = "header__actions";
+    hActions.appendChild(hExpand);
+    hActions.appendChild(hClose);
     header.appendChild(hTitle);
-    header.appendChild(hClose);
+    header.appendChild(hActions);
 
     var thread = doc.createElement("div");
     thread.className = "thread";
@@ -493,10 +670,16 @@
       var bubble = doc.createElement("div");
       bubble.className = "bubble";
       var textEl = doc.createElement("div");
-      textEl.textContent =
+      textEl.className = "md";
+      // Render the assistant answer as markdown (safe DOM, no innerHTML). The
+      // no-response fallback is plain text and renders as a single paragraph.
+      renderMarkdown(
+        textEl,
         answer && answer.trim()
           ? answer
-          : "Sorry, I didn't get a response. Please try again.";
+          : "Sorry, I didn't get a response. Please try again.",
+        doc
+      );
       bubble.appendChild(textEl);
       if (sources && sources.length) {
         bubble.appendChild(buildSources(sources));
@@ -569,7 +752,8 @@
         retry.textContent = "Try again";
         retry.addEventListener("click", function () {
           wrap.parentNode && wrap.parentNode.removeChild(wrap);
-          submitQuestion(question);
+          // Resend the existing transcript; do NOT re-append the user turn (it's already there).
+          deliver(question);
         });
         bubble.appendChild(retry);
       }
@@ -609,11 +793,20 @@
       var text = String(question == null ? "" : question).trim();
       if (!text || state.pending) return;
       state.lastQuestion = text;
-      appendUserMessage(text);
+      appendUserMessage(text); // the user turn is appended to the transcript exactly ONCE, here
+      deliver(text);
+    }
+
+    /**
+     * Send the current transcript to the backend and render the reply. `question` is used only
+     * to re-arm the retry button on failure; it is NOT re-appended, so retrying a failed send
+     * never duplicates the user turn in the transcript (the transcript already holds it).
+     */
+    function deliver(question) {
+      if (state.pending) return;
       setPending(true);
       var typing = showTyping();
 
-      // Send the whole transcript (the new user turn is already appended above).
       sendQuery(conversationForRequest()).then(
         function (result) {
           typing.done();
@@ -623,7 +816,7 @@
         },
         function (err) {
           typing.done();
-          appendError(text);
+          appendError(question);
           setPending(false);
           focusInput();
           if (typeof console !== "undefined" && console.error) {
@@ -663,8 +856,24 @@
       }
     }
 
+    // Toggle the panel between its default and expanded size. A CSS class drives the
+    // size (both dimensions clamp to the viewport), so this stays usable on mobile.
+    function toggleExpand() {
+      state.expanded = !state.expanded;
+      if (state.expanded) {
+        panel.classList.add("panel--expanded");
+      } else {
+        panel.classList.remove("panel--expanded");
+      }
+      hExpand.setAttribute("aria-pressed", state.expanded ? "true" : "false");
+      hExpand.setAttribute("aria-label", state.expanded ? "Shrink chat" : "Expand chat");
+      hExpand.textContent = state.expanded ? "⤡" : "⤢";
+      scrollToBottom();
+    }
+
     launcher.addEventListener("click", openPanel);
     hClose.addEventListener("click", closePanel);
+    hExpand.addEventListener("click", toggleExpand);
 
     form.addEventListener("submit", function (e) {
       e.preventDefault();
@@ -731,6 +940,7 @@
       warmUrl: warmUrl,
       safeHttpUrl: safeHttpUrl,
       displayUrl: displayUrl,
+      renderMarkdown: renderMarkdown,
       CONFIG: CONFIG,
       HOST_ID: HOST_ID
     };
