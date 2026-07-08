@@ -11,24 +11,6 @@ from infra.infra_stack import GavilanChatbotStack
 CONFIG = load_config()
 
 
-def _flatten_arn(value):
-    """Reconstruct an OSS policy string from a template value that may be a plain string or an
-    Fn::Join of literals + Ref/GetAtt tokens (role ARNs make the whole policy an Fn::Join).
-    Tokens are rendered as REF:/GETATT: markers so the JSON structure stays parseable."""
-    if isinstance(value, str):
-        return value
-    if isinstance(value, dict):
-        if "Fn::Join" in value:
-            return "".join(_flatten_arn(p) for p in value["Fn::Join"][1])
-        if "Fn::GetAtt" in value:
-            return "GETATT:" + value["Fn::GetAtt"][0]
-        if "Ref" in value:
-            return "REF:" + value["Ref"]
-    if isinstance(value, list):
-        return "".join(_flatten_arn(p) for p in value)
-    return str(value)
-
-
 def _template():
     # Skip asset bundling: the scraper deps layer bundles (pip --platform / Docker) at real synth,
     # which needs no Docker for tests and would be slow/network-bound. The resources still
@@ -77,101 +59,63 @@ def _query_role_statements(template):
     return statements
 
 
-def test_vector_collection_and_policies_created():
+def test_no_opensearch_serverless_resources_remain():
+    # The migration to S3 Vectors must leave NOTHING from the OpenSearch Serverless path behind:
+    # no collection, no security/access policies, no serverless index.
     template = _template()
+    template.resource_count_is("AWS::OpenSearchServerless::Collection", 0)
+    template.resource_count_is("AWS::OpenSearchServerless::SecurityPolicy", 0)
+    template.resource_count_is("AWS::OpenSearchServerless::AccessPolicy", 0)
+    template.resource_count_is("AWS::OpenSearchServerless::Index", 0)
+
+
+def test_s3_vector_bucket_created():
+    template = _template()
+    template.resource_count_is("AWS::S3Vectors::VectorBucket", 1)
     template.has_resource_properties(
-        "AWS::OpenSearchServerless::Collection",
-        {"Name": CONFIG["vector_store"]["collection_name"], "Type": "VECTORSEARCH"},
-    )
-    # Encryption + network policies.
-    template.resource_count_is("AWS::OpenSearchServerless::SecurityPolicy", 2)
-    template.resource_count_is("AWS::OpenSearchServerless::AccessPolicy", 1)
-
-
-def _oss_policy(template, policy_type):
-    """The parsed policy document of the single OSS SecurityPolicy of a given type."""
-    for res in template.find_resources("AWS::OpenSearchServerless::SecurityPolicy").values():
-        if res["Properties"]["Type"] == policy_type:
-            return json.loads(_flatten_arn(res["Properties"]["Policy"]))
-    raise AssertionError(f"no {policy_type} security policy")
-
-
-def test_network_policy_exposes_collection_only_not_dashboard():
-    # Nothing uses OpenSearch Dashboards, so only the collection endpoint is exposed to public
-    # access - no dashboard rule.
-    template = _template()
-    policy = _oss_policy(template, "network")
-    resource_types = {r["ResourceType"] for stmt in policy for r in stmt["Rules"]}
-    assert resource_types == {"collection"}, resource_types
-
-
-def test_data_access_policy_grants_deploy_role_full_index_lifecycle():
-    # The CloudFormation cfn-exec role (which actually creates/replaces/deletes the CfnIndex)
-    # must be a principal with the full index lifecycle, or cdk deploy/destroy fail on an
-    # authorization error.
-    template = _template()
-    ap = _one(template, "AWS::OpenSearchServerless::AccessPolicy")
-    policy = json.loads(_flatten_arn(ap["Properties"]["Policy"]))
-
-    deploy_stmts = [
-        stmt
-        for stmt in policy
-        if any("cfn-exec-role" in p for p in stmt["Principal"])
-    ]
-    assert len(deploy_stmts) == 1, [s["Principal"] for s in policy]
-    lifecycle = {
-        perm
-        for rule in deploy_stmts[0]["Rules"]
-        if rule["ResourceType"] == "index"
-        for perm in rule["Permission"]
-    }
-    assert {
-        "aoss:CreateIndex",
-        "aoss:UpdateIndex",
-        "aoss:DeleteIndex",
-        "aoss:DescribeIndex",
-    } <= lifecycle, lifecycle
-
-
-def test_vector_index_uses_configured_dimensions():
-    template = _template()
-    template.has_resource_properties(
-        "AWS::OpenSearchServerless::Index",
-        {
-            "IndexName": CONFIG["vector_store"]["index_name"],
-            "Mappings": {
-                "Properties": {
-                    CONFIG["vector_store"]["fields"]["vector"]: {
-                        "Type": "knn_vector",
-                        "Dimension": CONFIG["knowledge_base"]["vector_dimension"],
-                    }
-                }
-            },
-        },
+        "AWS::S3Vectors::VectorBucket",
+        {"VectorBucketName": CONFIG["vector_store"]["vector_bucket_name"]},
     )
 
 
-def test_knowledge_base_field_mapping_matches_index():
+def test_s3_vector_index_dimension_metric_datatype_and_nonfilterable_keys():
     template = _template()
-    fields = CONFIG["vector_store"]["fields"]
-    # The KB field mapping must reference exactly the fields the index defines.
-    template.has_resource_properties(
-        "AWS::Bedrock::KnowledgeBase",
-        {
-            "Name": CONFIG["knowledge_base"]["name"],
-            "StorageConfiguration": {
-                "Type": "OPENSEARCH_SERVERLESS",
-                "OpensearchServerlessConfiguration": {
-                    "VectorIndexName": CONFIG["vector_store"]["index_name"],
-                    "FieldMapping": {
-                        "VectorField": fields["vector"],
-                        "TextField": fields["text"],
-                        "MetadataField": fields["metadata"],
-                    },
-                },
-            },
-        },
-    )
+    template.resource_count_is("AWS::S3Vectors::Index", 1)
+    (index,) = template.find_resources("AWS::S3Vectors::Index").values()
+    props = index["Properties"]
+    assert props["IndexName"] == CONFIG["vector_store"]["index_name"]
+    # dimension MUST equal the embedding model's output (Titan v2 = 1024).
+    assert props["Dimension"] == CONFIG["knowledge_base"]["vector_dimension"]
+    assert props["DataType"] == CONFIG["vector_store"]["data_type"]          # float32
+    assert props["DistanceMetric"] == CONFIG["vector_store"]["distance_metric"]  # cosine
+    # The non-filterable metadata keys (the ingestion-blocking trap) are set at creation.
+    non_filterable = props["MetadataConfiguration"]["NonFilterableMetadataKeys"]
+    assert non_filterable == CONFIG["vector_store"]["non_filterable_metadata_keys"]
+    # The two Bedrock-internal culprits must be present.
+    assert "AMAZON_BEDROCK_TEXT" in non_filterable
+    assert "AMAZON_BEDROCK_METADATA" in non_filterable
+
+
+def test_s3_vector_index_depends_on_bucket():
+    # The index lives in the bucket; the bucket must be created first.
+    template = _template()
+    (index,) = template.find_resources("AWS::S3Vectors::Index").values()
+    depends = json.dumps(index.get("DependsOn", []))
+    assert "VectorBucket" in depends, depends
+
+
+def test_knowledge_base_storage_is_s3_vectors_pointing_at_the_index():
+    template = _template()
+    (kb,) = template.find_resources("AWS::Bedrock::KnowledgeBase").values()
+    storage = kb["Properties"]["StorageConfiguration"]
+    assert storage["Type"] == "S3_VECTORS"
+    s3v = storage["S3VectorsConfiguration"]
+    assert s3v["IndexName"] == CONFIG["vector_store"]["index_name"]
+    # Bucket ARN + index ARN are GetAtt refs to the vector bucket + index (not hardcoded).
+    assert s3v["VectorBucketArn"]["Fn::GetAtt"][0].startswith("VectorBucket"), s3v
+    assert s3v["IndexArn"]["Fn::GetAtt"][0].startswith("VectorIndex"), s3v
+    # S3 Vectors has no field mapping (unlike OpenSearch Serverless).
+    assert "FieldMapping" not in s3v
 
 
 def test_knowledge_base_created_after_index():
@@ -354,7 +298,7 @@ def test_query_lambda_has_its_own_role_distinct_from_kb_role():
     assert query_role_id != kb_roles[0]
 
     # The query role grants Retrieve + InvokeModel* (InvokeModel* because the generation model
-    # is invoked through a cross-region inference profile) but NOT the KB's aoss actions.
+    # is invoked through a cross-region inference profile) but NOT the KB's vector-store actions.
     template.has_resource_properties(
         "AWS::IAM::Policy",
         assertions.Match.object_like(
@@ -522,6 +466,42 @@ def test_kb_role_can_read_source_bucket():
         # bucket ARN is a GetAtt; objects ARN is a Join of [GetAtt, "/*"].
         blob = json.dumps(r)
         assert "KnowledgeBaseSourceBucket" in blob, r
+
+
+def test_kb_role_has_s3vectors_dataplane_grant_scoped_to_index_and_no_aoss():
+    # The KB role must read/write the S3 Vectors index (the documented data-plane actions), scoped
+    # to the index ARN - and must carry NO OpenSearch Serverless (aoss) permissions anymore.
+    template = _template()
+    all_stmts = [
+        stmt
+        for policy in template.find_resources("AWS::IAM::Policy").values()
+        for stmt in policy["Properties"]["PolicyDocument"]["Statement"]
+    ]
+    s3v_stmts = [
+        s for s in all_stmts
+        if any(
+            str(a).startswith("s3vectors:")
+            for a in (s["Action"] if isinstance(s["Action"], list) else [s["Action"]])
+        )
+    ]
+    assert len(s3v_stmts) == 1, s3v_stmts
+    actions = set(s3v_stmts[0]["Action"])
+    assert actions == {
+        "s3vectors:PutVectors",
+        "s3vectors:GetVectors",
+        "s3vectors:DeleteVectors",
+        "s3vectors:QueryVectors",
+        "s3vectors:GetIndex",
+    }, actions
+    # Scoped to the vector index ARN (GetAtt), not a wildcard.
+    resource = s3v_stmts[0]["Resource"]
+    assert json.dumps(resource).count("VectorIndex") >= 1, resource
+    assert resource != "*"
+
+    # No aoss action survives anywhere in the template.
+    for s in all_stmts:
+        acts = s["Action"] if isinstance(s["Action"], list) else [s["Action"]]
+        assert not any(str(a).startswith("aoss:") for a in acts), s
 
 
 # --- Scraper Lambda: deps layer, function, IAM, EventBridge schedule ----------------------------
