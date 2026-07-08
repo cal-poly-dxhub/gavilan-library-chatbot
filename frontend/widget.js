@@ -54,7 +54,15 @@
     greeting:
       "Hi! I'm the Gavilan College Library assistant. I can help with hours, " +
       "checking out materials, textbooks, and what the library offers. " +
-      "What can I help you find?"
+      "What can I help you find?",
+    // Starter questions shown as clickable buttons on first launch, under the greeting.
+    // They disappear as soon as the user sends any message. Scoped to what the bot handles.
+    suggestedQuestions: [
+      "What are the library hours?",
+      "How do I check out a book?",
+      "Where do I find my textbook?",
+      "What research databases are available?"
+    ]
   };
 
   // Capture the script element at load time (before the deferred mount runs),
@@ -408,6 +416,29 @@
     el.appendChild(icon);
   }
 
+  // ---- title font ---------------------------------------------------------
+  //
+  // The title uses Bitter, loaded once from Google Fonts. The <link> goes in the HOST document
+  // head (not the shadow root) because @font-face registered at the document level is usable
+  // inside the shadow tree, which a shadow-scoped link cannot guarantee across browsers. Purely
+  // decorative: if the host site's CSP blocks the font, the title just falls back to serif.
+  var FONT_LINK_ID = "gavilan-chatbot-font";
+  var FONT_HREF =
+    "https://fonts.googleapis.com/css2?family=Bitter:wght@600;700&display=swap";
+
+  function ensureTitleFont(doc) {
+    try {
+      if (!doc || !doc.head || doc.getElementById(FONT_LINK_ID)) return;
+      var link = doc.createElement("link");
+      link.id = FONT_LINK_ID;
+      link.rel = "stylesheet";
+      link.href = FONT_HREF;
+      doc.head.appendChild(link);
+    } catch (e) {
+      /* font is decorative; never let it break the widget */
+    }
+  }
+
   // ---- styles (scoped inside the shadow root) -----------------------------
 
   var STYLES = [
@@ -416,9 +447,8 @@
     ".root {",
     // PRIMARY BRAND COLOR - the single source of truth. Everything that reads as
     // "brand" (header, launcher, buttons, user bubbles, links) derives from --brand,
-    // so swapping this one value re-skins the widget. Placeholder maroon; replace with
-    // the real Gavilan brand value later.
-    "  --brand: #7b1e2b;",
+    // so swapping this one value re-skins the widget.
+    "  --brand: #8a1c30;",
     "  --accent: var(--brand); --accent-ink: #ffffff;",
     "  --bg: #ffffff; --panel-border: #d9dee5;",
     "  --user-bg: var(--brand); --user-ink: #ffffff;",
@@ -469,7 +499,9 @@
     "  display: flex; align-items: center; justify-content: space-between;",
     "  padding: 12px 14px; background: var(--accent); color: var(--accent-ink);",
     "}",
-    ".header__title { font-size: 15px; font-weight: 600; }",
+    // Title uses Bitter (loaded from Google Fonts into the host document head at mount);
+    // falls back to a serif until/if it loads. Only the title uses it - body/UI stays default.
+    ".header__title { font-family: 'Bitter', Georgia, 'Times New Roman', serif; font-size: 15px; font-weight: 700; }",
     ".header__close {",
     "  appearance: none; border: none; background: transparent;",
     "  color: var(--accent-ink); font-size: 22px; line-height: 1;",
@@ -562,7 +594,14 @@
     "  padding: 9px 11px; border: 1px solid #c8cfd8; border-radius: 10px;",
     "  font: inherit; color: inherit; background: #fff;",
     "}",
-    ".composer__input:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; border-color: var(--accent); }",
+    // Soft focus ring: a translucent tint of --brand instead of the full-strength red, so the
+    // text box highlight on focus reads gently rather than harsh/bold. Derived from --brand so
+    // it still tracks the single color token.
+    ".composer__input:focus-visible {",
+    "  outline: 2px solid color-mix(in srgb, var(--brand) 38%, transparent);",
+    "  outline-offset: 0;",
+    "  border-color: color-mix(in srgb, var(--brand) 55%, transparent);",
+    "}",
     ".composer__send {",
     "  flex: 0 0 auto; appearance: none; border: none; border-radius: 10px;",
     "  background: var(--accent); color: var(--accent-ink); cursor: pointer;",
@@ -571,6 +610,17 @@
     ".composer__send:hover:not(:disabled) { filter: brightness(1.07); }",
     ".composer__send:disabled { opacity: .5; cursor: default; }",
     ".composer__send:focus-visible { outline: 3px solid #9ec5ff; outline-offset: 2px; }",
+    // first-launch example questions (removed after the first message)
+    ".suggestions { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; margin: 2px 0 2px; }",
+    ".suggestions__label { font-size: 12px; color: var(--muted); margin-bottom: 2px; }",
+    ".suggestion {",
+    "  appearance: none; cursor: pointer; text-align: left; max-width: 100%;",
+    "  background: #fff; border: 1px solid var(--panel-border); color: var(--accent);",
+    "  font: inherit; font-size: 13px; font-weight: 600; line-height: 1.3;",
+    "  padding: 8px 12px; border-radius: 12px;",
+    "}",
+    ".suggestion:hover { border-color: var(--accent); background: color-mix(in srgb, var(--brand) 6%, #fff); }",
+    ".suggestion:focus-visible { outline: 2px solid color-mix(in srgb, var(--brand) 45%, transparent); outline-offset: 2px; }",
     // visually-hidden (for a11y live region labels)
     ".sr-only {",
     "  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;",
@@ -590,6 +640,8 @@
     doc = doc || (typeof document !== "undefined" ? document : null);
     if (!doc || !doc.body) return null;
     if (doc.getElementById(HOST_ID)) return null; // already mounted
+
+    ensureTitleFont(doc); // load Bitter for the title (host document head; safe no-op if blocked)
 
     var host = doc.createElement("div");
     host.id = HOST_ID;
@@ -892,9 +944,43 @@
       return out;
     }
 
+    // First-launch example questions. Rendered under the greeting; each is a button that submits
+    // that question. They are removed on the first message (typed or clicked), never to return.
+    var suggestionsWrap = null;
+
+    function renderSuggestions() {
+      var qs = CONFIG.suggestedQuestions;
+      if (!qs || !qs.length) return;
+      var wrap = doc.createElement("div");
+      wrap.className = "suggestions";
+      var label = doc.createElement("div");
+      label.className = "suggestions__label";
+      label.textContent = "Try asking:";
+      wrap.appendChild(label);
+      qs.forEach(function (q) {
+        var btn = doc.createElement("button");
+        btn.type = "button";
+        btn.className = "suggestion";
+        btn.textContent = q;
+        btn.addEventListener("click", function () { submitQuestion(q); });
+        wrap.appendChild(btn);
+      });
+      thread.appendChild(wrap);
+      suggestionsWrap = wrap;
+      scrollToBottom();
+    }
+
+    function removeSuggestions() {
+      if (suggestionsWrap && suggestionsWrap.parentNode) {
+        suggestionsWrap.parentNode.removeChild(suggestionsWrap);
+      }
+      suggestionsWrap = null;
+    }
+
     function submitQuestion(question) {
       var text = String(question == null ? "" : question).trim();
       if (!text || state.pending) return;
+      removeSuggestions(); // the starter questions go away once any message is sent
       state.lastQuestion = text;
       appendUserMessage(text); // the user turn is appended to the transcript exactly ONCE, here
       deliver(text);
@@ -1006,8 +1092,9 @@
       }
     });
 
-    // seed the greeting so it's present when the panel opens
+    // seed the greeting + first-launch example questions so they're present when the panel opens
     appendBotMessage(CONFIG.greeting, []);
+    renderSuggestions();
 
     return {
       host: host,

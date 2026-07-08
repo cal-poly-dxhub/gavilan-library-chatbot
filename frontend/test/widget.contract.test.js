@@ -698,4 +698,91 @@ test("the primary color is a single --brand token, reused (not hardcoded per spo
   assert.ok(!/#1f4e79/i.test(SOURCE), "old blue accent value removed");
 });
 
+test("the brand red is the exact Claude Design value", () => {
+  assert.ok(/--brand:\s*#8a1c30\s*;/i.test(SOURCE), "--brand is #8a1c30");
+});
+
+// --- title font ----------------------------------------------------------
+test("the title uses the Bitter font, loaded from Google Fonts", () => {
+  // Header title font-family is Bitter (body/UI is untouched).
+  assert.ok(
+    /\.header__title\s*\{[^}]*font-family:\s*'Bitter'/.test(SOURCE),
+    "header title uses Bitter"
+  );
+  // The font is loaded via a Google Fonts link for Bitter.
+  assert.ok(
+    /fonts\.googleapis\.com\/css2\?family=Bitter/.test(SOURCE),
+    "loads the Bitter font stylesheet"
+  );
+  assert.ok(/ensureTitleFont\(/.test(SOURCE), "font link is injected at mount");
+});
+
+// --- softened focus ring on the composer --------------------------------
+test("the text box focus ring is a softened tint of the brand, not full-strength", () => {
+  assert.ok(
+    /\.composer__input:focus-visible\s*\{[\s\S]*color-mix\(in srgb, var\(--brand\)/.test(SOURCE),
+    "composer focus outline uses a translucent color-mix of --brand"
+  );
+  // It must NOT be the old full-strength solid accent outline.
+  assert.ok(
+    !/\.composer__input:focus-visible\s*\{\s*outline:\s*2px solid var\(--accent\)/.test(SOURCE),
+    "no full-strength solid accent outline remains"
+  );
+});
+
+// --- first-launch example questions -------------------------------------
+test("example questions appear on first launch and each is clickable", () => {
+  var doc = makeDoc();
+  var handle = widget.mount(doc);
+  var suggestions = findByClass(handle.shadow, "suggestions");
+  assert.ok(suggestions, "a suggestions block is shown on first launch");
+  var btns = findAll(handle.shadow, "suggestion");
+  assert.ok(btns.length >= 3, "several starter question buttons are shown");
+  // Each button carries a non-empty question string.
+  btns.forEach(function (b) {
+    assert.ok(typeof b.textContent === "string" && b.textContent.length > 0);
+  });
+});
+
+test("clicking an example question submits it and removes the suggestions", async () => {
+  var asked = null;
+  var restore = withNetwork(function (url, init) {
+    asked = JSON.parse(init.body); // capture what got sent
+    return okJson({ answer: "A", sources: [] })();
+  });
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    var firstBtn = findAll(handle.shadow, "suggestion")[0];
+    var questionText = firstBtn.textContent;
+    firstBtn.fire("click");
+    await flush();
+
+    // The clicked question was submitted...
+    var lastMsg = asked.messages[asked.messages.length - 1];
+    assert.strictEqual(lastMsg.role, "user");
+    assert.strictEqual(lastMsg.content, questionText);
+    // ...and the suggestions are gone.
+    assert.strictEqual(findByClass(handle.shadow, "suggestions"), null, "suggestions removed after use");
+    assert.strictEqual(handle.getState().messages.filter(function (m) { return m.role === "user"; }).length, 1);
+  } finally {
+    restore();
+  }
+});
+
+test("suggestions disappear after a typed message and do not come back", async () => {
+  var restore = withNetwork(okJson({ answer: "A", sources: [] }));
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    assert.ok(findByClass(handle.shadow, "suggestions"), "present before any message");
+    handle.submit("a typed question"); await flush();
+    assert.strictEqual(findByClass(handle.shadow, "suggestions"), null, "gone after first message");
+    handle.submit("a second question"); await flush();
+    assert.strictEqual(findByClass(handle.shadow, "suggestions"), null, "still gone after later messages");
+  } finally {
+    restore();
+  }
+});
+
 run();
