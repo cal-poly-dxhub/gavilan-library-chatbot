@@ -351,7 +351,7 @@ def test_tool_result_fed_back_to_model_with_passages_and_sources(monkeypatch):
     tool_names = {
         t["toolSpec"]["name"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]
     }
-    assert tool_names == {"search_library_info", "database_catalog", "search_book_catalog"}
+    assert tool_names == {"search_library_info", "database_catalog", "search_book_catalog", "search_course_reserves"}
     # The initial user message is the bare question (not a context-wrapped prompt).
     assert _user_text(bedrock) == "What are the library hours?"
     # The second call's messages carry the assistant tool_use turn AND a user toolResult.
@@ -1470,7 +1470,7 @@ def test_both_tools_advertised_with_differentiated_descriptions(monkeypatch):
     handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hi"})), None)
 
     tools = {t["toolSpec"]["name"]: t["toolSpec"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]}
-    assert set(tools) == {"search_library_info", "database_catalog", "search_book_catalog"}
+    assert set(tools) == {"search_library_info", "database_catalog", "search_book_catalog", "search_course_reserves"}
     cat_schema = tools["database_catalog"]["inputSchema"]["json"]
     assert set(cat_schema["properties"]) == {"query_type", "value"}
     assert cat_schema["properties"]["query_type"]["enum"] == ["name", "subject"]
@@ -2039,7 +2039,7 @@ def test_primo_tool_advertised_with_query_schema(monkeypatch):
     handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hi"})), None)
 
     tools = {t["toolSpec"]["name"]: t["toolSpec"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]}
-    assert set(tools) == {"search_library_info", "database_catalog", "search_book_catalog"}
+    assert set(tools) == {"search_library_info", "database_catalog", "search_book_catalog", "search_course_reserves"}
     primo_schema = tools["search_book_catalog"]["inputSchema"]["json"]
     assert set(primo_schema["properties"]) == {"query"}
     assert primo_schema["required"] == ["query"]
@@ -2142,3 +2142,233 @@ def test_primo_and_search_sources_merge_and_dedupe(monkeypatch):
     assert "https://gav.edu/library/borrow" in uris
     assert any(u.startswith("https://caccl-gavilan.primo.exlibrisgroup.com/discovery/search") for u in uris)
     assert len(uris) == len(set(uris))  # no duplicates
+
+
+# --- Phase 2d: search_course_reserves (live Primo CourseReserves scope) ----------------------
+#
+# A fourth tool, mirroring search_book_catalog but in the CourseReserves scope: textbooks/materials
+# on reserve for a class. Same EVIDENCE-not-verdict posture (total == 0 is the only clean
+# not-on-reserve signal; soft-fail on any error; defensive parsing). The reserve-specific piece is
+# crsinfo, which links a record to one or more COURSE CODES (a single item can serve several
+# courses). Reuses the Primo test seams (_primo_get_json stub via _wire_primo).
+
+
+RESERVES_TOOL = "search_course_reserves"
+
+
+def _reserve_doc(title, *, author="", courses=("PSYC C1000",), rid="alma1"):
+    """A CourseReserves `docs` entry: one crsinfo list ENTRY per course, in the real
+    $$R<code>$$V<code>: <code>; <dept>$$M<code> shape."""
+    crsinfo = [f"$$R{c}$$V{c}: {c}; Dept$$M{c}" for c in courses]
+    return {
+        "pnx": {
+            "display": {
+                "title": [title],
+                "creator": [author] if author else [],
+                "crsinfo": crsinfo,
+            },
+            "control": {"recordid": [rid], "score": ["1.0"]},
+        }
+    }
+
+
+def reserves_tool_use_turn(query="PSYC C1000", *, tool_use_id="tu-1"):
+    return {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"toolUse": {"toolUseId": tool_use_id, "name": RESERVES_TOOL, "input": {"query": query}}}
+                ],
+            }
+        },
+        "stopReason": "tool_use",
+    }
+
+
+# -- Direct unit tests of _run_reserves_tool --
+
+
+def test_reserves_parses_courses_and_availability(monkeypatch):
+    payload = _primo_search_payload(
+        [_reserve_doc("Introduction to psychology", author="Kalat, James W.$$Qauthor", courses=["PSYC C1000"], rid="r1")],
+        total=5,
+    )
+    # A reserve delivery reports the Course Reserve sublocation.
+    _wire_primo(monkeypatch, payload, {"r1": _delivery_available(main="Gilroy Campus", sub="Course Reserve", call="BF121 .K26 2022")})
+
+    result, source = handler._run_reserves_tool({"query": "PSYC C1000"})
+
+    assert result["total"] == 5
+    assert "error" not in result
+    row = result["results"][0]
+    assert row["title"] == "Introduction to psychology"
+    assert row["author"] == "Kalat, James W."  # $$-delimited creator cleaned
+    assert row["courses"] == ["PSYC C1000"]
+    assert row["availability"]["status"] == "available"
+    # The Course Reserve sublocation is surfaced in the location.
+    assert "Course Reserve" in row["availability"]["location"]
+    assert row["availability"]["call_number"] == "BF121 .K26 2022"
+    # A lookup with candidates contributes the reserves results-page source.
+    assert source is not None
+    assert source["uri"].startswith("https://caccl-gavilan.primo.exlibrisgroup.com/discovery/search")
+    assert "CourseReserves" in source["uri"]
+
+
+def test_reserves_multi_course_item(monkeypatch):
+    # A single item on reserve for TWO courses (two crsinfo entries), one with a trailing backslash
+    # like the real data - both course codes parse, deduped, backslash stripped.
+    doc = {
+        "pnx": {
+            "display": {
+                "title": ["Understanding psychology"],
+                "crsinfo": [
+                    "$$RPSYC C1000$$VPSYC C1000: PSYC C1000; Psychology$$MPSYC C1000\\",
+                    "$$RPSYCH 10$$VPSYCH 10: PSYCH 10; Psychology$$MPSYCH 10",
+                ],
+            },
+            "control": {"recordid": ["m1"]},
+        }
+    }
+    _wire_primo(monkeypatch, _primo_search_payload([doc], total=3), {"m1": _delivery_available(sub="Course Reserve")})
+
+    result, _ = handler._run_reserves_tool({"query": "understanding psychology"})
+
+    assert result["results"][0]["courses"] == ["PSYC C1000", "PSYCH 10"]
+
+
+def test_reserves_total_zero_is_authoritative_not_on_reserve(monkeypatch):
+    _wire_primo(monkeypatch, _primo_search_payload([], total=0))
+
+    result, source = handler._run_reserves_tool({"query": "ZZZZ 999"})
+
+    assert result["total"] == 0
+    assert result["results"] == []
+    assert "reserve" in result["note"].lower()
+    assert source is None  # nothing found -> no verify link
+
+
+def test_reserves_malformed_docs_degrade_without_crashing(monkeypatch):
+    # Junk shapes plus a good doc whose crsinfo is missing (courses -> []). Must not crash.
+    monkeypatch.setattr(handler, "PRIMO_NUMBER_OF_RESULTS", 10)
+    docs = [
+        "not a dict",
+        {"pnx": "not a dict"},
+        {"pnx": {"display": {"crsinfo": "not a list", "title": ["No Course Info"]}, "control": {"recordid": ["g0"]}}},
+        {"pnx": {"display": {}, "control": {}}},  # no title -> dropped
+        _reserve_doc("Good Reserve Book", courses=["KIN 8"], rid="g1"),
+    ]
+    _wire_primo(monkeypatch, _primo_search_payload(docs, total=5),
+                {"g0": _delivery_available(sub="Course Reserve"), "g1": _delivery_available(sub="Course Reserve")})
+
+    result, _ = handler._run_reserves_tool({"query": "whatever"})
+
+    titles = {r["title"]: r for r in result["results"]}
+    assert "Good Reserve Book" in titles and titles["Good Reserve Book"]["courses"] == ["KIN 8"]
+    # crsinfo that isn't a list degrades to an empty courses list, not a crash.
+    assert "No Course Info" in titles and titles["No Course Info"]["courses"] == []
+
+
+def test_reserves_search_failure_soft_fails(monkeypatch):
+    _wire_primo(monkeypatch, _primo_search_payload([]), search_exc=TimeoutError("reserves timed out"))
+
+    result, source = handler._run_reserves_tool({"query": "PSYC C1000"})
+
+    assert result["error"] == "reserves_unavailable"
+    assert "unavailable" in result["note"].lower()
+    assert source is None
+
+
+def test_reserves_availability_failure_degrades_to_unknown(monkeypatch):
+    _wire_primo(monkeypatch, _primo_search_payload([_reserve_doc("Book", courses=["PSYC C1000"], rid="a1")], total=2),
+                delivery_exc=ConnectionError("delivery down"))
+
+    result, _ = handler._run_reserves_tool({"query": "psych book"})
+
+    assert result["total"] == 2
+    assert result["results"][0]["availability"]["status"] == "unknown"
+    assert result["results"][0]["courses"] == ["PSYC C1000"]
+
+
+def test_reserves_blank_query_is_error_no_source(monkeypatch):
+    monkeypatch.setattr(
+        handler, "_primo_get_json",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not hit Primo for a blank query")),
+    )
+    result, source = handler._run_reserves_tool({"query": "  "})
+    assert "error" in result
+    assert source is None
+
+
+def test_reserves_delivery_uses_reserves_scope_and_book_catalog_stays_general(monkeypatch):
+    # Scope plumbing: the reserves availability call must query the CourseReserves scope, while the
+    # general book-catalog availability call must stay on MyInstitution. Capture the delivery URLs.
+    seen = {"reserves": [], "book": []}
+
+    def make_get(bucket):
+        def fake_get(url, timeout):
+            if "/L/" in url:
+                seen[bucket].append(url)
+                return _delivery_available()
+            return _primo_search_payload([_reserve_doc("X", rid="z1") if bucket == "reserves" else _primo_doc("X", rid="z1")], total=1)
+        return fake_get
+
+    monkeypatch.setattr(handler, "_primo_get_json", make_get("reserves"))
+    handler._run_reserves_tool({"query": "PSYC C1000"})
+    monkeypatch.setattr(handler, "_primo_get_json", make_get("book"))
+    handler._run_primo_tool({"query": "the great gatsby"})
+
+    assert seen["reserves"] and all("scope=CourseReserves" in u for u in seen["reserves"])
+    assert seen["book"] and all("scope=MyInstitution" in u for u in seen["book"])
+
+
+# -- search_course_reserves inside the agent loop --
+
+
+def test_reserves_tool_advertised_with_query_schema(monkeypatch):
+    # The toolConfig now carries FOUR tools; search_course_reserves takes a single `query`.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("hi")])
+    _wire(monkeypatch, agent, bedrock)
+
+    handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hi"})), None)
+
+    tools = {t["toolSpec"]["name"]: t["toolSpec"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]}
+    assert set(tools) == {"search_library_info", "database_catalog", "search_book_catalog", "search_course_reserves"}
+    res_schema = tools["search_course_reserves"]["inputSchema"]["json"]
+    assert set(res_schema["properties"]) == {"query"}
+    assert res_schema["required"] == ["query"]
+
+
+def test_agent_routes_reserve_query_to_reserves_tool_and_contributes_source(monkeypatch):
+    agent = FakeAgentRuntime()
+    _wire_primo(
+        monkeypatch,
+        _primo_search_payload([_reserve_doc("Introduction to psychology", courses=["PSYC C1000"], rid="r1")], total=5),
+        {"r1": _delivery_available(sub="Course Reserve", call="BF121 .K26 2022")},
+    )
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            reserves_tool_use_turn("PSYC C1000"),
+            end_turn("The catalog shows it on reserve at the Course Reserve desk."),
+        ]
+    )
+    monkeypatch.setattr(handler, "_bedrock_client", lambda: bedrock)
+    monkeypatch.setattr(handler, "_agent_client", lambda: agent)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "what's on reserve for PSYC C1000?"})), None)
+
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert agent.calls == []  # KB search never ran
+    (tr,) = [
+        b["toolResult"]
+        for m in bedrock.converse_calls[1]["messages"]
+        for b in m.get("content", [])
+        if "toolResult" in b
+    ]
+    assert tr["status"] == "success"
+    assert tr["content"][0]["json"]["total"] == 5
+    assert tr["content"][0]["json"]["results"][0]["courses"] == ["PSYC C1000"]
+    assert len(body["sources"]) == 1
+    assert "CourseReserves" in body["sources"][0]["uri"]
