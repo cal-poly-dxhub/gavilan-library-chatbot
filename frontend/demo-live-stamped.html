@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Widget LIVE demo — Gavilan Library Chatbot (real backend)</title>
+  <!--
+    LIVE-MODE test harness. Counterpart to demo.html, but instead of the offline
+    mock it loads the REAL widget.js pointed at the DEPLOYED backend, so you can
+    exercise the actual bot (real retrieval + generation over the scraped
+    library content) end to end from your machine. demo.html stays the mock test;
+    this file is the live test. widget.js and mock.js are unchanged.
+
+    ============================================================================
+    HOW TO RUN
+    ============================================================================
+    1. STAMP THE API URL. Replace the https://gdysv675oh.execute-api.us-west-2.amazonaws.com/query token in the widget <script>
+       tag near the bottom of this file with the `ChatbotApiUrl` value from your
+       CDK deploy outputs, e.g.
+         https://abc123.execute-api.us-west-2.amazonaws.com/query
+       Use it AS-IS: it already ends in /query, which is exactly what the widget's
+       `data-api-url` attribute expects. (This widget reads the FULL /query URL
+       from data-api-url and derives /warm from it; it does NOT append the path
+       itself, so do NOT strip /query.) Leave https://gdysv675oh.execute-api.us-west-2.amazonaws.com/query as a token in the
+       committed file so it survives redeploys - only stamp your local copy.
+
+    2. SERVE OVER LOCALHOST (not file://). Browsers treat file:// as a null origin
+       and block cross-origin fetches; serve the folder instead:
+         cd frontend && python3 -m http.server 8000
+
+    3. OPEN  http://localhost:8000/demo-live.html
+
+    4. LIKELY FAILURE MODE - CORS. The widget calls the deployed API from the
+       http://localhost:8000 origin. If the API Gateway CORS config does not allow
+       that origin, the browser blocks the request and the widget shows an error -
+       even though the API itself works fine via curl (curl sends no Origin header,
+       so it bypasses CORS). So: if the widget errors but `curl` against the same
+       /query URL succeeds, the cause is almost certainly CORS - check the API's
+       allowed origins for http://localhost:8000 (both /query and the /warm ping
+       are subject to it).
+    ============================================================================
+
+    The hostile host-page CSS below is inherited from demo.html on purpose: it
+    proves the widget's Shadow DOM isolation still holds against the real widget.
+  -->
+  <style>
+    /* --- intentionally hostile host-page CSS to test style isolation --- */
+    * {
+      box-sizing: content-box !important;
+      font-family: "Comic Sans MS", cursive !important;
+      letter-spacing: 0.5px;
+    }
+    body {
+      margin: 0;
+      padding: 0;
+      background: repeating-linear-gradient(45deg, #fff, #fff 20px, #f3f0ff 20px, #f3f0ff 40px);
+      color: #202020;
+    }
+    button, section, div, a, textarea, ul, li, span {
+      color: hotpink !important;
+      font-size: 20px !important;
+      border: 2px dashed limegreen;
+      text-transform: uppercase;
+    }
+    a { text-decoration: overline underline wavy blue !important; }
+    /* If any of the above bled into the widget, it would look obviously broken. */
+
+    /* Tidy styling for the harness page's own content (scoped to .host-*). */
+    .host-wrap { max-width: 720px; margin: 0 auto; padding: 40px 24px 120px; }
+    .host-card {
+      border: 1px solid #d9dee5 !important;
+      border-radius: 12px;
+      background: #ffffff;
+      padding: 20px 24px;
+      margin-top: 18px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+    }
+    .host-note { font-size: 14px !important; color: #444 !important; text-transform: none; }
+    code { background: #eef1f5; padding: 2px 6px; border-radius: 5px; font-family: monospace !important; }
+
+    /* LIVE banner - unmistakable that this page hits the real backend. */
+    .host-live-banner {
+      border: 2px solid #b45309 !important;
+      background: #fff7ed !important;
+      color: #7c2d12 !important;
+      border-radius: 12px;
+      padding: 14px 18px;
+      margin-top: 8px;
+      font-size: 15px !important;
+      text-transform: none;
+      letter-spacing: normal;
+    }
+    .host-live-banner strong { color: #7c2d12 !important; }
+    .host-live-banner code { background: #ffedd5; }
+  </style>
+</head>
+<body>
+  <div class="host-wrap">
+    <h1>Gavilan College Library</h1>
+
+    <div class="host-live-banner">
+      <strong>LIVE MODE — this page calls the REAL deployed backend.</strong>
+      There is no mock here. Every question triggers a real
+      <code>POST /query</code> to the API Gateway endpoint stamped into the
+      widget tag (<code>data-api-url</code>), which runs live retrieval over the
+      scraped library content and Bedrock generation. Responses cost real Bedrock
+      calls and a cold first query can take ~15–25s while OpenSearch wakes.
+    </div>
+
+    <p class="host-note">
+      This is a mock host page (a stand-in for the library's real site) used to
+      test the embeddable chat widget against the live bot. The page's own CSS is
+      intentionally hostile to prove the widget's Shadow DOM isolation holds.
+    </p>
+
+    <div class="host-card">
+      <h2>Try the widget (real answers from scraped content)</h2>
+      <p class="host-note">
+        Click <strong>“Ask the Library”</strong> at the bottom-right, then try
+        questions that exercise the actual scraped library pages:
+      </p>
+      <ul class="host-note">
+        <li>“What are the library hours?”</li>
+        <li>“Can I check out a laptop?”</li>
+        <li>“What research databases does the library have?”</li>
+        <li>“How do I get a library card?”</li>
+      </ul>
+      <p class="host-note">
+        Answers should cite a source link back to a <code>gavilan.edu/library</code>
+        page. If the widget shows an error, see the CORS note in the file header.
+      </p>
+    </div>
+
+    <div class="host-card">
+      <h2 class="host-note">Pointing at a (re)deploy</h2>
+      <p class="host-note">
+        The endpoint lives in ONE place: the <code>data-api-url</code> attribute
+        on the <code>widget.js</code> script tag below, stamped in place of the
+        <code>https://gdysv675oh.execute-api.us-west-2.amazonaws.com/query</code> token. Paste the <code>ChatbotApiUrl</code> value
+        from the CDK outputs there as-is (it already ends in <code>/query</code>).
+        No mock.js is loaded on this page.
+      </p>
+    </div>
+  </div>
+
+  <!--
+    ============================================================
+    LIVE EMBED. This is the same one tag the real library site
+    uses. No mock.js is present, so the widget talks to the real
+    backend. Replace https://gdysv675oh.execute-api.us-west-2.amazonaws.com/query with the deployed /query URL
+    (the CDK `ChatbotApiUrl` output), used AS-IS:
+
+      data-api-url="https://abc123.execute-api.us-west-2.amazonaws.com/query"
+
+    Keep https://gdysv675oh.execute-api.us-west-2.amazonaws.com/query a token in the committed file; stamp only
+    your local copy so it survives redeploys.
+    ============================================================
+  -->
+  <script src="widget.js" data-api-url="https://gdysv675oh.execute-api.us-west-2.amazonaws.com/query" defer></script>
+</body>
+</html>
