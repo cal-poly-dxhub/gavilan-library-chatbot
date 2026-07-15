@@ -347,11 +347,11 @@ def test_tool_result_fed_back_to_model_with_passages_and_sources(monkeypatch):
 
     # Two converse calls: the tool request, then the final answer.
     assert len(bedrock.converse_calls) == 2
-    # The toolConfig advertises both tools; the search tool is present.
+    # The toolConfig advertises all tools; the search tool is present.
     tool_names = {
         t["toolSpec"]["name"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]
     }
-    assert tool_names == {"search_library_info", "database_catalog"}
+    assert tool_names == {"search_library_info", "database_catalog", "search_book_catalog", "search_course_reserves"}
     # The initial user message is the bare question (not a context-wrapped prompt).
     assert _user_text(bedrock) == "What are the library hours?"
     # The second call's messages carry the assistant tool_use turn AND a user toolResult.
@@ -1462,7 +1462,7 @@ def test_guardrail_block_drops_catalog_source(monkeypatch):
 
 
 def test_both_tools_advertised_with_differentiated_descriptions(monkeypatch):
-    # The toolConfig carries both tools, and the catalog input schema uses query_type/value.
+    # The toolConfig carries all tools, and the catalog input schema uses query_type/value.
     agent = FakeAgentRuntime()
     bedrock = FakeBedrockRuntime(converse_script=[end_turn("hi")])
     _wire(monkeypatch, agent, bedrock)
@@ -1470,7 +1470,7 @@ def test_both_tools_advertised_with_differentiated_descriptions(monkeypatch):
     handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hi"})), None)
 
     tools = {t["toolSpec"]["name"]: t["toolSpec"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]}
-    assert set(tools) == {"search_library_info", "database_catalog"}
+    assert set(tools) == {"search_library_info", "database_catalog", "search_book_catalog", "search_course_reserves"}
     cat_schema = tools["database_catalog"]["inputSchema"]["json"]
     assert set(cat_schema["properties"]) == {"query_type", "value"}
     assert cat_schema["properties"]["query_type"]["enum"] == ["name", "subject"]
@@ -1783,3 +1783,592 @@ def test_bot_role_maps_to_assistant(monkeypatch):
         {"role": "assistant", "text": "9 to 5."},
         {"role": "user", "text": "weekends?"},
     ]
+
+
+# --- Phase 2c: search_book_catalog (live Primo book/media catalog) --------------------------
+#
+# Unlike database_catalog, Primo is NOT authoritative about absence: it always returns fuzzy
+# matches and its ranking is unreliable. The handler therefore returns EVIDENCE (candidate records
+# + availability + total) and the MODEL judges a match; there is NO score threshold and NO
+# held/not-held logic in the handler. total == 0 is the only clean not-held signal. The tool is a
+# live third-party call, so every failure must degrade to a "catalog unavailable" result, never
+# throw. These tests stub handler._primo_get_json (the single HTTP seam), so no network is touched.
+
+
+PRIMO_TOOL = "search_book_catalog"
+
+
+def _primo_doc(title, *, author="", year="", rid="alma1", typ="book"):
+    """A Primo search `docs` entry in the real pnx shape (display + control sections)."""
+    return {
+        "pnx": {
+            "display": {
+                "title": [title],
+                "creator": [author] if author else [],
+                "creationdate": [year] if year else [],
+                "type": [typ],
+            },
+            "control": {"recordid": [rid], "score": ["1.0"]},
+        }
+    }
+
+
+def _primo_search_payload(docs, total=None):
+    return {"info": {"total": total if total is not None else len(docs)}, "docs": docs}
+
+
+def _delivery_available(main="Gilroy Campus", sub="New Books", call="PS3511.I9 G7 2021i"):
+    return {
+        "delivery": {
+            "availability": ["available_in_library"],
+            "bestlocation": {
+                "availabilityStatus": "available",
+                "mainLocation": main,
+                "subLocation": sub,
+                "callNumber": call,
+            },
+        }
+    }
+
+
+def _delivery_online():
+    return {"delivery": {"availability": ["available"], "electronicServices": [{"serviceType": "Available Online"}]}}
+
+
+def _wire_primo(monkeypatch, search_payload, delivery_by_rid=None, *, search_exc=None, delivery_exc=None):
+    """Stub handler._primo_get_json: dispatch by URL to a canned search payload and per-record
+    delivery payloads. `search_exc`/`delivery_exc` force that leg to raise (soft-fail paths)."""
+    import urllib.parse as _up
+
+    delivery_by_rid = delivery_by_rid or {}
+
+    def fake_get(url, timeout):
+        if "/L/" in url:
+            if delivery_exc is not None:
+                raise delivery_exc
+            rid = _up.unquote(url.split("/L/")[1].split("?")[0])
+            return delivery_by_rid.get(rid, {"delivery": {}})
+        if search_exc is not None:
+            raise search_exc
+        return search_payload
+
+    monkeypatch.setattr(handler, "_primo_get_json", fake_get)
+
+
+def primo_tool_use_turn(query="the great gatsby", *, tool_use_id="tu-1"):
+    """A Converse response asking to call search_book_catalog."""
+    return {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"toolUse": {"toolUseId": tool_use_id, "name": PRIMO_TOOL, "input": {"query": query}}}
+                ],
+            }
+        },
+        "stopReason": "tool_use",
+    }
+
+
+# -- Direct unit tests of _run_primo_tool (no agent loop) --
+
+
+def test_primo_parses_results_with_availability(monkeypatch):
+    payload = _primo_search_payload(
+        [
+            _primo_doc("The Great Gatsby", author="Fitzgerald, F. Scott$$Qauthor", year="2021", rid="alma1"),
+            _primo_doc("The Great Gatsby", author="Paramount Pictures", year="2003", rid="alma2", typ="video"),
+        ],
+        total=110,
+    )
+    _wire_primo(
+        monkeypatch,
+        payload,
+        {"alma1": _delivery_available(), "alma2": _delivery_available(sub="Videos", call="PS3511.I9")},
+    )
+
+    result, source = handler._run_primo_tool({"query": "the great gatsby"})
+
+    # total is surfaced raw (the only not-held signal); no held/not-held verdict is computed.
+    assert result["total"] == 110
+    assert "held" not in result and "error" not in result
+    first = result["results"][0]
+    assert first["title"] == "The Great Gatsby"
+    # The $$-delimited creator is cleaned to just the name.
+    assert first["author"] == "Fitzgerald, F. Scott"
+    assert first["year"] == "2021"
+    assert first["availability"]["status"] == "available"
+    assert first["availability"]["location"] == "Gilroy Campus, New Books"
+    assert first["availability"]["call_number"] == "PS3511.I9 G7 2021i"
+    # A lookup with candidates contributes the Primo results-page source (a verify link).
+    assert source is not None
+    assert source["uri"].startswith("https://caccl-gavilan.primo.exlibrisgroup.com/discovery/search")
+
+
+def test_primo_total_zero_is_surfaced_and_contributes_no_source(monkeypatch):
+    # The ONLY clean not-held signal: total == 0, empty docs. The handler surfaces it and adds a
+    # note; it does not itself say "not held" (the model does, from total == 0).
+    _wire_primo(monkeypatch, _primo_search_payload([], total=0))
+
+    result, source = handler._run_primo_tool({"query": "obscure nonexistent zzqx treatise"})
+
+    assert result["total"] == 0
+    assert result["results"] == []
+    assert "not found" in result["note"].lower() or "no matching" in result["note"].lower()
+    assert source is None  # nothing found -> no verify link cited
+
+
+def test_primo_online_resource_reported_as_online(monkeypatch):
+    _wire_primo(monkeypatch, _primo_search_payload([_primo_doc("An E-Book", rid="e1")]), {"e1": _delivery_online()})
+
+    result, _ = handler._run_primo_tool({"query": "an e-book"})
+
+    assert result["results"][0]["availability"]["status"] == "online"
+    assert "Available Online" in result["results"][0]["availability"]["location"]
+
+
+def test_primo_malformed_docs_degrade_without_crashing(monkeypatch):
+    # A mix of junk: not a dict, missing pnx, non-list fields, a doc with no title (dropped), and
+    # one good doc. Parsing must never raise and must keep the salvageable record. Raise the cap so
+    # every doc (the good one is last) is actually processed, exercising all the junk shapes.
+    monkeypatch.setattr(handler, "PRIMO_NUMBER_OF_RESULTS", 10)
+    docs = [
+        "not a dict",
+        {"pnx": "not a dict"},
+        {"pnx": {"display": {"title": "not a list either"}}},  # title not a list -> handled
+        {"pnx": {"display": {}, "control": {}}},  # no title -> dropped
+        _primo_doc("Real Book", author="Real Author", rid="good1"),
+    ]
+    _wire_primo(monkeypatch, _primo_search_payload(docs, total=5), {"good1": _delivery_available()})
+
+    result, _ = handler._run_primo_tool({"query": "whatever"})
+
+    titles = [r["title"] for r in result["results"]]
+    # "not a list either" is a bare string title -> _primo_first accepts it; the good doc survives.
+    assert "Real Book" in titles
+    # The title-less doc and the non-dict entries produced no crash and no bogus rows.
+    assert all(r["title"] for r in result["results"])
+
+
+def test_primo_missing_availability_fields_degrade_to_unknown(monkeypatch):
+    # Delivery present but with a shape we don't recognize (no bestlocation / eservices / codes).
+    _wire_primo(monkeypatch, _primo_search_payload([_primo_doc("Book X", rid="x1")]), {"x1": {"delivery": {}}})
+
+    result, _ = handler._run_primo_tool({"query": "book x"})
+
+    assert result["results"][0]["availability"]["status"] in ("not available", "unknown")
+
+
+def test_primo_search_failure_soft_fails_without_throwing(monkeypatch):
+    # Primo down / timeout / bad response: the tool returns a catalog_unavailable result (so the
+    # model can still answer) and NEVER raises. No source is contributed.
+    _wire_primo(monkeypatch, _primo_search_payload([]), search_exc=TimeoutError("primo timed out"))
+
+    result, source = handler._run_primo_tool({"query": "the great gatsby"})
+
+    assert result["error"] == "catalog_unavailable"
+    assert "unavailable" in result["note"].lower()
+    assert source is None
+
+
+def test_primo_availability_failure_degrades_but_still_returns_results(monkeypatch):
+    # The search succeeds but every per-record delivery call fails: results still come back, each
+    # with availability "unknown", rather than the whole tool failing.
+    _wire_primo(
+        monkeypatch,
+        _primo_search_payload([_primo_doc("Book A", rid="a1")], total=3),
+        delivery_exc=ConnectionError("delivery endpoint down"),
+    )
+
+    result, _ = handler._run_primo_tool({"query": "book a"})
+
+    assert result["total"] == 3
+    assert result["results"][0]["availability"]["status"] == "unknown"
+
+
+def test_primo_blank_query_is_an_error_with_no_source(monkeypatch):
+    # No HTTP call should be needed; a blank query is an error result the model can recover from.
+    monkeypatch.setattr(
+        handler, "_primo_get_json",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not hit Primo for a blank query")),
+    )
+    result, source = handler._run_primo_tool({"query": "   "})
+    assert "error" in result
+    assert source is None
+
+
+def test_primo_availability_budget_skips_extra_lookups(monkeypatch):
+    # Once the availability wall-clock budget is exhausted, remaining results report "unknown" and
+    # no further delivery calls are made - the guard that stops a slow Primo eating the request.
+    monkeypatch.setattr(handler, "PRIMO_AVAILABILITY_BUDGET_SECONDS", -1.0)  # already past deadline
+    calls = {"delivery": 0}
+
+    def fake_get(url, timeout):
+        if "/L/" in url:
+            calls["delivery"] += 1
+            return _delivery_available()
+        return _primo_search_payload([_primo_doc("B1", rid="b1"), _primo_doc("B2", rid="b2")], total=2)
+
+    monkeypatch.setattr(handler, "_primo_get_json", fake_get)
+
+    result, _ = handler._run_primo_tool({"query": "b"})
+
+    assert calls["delivery"] == 0  # no availability lookups ran under a spent budget
+    assert all(r["availability"]["status"] == "unknown" for r in result["results"])
+
+
+def test_primo_respects_number_of_results_cap(monkeypatch):
+    # Even if Primo returns more docs than the cap, only PRIMO_NUMBER_OF_RESULTS are surfaced.
+    monkeypatch.setattr(handler, "PRIMO_NUMBER_OF_RESULTS", 2)
+    docs = [_primo_doc(f"Book {i}", rid=f"r{i}") for i in range(6)]
+    _wire_primo(monkeypatch, _primo_search_payload(docs, total=6), {f"r{i}": _delivery_available() for i in range(6)})
+
+    result, _ = handler._run_primo_tool({"query": "book"})
+    assert len(result["results"]) == 2
+
+
+# -- search_book_catalog inside the agent loop --
+
+
+def test_primo_tool_advertised_with_query_schema(monkeypatch):
+    # The toolConfig now carries THREE tools; search_book_catalog takes a single `query`.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("hi")])
+    _wire(monkeypatch, agent, bedrock)
+
+    handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hi"})), None)
+
+    tools = {t["toolSpec"]["name"]: t["toolSpec"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]}
+    assert set(tools) == {"search_library_info", "database_catalog", "search_book_catalog", "search_course_reserves"}
+    primo_schema = tools["search_book_catalog"]["inputSchema"]["json"]
+    assert set(primo_schema["properties"]) == {"query"}
+    assert primo_schema["required"] == ["query"]
+
+
+def test_agent_routes_book_query_to_primo_and_contributes_source(monkeypatch):
+    # End to end: the model calls search_book_catalog; the tool runs the real _run_primo_tool over
+    # stubbed HTTP; the answer returns with the Primo results-page as a source. KB search is unused.
+    agent = FakeAgentRuntime()
+    _wire_primo(
+        monkeypatch,
+        _primo_search_payload([_primo_doc("The Great Gatsby", author="Fitzgerald", rid="alma1")], total=110),
+        {"alma1": _delivery_available()},
+    )
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            primo_tool_use_turn("the great gatsby"),
+            end_turn("The catalog shows a copy available at the Gilroy Campus."),
+        ]
+    )
+    monkeypatch.setattr(handler, "_bedrock_client", lambda: bedrock)
+    monkeypatch.setattr(handler, "_agent_client", lambda: agent)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "do you have the great gatsby?"})), None)
+
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert body["answer"].startswith("The catalog shows")
+    # KB retrieval never ran (Primo handled it).
+    assert agent.calls == []
+    # The tool result fed back carries the total and the candidate record.
+    (tr,) = [
+        b["toolResult"]
+        for m in bedrock.converse_calls[1]["messages"]
+        for b in m.get("content", [])
+        if "toolResult" in b
+    ]
+    assert tr["status"] == "success"
+    assert tr["content"][0]["json"]["total"] == 110
+    # The Primo results-page source is attached.
+    assert len(body["sources"]) == 1
+    assert body["sources"][0]["uri"].startswith(
+        "https://caccl-gavilan.primo.exlibrisgroup.com/discovery/search"
+    )
+
+
+def test_agent_primo_soft_fail_still_answers(monkeypatch):
+    # Primo is down: the toolResult is a status=error catalog_unavailable payload, but the request
+    # still returns 200 with an answer and no sources - the loop never dies on a dead Primo.
+    agent = FakeAgentRuntime()
+    _wire_primo(monkeypatch, _primo_search_payload([]), search_exc=TimeoutError("down"))
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            primo_tool_use_turn("the great gatsby"),
+            end_turn("The catalog search is temporarily unavailable. Try the catalog or ask a librarian."),
+        ]
+    )
+    monkeypatch.setattr(handler, "_bedrock_client", lambda: bedrock)
+    monkeypatch.setattr(handler, "_agent_client", lambda: agent)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "do you have gatsby?"})), None)
+
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert "unavailable" in body["answer"].lower()
+    assert body["sources"] == []
+    (tr,) = [
+        b["toolResult"]
+        for m in bedrock.converse_calls[1]["messages"]
+        for b in m.get("content", [])
+        if "toolResult" in b
+    ]
+    assert tr["status"] == "error"
+    assert tr["content"][0]["json"]["error"] == "catalog_unavailable"
+
+
+def test_primo_and_search_sources_merge_and_dedupe(monkeypatch):
+    # The model uses BOTH search_library_info (KB passages) and search_book_catalog (Primo page).
+    # Sources merge with no duplicates, preserving the {answer, sources} contract.
+    agent = FakeAgentRuntime()  # two default KB chunks
+    _wire_primo(
+        monkeypatch,
+        _primo_search_payload([_primo_doc("A Book", rid="alma1")], total=1),
+        {"alma1": _delivery_available()},
+    )
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            tool_use_turn(query="library hours", tool_use_id="tu-1"),
+            primo_tool_use_turn("a book", tool_use_id="tu-2"),
+            end_turn("Here is everything."),
+        ]
+    )
+    monkeypatch.setattr(handler, "_bedrock_client", lambda: bedrock)
+    monkeypatch.setattr(handler, "_agent_client", lambda: agent)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours and a book"})), None)
+
+    uris = [s["uri"] for s in json.loads(resp["body"])["sources"]]
+    assert "https://gav.edu/library/hours" in uris
+    assert "https://gav.edu/library/borrow" in uris
+    assert any(u.startswith("https://caccl-gavilan.primo.exlibrisgroup.com/discovery/search") for u in uris)
+    assert len(uris) == len(set(uris))  # no duplicates
+
+
+# --- Phase 2d: search_course_reserves (live Primo CourseReserves scope) ----------------------
+#
+# A fourth tool, mirroring search_book_catalog but in the CourseReserves scope: textbooks/materials
+# on reserve for a class. Same EVIDENCE-not-verdict posture (total == 0 is the only clean
+# not-on-reserve signal; soft-fail on any error; defensive parsing). The reserve-specific piece is
+# crsinfo, which links a record to one or more COURSE CODES (a single item can serve several
+# courses). Reuses the Primo test seams (_primo_get_json stub via _wire_primo).
+
+
+RESERVES_TOOL = "search_course_reserves"
+
+
+def _reserve_doc(title, *, author="", courses=("PSYC C1000",), rid="alma1"):
+    """A CourseReserves `docs` entry: one crsinfo list ENTRY per course, in the real
+    $$R<code>$$V<code>: <code>; <dept>$$M<code> shape."""
+    crsinfo = [f"$$R{c}$$V{c}: {c}; Dept$$M{c}" for c in courses]
+    return {
+        "pnx": {
+            "display": {
+                "title": [title],
+                "creator": [author] if author else [],
+                "crsinfo": crsinfo,
+            },
+            "control": {"recordid": [rid], "score": ["1.0"]},
+        }
+    }
+
+
+def reserves_tool_use_turn(query="PSYC C1000", *, tool_use_id="tu-1"):
+    return {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"toolUse": {"toolUseId": tool_use_id, "name": RESERVES_TOOL, "input": {"query": query}}}
+                ],
+            }
+        },
+        "stopReason": "tool_use",
+    }
+
+
+# -- Direct unit tests of _run_reserves_tool --
+
+
+def test_reserves_parses_courses_and_availability(monkeypatch):
+    payload = _primo_search_payload(
+        [_reserve_doc("Introduction to psychology", author="Kalat, James W.$$Qauthor", courses=["PSYC C1000"], rid="r1")],
+        total=5,
+    )
+    # A reserve delivery reports the Course Reserve sublocation.
+    _wire_primo(monkeypatch, payload, {"r1": _delivery_available(main="Gilroy Campus", sub="Course Reserve", call="BF121 .K26 2022")})
+
+    result, source = handler._run_reserves_tool({"query": "PSYC C1000"})
+
+    assert result["total"] == 5
+    assert "error" not in result
+    row = result["results"][0]
+    assert row["title"] == "Introduction to psychology"
+    assert row["author"] == "Kalat, James W."  # $$-delimited creator cleaned
+    assert row["courses"] == ["PSYC C1000"]
+    assert row["availability"]["status"] == "available"
+    # The Course Reserve sublocation is surfaced in the location.
+    assert "Course Reserve" in row["availability"]["location"]
+    assert row["availability"]["call_number"] == "BF121 .K26 2022"
+    # A lookup with candidates contributes the reserves results-page source.
+    assert source is not None
+    assert source["uri"].startswith("https://caccl-gavilan.primo.exlibrisgroup.com/discovery/search")
+    assert "CourseReserves" in source["uri"]
+
+
+def test_reserves_multi_course_item(monkeypatch):
+    # A single item on reserve for TWO courses (two crsinfo entries), one with a trailing backslash
+    # like the real data - both course codes parse, deduped, backslash stripped.
+    doc = {
+        "pnx": {
+            "display": {
+                "title": ["Understanding psychology"],
+                "crsinfo": [
+                    "$$RPSYC C1000$$VPSYC C1000: PSYC C1000; Psychology$$MPSYC C1000\\",
+                    "$$RPSYCH 10$$VPSYCH 10: PSYCH 10; Psychology$$MPSYCH 10",
+                ],
+            },
+            "control": {"recordid": ["m1"]},
+        }
+    }
+    _wire_primo(monkeypatch, _primo_search_payload([doc], total=3), {"m1": _delivery_available(sub="Course Reserve")})
+
+    result, _ = handler._run_reserves_tool({"query": "understanding psychology"})
+
+    assert result["results"][0]["courses"] == ["PSYC C1000", "PSYCH 10"]
+
+
+def test_reserves_total_zero_is_authoritative_not_on_reserve(monkeypatch):
+    _wire_primo(monkeypatch, _primo_search_payload([], total=0))
+
+    result, source = handler._run_reserves_tool({"query": "ZZZZ 999"})
+
+    assert result["total"] == 0
+    assert result["results"] == []
+    assert "reserve" in result["note"].lower()
+    assert source is None  # nothing found -> no verify link
+
+
+def test_reserves_malformed_docs_degrade_without_crashing(monkeypatch):
+    # Junk shapes plus a good doc whose crsinfo is missing (courses -> []). Must not crash.
+    monkeypatch.setattr(handler, "PRIMO_NUMBER_OF_RESULTS", 10)
+    docs = [
+        "not a dict",
+        {"pnx": "not a dict"},
+        {"pnx": {"display": {"crsinfo": "not a list", "title": ["No Course Info"]}, "control": {"recordid": ["g0"]}}},
+        {"pnx": {"display": {}, "control": {}}},  # no title -> dropped
+        _reserve_doc("Good Reserve Book", courses=["KIN 8"], rid="g1"),
+    ]
+    _wire_primo(monkeypatch, _primo_search_payload(docs, total=5),
+                {"g0": _delivery_available(sub="Course Reserve"), "g1": _delivery_available(sub="Course Reserve")})
+
+    result, _ = handler._run_reserves_tool({"query": "whatever"})
+
+    titles = {r["title"]: r for r in result["results"]}
+    assert "Good Reserve Book" in titles and titles["Good Reserve Book"]["courses"] == ["KIN 8"]
+    # crsinfo that isn't a list degrades to an empty courses list, not a crash.
+    assert "No Course Info" in titles and titles["No Course Info"]["courses"] == []
+
+
+def test_reserves_search_failure_soft_fails(monkeypatch):
+    _wire_primo(monkeypatch, _primo_search_payload([]), search_exc=TimeoutError("reserves timed out"))
+
+    result, source = handler._run_reserves_tool({"query": "PSYC C1000"})
+
+    assert result["error"] == "reserves_unavailable"
+    assert "unavailable" in result["note"].lower()
+    assert source is None
+
+
+def test_reserves_availability_failure_degrades_to_unknown(monkeypatch):
+    _wire_primo(monkeypatch, _primo_search_payload([_reserve_doc("Book", courses=["PSYC C1000"], rid="a1")], total=2),
+                delivery_exc=ConnectionError("delivery down"))
+
+    result, _ = handler._run_reserves_tool({"query": "psych book"})
+
+    assert result["total"] == 2
+    assert result["results"][0]["availability"]["status"] == "unknown"
+    assert result["results"][0]["courses"] == ["PSYC C1000"]
+
+
+def test_reserves_blank_query_is_error_no_source(monkeypatch):
+    monkeypatch.setattr(
+        handler, "_primo_get_json",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not hit Primo for a blank query")),
+    )
+    result, source = handler._run_reserves_tool({"query": "  "})
+    assert "error" in result
+    assert source is None
+
+
+def test_reserves_delivery_uses_reserves_scope_and_book_catalog_stays_general(monkeypatch):
+    # Scope plumbing: the reserves availability call must query the CourseReserves scope, while the
+    # general book-catalog availability call must stay on MyInstitution. Capture the delivery URLs.
+    seen = {"reserves": [], "book": []}
+
+    def make_get(bucket):
+        def fake_get(url, timeout):
+            if "/L/" in url:
+                seen[bucket].append(url)
+                return _delivery_available()
+            return _primo_search_payload([_reserve_doc("X", rid="z1") if bucket == "reserves" else _primo_doc("X", rid="z1")], total=1)
+        return fake_get
+
+    monkeypatch.setattr(handler, "_primo_get_json", make_get("reserves"))
+    handler._run_reserves_tool({"query": "PSYC C1000"})
+    monkeypatch.setattr(handler, "_primo_get_json", make_get("book"))
+    handler._run_primo_tool({"query": "the great gatsby"})
+
+    assert seen["reserves"] and all("scope=CourseReserves" in u for u in seen["reserves"])
+    assert seen["book"] and all("scope=MyInstitution" in u for u in seen["book"])
+
+
+# -- search_course_reserves inside the agent loop --
+
+
+def test_reserves_tool_advertised_with_query_schema(monkeypatch):
+    # The toolConfig now carries FOUR tools; search_course_reserves takes a single `query`.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("hi")])
+    _wire(monkeypatch, agent, bedrock)
+
+    handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hi"})), None)
+
+    tools = {t["toolSpec"]["name"]: t["toolSpec"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]}
+    assert set(tools) == {"search_library_info", "database_catalog", "search_book_catalog", "search_course_reserves"}
+    res_schema = tools["search_course_reserves"]["inputSchema"]["json"]
+    assert set(res_schema["properties"]) == {"query"}
+    assert res_schema["required"] == ["query"]
+
+
+def test_agent_routes_reserve_query_to_reserves_tool_and_contributes_source(monkeypatch):
+    agent = FakeAgentRuntime()
+    _wire_primo(
+        monkeypatch,
+        _primo_search_payload([_reserve_doc("Introduction to psychology", courses=["PSYC C1000"], rid="r1")], total=5),
+        {"r1": _delivery_available(sub="Course Reserve", call="BF121 .K26 2022")},
+    )
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            reserves_tool_use_turn("PSYC C1000"),
+            end_turn("The catalog shows it on reserve at the Course Reserve desk."),
+        ]
+    )
+    monkeypatch.setattr(handler, "_bedrock_client", lambda: bedrock)
+    monkeypatch.setattr(handler, "_agent_client", lambda: agent)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "what's on reserve for PSYC C1000?"})), None)
+
+    assert resp["statusCode"] == 200
+    body = json.loads(resp["body"])
+    assert agent.calls == []  # KB search never ran
+    (tr,) = [
+        b["toolResult"]
+        for m in bedrock.converse_calls[1]["messages"]
+        for b in m.get("content", [])
+        if "toolResult" in b
+    ]
+    assert tr["status"] == "success"
+    assert tr["content"][0]["json"]["total"] == 5
+    assert tr["content"][0]["json"]["results"][0]["courses"] == ["PSYC C1000"]
+    assert len(body["sources"]) == 1
+    assert "CourseReserves" in body["sources"][0]["uri"]

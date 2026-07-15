@@ -121,6 +121,9 @@ class GavilanChatbotStack(Stack):
         generation_cfg = config["generation"]
         guardrail_cfg = config["guardrail"]
         catalog_cfg = config["catalog"]
+        # Live Primo book/media catalog tool (search_book_catalog) behavioral knobs. Optional so a
+        # config without a `primo` block still synths; the handler carries matching defaults.
+        primo_cfg = config.get("primo", {})
 
         kb_name = kb_cfg["name"]
         # S3 Vectors store knobs (replaces the OpenSearch Serverless collection/index).
@@ -792,6 +795,13 @@ class GavilanChatbotStack(Stack):
                 "CATALOG_BUCKET": catalog_bucket.bucket_name,
                 "CATALOG_KEY": catalog_key,
                 "CATALOG_CACHE_TTL_SECONDS": str(catalog_cfg["cache_ttl_seconds"]),
+                # Live Primo book/media catalog tool (search_book_catalog). No IAM: it is an
+                # outbound HTTPS call, not an AWS API. Knobs from config.yaml (handler has defaults).
+                "PRIMO_TIMEOUT_SECONDS": str(primo_cfg.get("timeout_seconds", 5)),
+                "PRIMO_NUMBER_OF_RESULTS": str(primo_cfg.get("number_of_results", 4)),
+                "PRIMO_AVAILABILITY_BUDGET_SECONDS": str(
+                    primo_cfg.get("availability_budget_seconds", 8)
+                ),
             },
         )
         # The Lambda queries the KB at runtime, so it must not exist before the KB.

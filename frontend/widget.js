@@ -46,9 +46,10 @@
     // backend right up to that ceiling rather than aborting early. A cold first query
     // (OpenSearch scale-to-zero wake + generation) can take 15-25s.
     requestTimeoutMs: 30000,
-    // After this long with no response, the typing indicator gains an honest "waking up"
-    // note so a slow first query doesn't look frozen.
-    wakingHintDelayMs: 4000,
+    // After this long with no response, the typing indicator gains an honest "still working"
+    // note so a slow turn doesn't look frozen. Kept generous so it only shows on genuinely slow
+    // responses, not routine ones (it must not read like a startup message every message).
+    wakingHintDelayMs: 6000,
     title: "Library Help",
     launcherLabel: "Ask the Library",
     greeting:
@@ -864,13 +865,14 @@
       }
       bubble.appendChild(typing);
 
-      // Honest slow-start note: a first query after idle can spend 15-25s waking the
-      // backend (OpenSearch scale-to-zero), which would otherwise look frozen. After a
-      // short delay, reveal a plain "waking up" line - no fake progress bar.
+      // Honest slow-response note: a query occasionally takes long enough (a big generation,
+      // a cold Lambda) that a bare typing indicator looks frozen. After a short delay, reveal a
+      // plain "Working…" line - no fake progress bar. Short, neutral wording on purpose: this can
+      // fire on any slow turn, so it must not imply the assistant is starting up each time.
       var hint = doc.createElement("div");
       hint.className = "typing__hint";
       hint.hidden = true;
-      hint.textContent = "Waking up the library assistant. This can take a moment…";
+      hint.textContent = "Working…";
       bubble.appendChild(hint);
 
       wrap.appendChild(bubble);

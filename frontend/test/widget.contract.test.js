@@ -250,7 +250,7 @@ test("request timeout is raised to the 30s API Gateway ceiling", () => {
   assert.strictEqual(widget.CONFIG.requestTimeoutMs, 30000);
 });
 
-test("a delayed 'waking up' hint backs a slow first response (no fake progress)", () => {
+test("a delayed 'still working' hint backs a slow response (no fake progress)", () => {
   assert.ok(typeof widget.CONFIG.wakingHintDelayMs === "number", "hint delay is configurable");
   assert.ok(
     widget.CONFIG.wakingHintDelayMs > 0 &&
@@ -259,7 +259,9 @@ test("a delayed 'waking up' hint backs a slow first response (no fake progress)"
   );
   // A real element revealed on a timer, not a fake progress bar.
   assert.ok(/typing__hint/.test(SOURCE), "the typing hint element exists");
-  assert.ok(/Waking up/i.test(SOURCE), "honest 'waking up' copy is present");
+  // Short, neutral 'Working…' copy, not startup wording that reads like a cold boot each message.
+  assert.ok(/Working…/i.test(SOURCE), "neutral 'Working…' copy is present");
+  assert.ok(!/Waking up/i.test(SOURCE), "no startup-implying 'waking up' copy remains");
   assert.ok(
     /CONFIG\.wakingHintDelayMs/.test(SOURCE),
     "the hint reveal is driven by the configured delay"

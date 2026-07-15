@@ -6,11 +6,15 @@ Fronted by an API Gateway HTTP API (payload format 2.0) with two routes on this 
          user query.
       1. run_agent() -> an AGENTIC Bedrock Converse tool-use loop under the real system
          prompt (app/system_prompt.md), with the OUTPUT guardrail (content filters, answer
-         side only) attached to every Converse call as a backstop. The model is given ONE
-         tool, `search_library_info`, which wraps the KB `Retrieve`; the model decides when
-         (and how many times) to call it. The loop feeds each tool result back and re-calls
-         Converse until stopReason == "end_turn" (or a safety iteration cap). Sources are
-         accumulated from every retrieval the model triggered during the loop.
+         side only) attached to every Converse call as a backstop. The model is given FOUR
+         tools: `search_library_info` (KB `Retrieve`), `database_catalog` (authoritative
+         research-database lookup from static JSON), `search_book_catalog` (a LIVE search of
+         the Primo book/media catalog), and `search_course_reserves` (a LIVE search of the
+         Primo course-reserves scope) - the two live catalog tools return evidence the model
+         judges, not an authoritative verdict. The model decides which to call and how often.
+         The loop feeds each tool result back and re-calls Converse until stopReason ==
+         "end_turn" (or a safety iteration cap). Sources accumulate from every tool the model
+         triggered during the loop.
   - GET /warm -> _handle_warm(): a retrieval-only pre-warm before the first real query. No
       generation, no guardrail.
 
@@ -39,7 +43,10 @@ Wiring comes from env vars set by the CDK stack.
 import base64
 import json
 import os
+import ssl
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import boto3
@@ -108,6 +115,14 @@ _FALLBACK_BLOCK_MESSAGE = (
 #                          databases for subject Y?), from a bundled static JSON.
 SEARCH_TOOL_NAME = "search_library_info"
 CATALOG_TOOL_NAME = "database_catalog"
+# search_book_catalog - a LIVE search of the Primo book/media catalog. Unlike database_catalog
+# (authoritative), this returns EVIDENCE (candidate records + availability) and the MODEL judges
+# whether any is a real match; total == 0 is the only clean not-held signal. See the Primo section.
+PRIMO_TOOL_NAME = "search_book_catalog"
+# search_course_reserves - a LIVE search of the Primo CourseReserves scope: textbooks/materials on
+# reserve for a class, searchable by course code or title. Same EVIDENCE-not-verdict posture as
+# search_book_catalog (total == 0 is the clean not-on-reserve signal); see the reserves section.
+RESERVES_TOOL_NAME = "search_course_reserves"
 
 # Safety cap on the Converse tool-use loop: the model can call the tool and be re-invoked at
 # most this many times before we stop and return the best answer so far. Prevents a runaway
@@ -161,6 +176,60 @@ _CATALOG_SOURCE = {
     "uri": _SEED_CATALOG.get("catalog_url", ""),
     "excerpt": "Gavilan Library A-Z database list",
 }
+
+# --- Primo book/media catalog tool (search_book_catalog) -----------------------------------
+#
+# A LIVE search of Gavilan's Primo discovery catalog (an undocumented public JSON endpoint the
+# library sanctioned). It is fundamentally different from database_catalog:
+#   - database_catalog is AUTHORITATIVE (a curated list), so it can say "not held".
+#   - Primo is NOT. It always returns fuzzy matches, and its relevance score is query-relative
+#     (a held book can score BELOW not-held noise), so the handler makes NO held/not-held
+#     judgment and applies NO score threshold. It returns EVIDENCE - the top few candidate
+#     records with fields + availability + the total match count - and the MODEL decides whether
+#     any candidate is a real match. `total == 0` is the ONLY clean not-held signal, surfaced raw.
+#
+# This is a live third-party HTTP call INSIDE the Converse loop, a new class of dependency, so:
+#   - every call is timed out (it eats the request/Lambda budget);
+#   - ANY failure (network, timeout, HTTP error, changed/absent fields, parse error) degrades to
+#     a "catalog unavailable" result - it never throws and never kills the query;
+#   - parsing is defensive (the $$C..$$V.. encoding + undocumented shape); missing fields degrade.
+#
+# Endpoint identity (the reverse-engineered discovery API; tied to the institution, not a
+# per-deploy knob, so it stays in code rather than config.yaml):
+PRIMO_SEARCH_URL = "https://caccl-gavilan.primo.exlibrisgroup.com/primaws/rest/pub/pnxs"
+PRIMO_DISCOVERY_URL = "https://caccl-gavilan.primo.exlibrisgroup.com/discovery/search"
+PRIMO_INST = "01CACCL_GAVILAN"
+PRIMO_VID = "01CACCL_GAVILAN:GAVILAN"
+# General local-holdings scope ONLY. Deliberately NOT CourseReserves: Gavilan's general catalog
+# does not stock course textbooks (they live in course reserves + the bookstore), so textbook
+# questions must stay on the system prompt's <textbook_flow> and never route through this tool.
+PRIMO_SCOPE = "MyInstitution"
+PRIMO_TAB = "LibraryCatalog"
+# Course-reserves scope, used by the SEPARATE search_course_reserves tool: textbooks/materials an
+# instructor placed on hold for a class (short loans at the Course Reserve desk). Reserve records
+# carry a crsinfo field linking them to one or more course codes; this is the scope textbook
+# questions check, complementing the general catalog above.
+PRIMO_RESERVES_SCOPE = "CourseReserves"
+PRIMO_RESERVES_TAB = "CourseReserves"
+
+# Behavioral knobs, wired from config.yaml by the stack (env). Defaults are a local-run safety net.
+PRIMO_TIMEOUT_SECONDS = float(os.environ.get("PRIMO_TIMEOUT_SECONDS", "5"))
+PRIMO_NUMBER_OF_RESULTS = int(os.environ.get("PRIMO_NUMBER_OF_RESULTS", "4"))
+# Total wall-clock cap across all per-result availability lookups (each result needs its own
+# delivery call). Once exceeded, the remaining results report availability "unknown" rather than
+# blocking - bounds worst-case latency of the tool inside the agent loop.
+PRIMO_AVAILABILITY_BUDGET_SECONDS = float(os.environ.get("PRIMO_AVAILABILITY_BUDGET_SECONDS", "8"))
+
+# Fed back to the model when the live lookup fails: it must NOT claim the item is absent, only
+# that the search is down. (Absence may ONLY be stated on a real total == 0 result.)
+_PRIMO_UNAVAILABLE_NOTE = (
+    "The library book catalog search is temporarily unavailable. Do not say whether the library "
+    "holds this item; suggest checking the library catalog directly or asking a librarian."
+)
+_RESERVES_UNAVAILABLE_NOTE = (
+    "The course reserves search is temporarily unavailable. Do not say whether the item is on "
+    "reserve; suggest checking the library catalog directly or asking a librarian."
+)
 
 _agent_runtime = None
 _bedrock_runtime = None
@@ -274,12 +343,16 @@ def retrieve(query):
 
 
 def _tool_config():
-    """The Converse `toolConfig`: two tools the model routes between (toolChoice left at the
+    """The Converse `toolConfig`: four tools the model routes between (toolChoice left at the
     model's default `auto`, so it may also answer a greeting without any tool):
       - search_library_info: semantic search over the library website (hours, services, policies,
         how-to, borrowing, contact, general questions).
       - database_catalog: authoritative lookup of the research-database catalog - whether a named
         database is available (including confirming it is NOT), and databases by subject.
+      - search_book_catalog: LIVE search of the Primo book/media catalog - returns candidate
+        records + availability for a title/author/work; EVIDENCE the model judges, not a verdict.
+      - search_course_reserves: LIVE search of the Primo CourseReserves scope - textbooks/materials
+        on reserve for a class, by course code or title; same EVIDENCE-not-verdict posture.
     The descriptions are deliberately differentiated so the model picks the right one."""
     return {
         "tools": [
@@ -346,6 +419,84 @@ def _tool_config():
                                 },
                             },
                             "required": ["query_type", "value"],
+                        }
+                    },
+                }
+            },
+            {
+                "toolSpec": {
+                    "name": PRIMO_TOOL_NAME,
+                    "description": (
+                        "Search the Gavilan College Library's BOOK and MEDIA catalog (Primo) for a "
+                        "specific title, author, or work the student wants to find or borrow - e.g. "
+                        "'do you have The Great Gatsby?', 'is the Citizen Kane film available?', "
+                        "'books by Toni Morrison'. It returns the top few candidate records (title, "
+                        "author, year, type) with the catalog's current availability (status, "
+                        "campus/location, call number) and the total match count. This is EVIDENCE, "
+                        "NOT a verdict: Primo always returns fuzzy matches and its ranking is "
+                        "unreliable, so YOU must decide whether any candidate is really the item "
+                        "asked for, checking ALL returned candidates for a matching title with an "
+                        "available copy (the top-ranked result is often not the available one). Do "
+                        "NOT conclude the library lacks an item unless total is 0. Availability is "
+                        "what the catalog SHOWS, not a guarantee the copy is on the shelf. Use this "
+                        "for books and media the library owns; NOT for research databases (use "
+                        "database_catalog), NOT for hours/services/policies (use search_library_info), "
+                        "and NOT for course textbooks or materials on reserve for a class (use "
+                        "search_course_reserves for those)."
+                    ),
+                    "inputSchema": {
+                        "json": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": (
+                                        "The title, author, or subject to look up in the book/media "
+                                        "catalog."
+                                    ),
+                                }
+                            },
+                            "required": ["query"],
+                        }
+                    },
+                }
+            },
+            {
+                "toolSpec": {
+                    "name": RESERVES_TOOL_NAME,
+                    "description": (
+                        "Search the Gavilan College Library's COURSE RESERVES (Primo) - textbooks and "
+                        "materials an instructor placed on hold for a class, borrowed for short loans "
+                        "at the Course Reserve desk. Use this to check whether a textbook is on "
+                        "reserve, or to list what is on reserve for a course - e.g. 'is the psychology "
+                        "textbook on reserve?', 'what's on reserve for PSYC C1000?', 'do you have the "
+                        "book for MATH 205?'. The query can be a COURSE CODE (formats vary, like 'PSYC "
+                        "C1000' or the older 'PSYCH 10') OR a textbook title. It returns the top few "
+                        "candidate records with title, author, the course code(s) each item is on "
+                        "reserve for, the catalog's current availability (status, location such as the "
+                        "Course Reserve desk, call number), and the total match count. This is "
+                        "EVIDENCE, NOT a verdict: results are fuzzy and the ranking is unreliable (a "
+                        "search can rank the wrong course first), so YOU must confirm a candidate "
+                        "really matches using its course info, checking ALL candidates, not just the "
+                        "first. Do NOT conclude an item is not on reserve unless total is 0. "
+                        "Availability is what the catalog SHOWS, not a guarantee the copy is on the "
+                        "shelf. Use this for textbooks/course materials on reserve; NOT for the "
+                        "general book/media catalog (use search_book_catalog), research databases "
+                        "(use database_catalog), or hours/services (use search_library_info)."
+                    ),
+                    "inputSchema": {
+                        "json": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": (
+                                        "A course code (e.g. 'PSYC C1000', 'MATH 205'), a textbook "
+                                        "title, or a subject to look up in course reserves."
+                                    ),
+                                }
+                            },
+                            "required": ["query"],
                         }
                     },
                 }
@@ -451,6 +602,425 @@ def _run_catalog_tool(tool_input):
         return _catalog_subject_lookup(value), _CATALOG_SOURCE
     # Default to a name lookup (the common "do you have X?" case) for 'name' or anything else.
     return _catalog_name_lookup(value), _CATALOG_SOURCE
+
+
+# --- Primo book/media catalog tool implementation ------------------------------------------
+
+_primo_ssl_ctx = None
+
+
+def _primo_ssl_context():
+    """A certificate-verifying SSL context for the Primo HTTPS calls, resolved once per container.
+
+    Priority: (1) certifi if importable - this is the LOCAL-DEV path (the macOS python.org build
+    ships no OS trust store, so a bare default context fails cert verification); (2) the platform
+    default trust store, which is what the Lambda runtime (Amazon Linux 2023) uses and which is
+    the expected production path; (3) botocore's bundled CA (botocore is always present in the
+    Lambda runtime) as a final belt-and-suspenders. We only accept the default context if it
+    actually loaded CA certs, so a certificate-less environment falls through to (3).
+
+    NOTE: the production (Lambda) leg can only be fully confirmed at deploy - it cannot be
+    exercised offline. See the change summary."""
+    global _primo_ssl_ctx
+    if _primo_ssl_ctx is not None:
+        return _primo_ssl_ctx
+    ctx = None
+    try:
+        import certifi
+
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:  # noqa: BLE001 - certifi absent (e.g. Lambda): try the OS trust store next
+        ctx = None
+    if ctx is None:
+        try:
+            candidate = ssl.create_default_context()
+            if candidate.cert_store_stats().get("x509_ca", 0) > 0:
+                ctx = candidate
+        except Exception:  # noqa: BLE001
+            ctx = None
+    if ctx is None:
+        try:
+            import botocore  # guaranteed in the Lambda runtime; bundles a CA cert file
+
+            cafile = os.path.join(os.path.dirname(botocore.__file__), "cacert.pem")
+            if os.path.exists(cafile):
+                ctx = ssl.create_default_context(cafile=cafile)
+        except Exception:  # noqa: BLE001
+            ctx = None
+    _primo_ssl_ctx = ctx or ssl.create_default_context()
+    return _primo_ssl_ctx
+
+
+def _primo_get_json(url, timeout):
+    """GET a Primo URL and parse JSON. Timed out. Raises on any network / timeout / HTTP / parse
+    error; every caller wraps this and soft-fails (a dead Primo must never kill the request)."""
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout, context=_primo_ssl_context()) as resp:
+        return json.loads(resp.read())
+
+
+def _primo_search_request(query, limit, timeout):
+    """The Primo search call (ranked bib records, NO availability). MyInstitution/LibraryCatalog
+    scope only - the general local catalog, never CourseReserves."""
+    params = {
+        "q": f"any,contains,{query}",
+        "inst": PRIMO_INST,
+        "vid": PRIMO_VID,
+        "scope": PRIMO_SCOPE,
+        "tab": PRIMO_TAB,
+        "pcAvailability": "true",
+        "skipDelivery": "Y",
+        "sort": "rank",
+        "lang": "en",
+        "limit": str(limit),
+        "offset": "0",
+    }
+    return _primo_get_json(f"{PRIMO_SEARCH_URL}?{urllib.parse.urlencode(params)}", timeout)
+
+
+def _primo_delivery_request(record_id, timeout, scope=None):
+    """The per-record delivery call (real-time holdings + availability). Separate from search.
+    `scope` defaults to the general-catalog scope; the reserves tool passes its own scope so the
+    delivery is fetched in the same scope the record was found in."""
+    params = {
+        "inst": PRIMO_INST,
+        "vid": PRIMO_VID,
+        "scope": scope or PRIMO_SCOPE,
+        "lang": "en",
+        "getDelivery": "true",
+    }
+    url = f"{PRIMO_SEARCH_URL}/L/{urllib.parse.quote(record_id)}?{urllib.parse.urlencode(params)}"
+    return _primo_get_json(url, timeout)
+
+
+def _primo_first(field):
+    """First non-empty string in a Primo list field (or the bare string). '' if absent or oddly
+    shaped. Primo display/control fields are almost always single-element lists, but the
+    undocumented shape is not guaranteed, so never index blindly."""
+    if isinstance(field, list):
+        for v in field:
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+    if isinstance(field, str):
+        return field.strip()
+    return ""
+
+
+def _primo_availability(record_id, timeout, scope=None):
+    """Real-time availability for one record from the delivery endpoint, as a dict
+    {status, location, call_number}. Any failure (or a shape we don't recognize) degrades to
+    status 'unknown' - it never raises. NOTE: 'available' here is what the catalog SHOWS, not a
+    guarantee the physical copy is on the shelf; the system prompt phrases it accordingly.
+    `scope` is passed through to the delivery call (the reserves tool uses the reserves scope, so
+    the reserve holding's 'Course Reserve' sublocation surfaces in `location`)."""
+    unknown = {"status": "unknown", "location": "", "call_number": ""}
+    if not record_id:
+        return unknown
+    try:
+        payload = _primo_delivery_request(record_id, timeout, scope=scope)
+    except Exception as exc:  # noqa: BLE001 - degrade to unknown, never fail the whole lookup
+        print(json.dumps({"event": "primo_availability_failed", "error": f"{type(exc).__name__}: {exc}"}))
+        return unknown
+    delivery = payload.get("delivery") if isinstance(payload, dict) else None
+    if not isinstance(delivery, dict):
+        return unknown
+
+    codes = delivery.get("availability")
+    codes = codes if isinstance(codes, list) else []
+    best = delivery.get("bestlocation")
+    best = best if isinstance(best, dict) else {}
+    eservices = delivery.get("electronicServices")
+    eservices = eservices if isinstance(eservices, list) else []
+
+    if best:
+        where = ", ".join(
+            x for x in (best.get("mainLocation"), best.get("subLocation")) if isinstance(x, str) and x
+        )
+        status = best.get("availabilityStatus") or (codes[0] if codes else "") or "unknown"
+        call = best.get("callNumber")
+        return {"status": status, "location": where, "call_number": call if isinstance(call, str) else ""}
+    if eservices:
+        names = ", ".join(
+            (s.get("serviceType") or s.get("displayName") or "online access")
+            for s in eservices
+            if isinstance(s, dict)
+        )
+        return {"status": "online", "location": names, "call_number": ""}
+    displayed = delivery.get("displayedAvailability")
+    if isinstance(displayed, str) and displayed:
+        status = displayed
+    elif codes:
+        status = ", ".join(c for c in codes if isinstance(c, str))
+    else:
+        status = "not available"
+    return {"status": status or "unknown", "location": "", "call_number": ""}
+
+
+def _parse_primo_doc(doc):
+    """One Primo `docs` entry -> {title, author, year, type, record_id}, or None if there is no
+    usable title. Defensive against missing pnx sections and the $$C..$$V.. delimited creator."""
+    if not isinstance(doc, dict):
+        return None
+    pnx = doc.get("pnx")
+    pnx = pnx if isinstance(pnx, dict) else {}
+    display = pnx.get("display")
+    display = display if isinstance(display, dict) else {}
+    control = pnx.get("control")
+    control = control if isinstance(control, dict) else {}
+
+    title = _primo_first(display.get("title"))
+    if not title:
+        return None
+    creator = _primo_first(display.get("creator")) or _primo_first(display.get("contributor"))
+    author = creator.split("$$")[0].strip() if creator else ""
+    return {
+        "title": title,
+        "author": author,
+        "year": _primo_first(display.get("creationdate")),
+        "type": _primo_first(display.get("type")),
+        "record_id": _primo_first(control.get("recordid")),
+    }
+
+
+def _primo_total(data):
+    """The reported total match count. 0 (the only clean not-held signal) if absent/odd-shaped."""
+    info = data.get("info") if isinstance(data, dict) else None
+    total = info.get("total") if isinstance(info, dict) else None
+    return total if isinstance(total, int) else 0
+
+
+def _primo_search_page(query):
+    """A student-facing Primo results URL for this query - the synthetic source and the place to
+    verify catalog holdings (matching how database_catalog cites the A-Z page)."""
+    params = {
+        "query": f"any,contains,{query}",
+        "tab": PRIMO_TAB,
+        "search_scope": PRIMO_SCOPE,
+        "vid": PRIMO_VID,
+        "offset": "0",
+    }
+    return f"{PRIMO_DISCOVERY_URL}?{urllib.parse.urlencode(params)}"
+
+
+def _run_primo_tool(tool_input):
+    """Execute search_book_catalog: a live Primo search plus a per-result availability lookup.
+
+    Returns (result_json, source). result_json carries `total` (the ONLY clean not-held signal,
+    == 0) and up to PRIMO_NUMBER_OF_RESULTS candidate `results` (title/author/year/type +
+    availability) for the MODEL to judge - the handler makes NO held/not-held decision and applies
+    NO score threshold. On a blank query it returns an error result; on ANY live-call failure it
+    soft-fails to a 'catalog_unavailable' result so the model can still answer. `source` is the
+    Primo results page for a lookup that produced candidates (deduped like the catalog source),
+    otherwise None (a no-match or an unavailable lookup contributes no source)."""
+    query = ""
+    if isinstance(tool_input, dict):
+        query = (tool_input.get("query") or "").strip()
+    if not query:
+        return {"error": "No search terms were provided."}, None
+
+    try:
+        data = _primo_search_request(query, PRIMO_NUMBER_OF_RESULTS, PRIMO_TIMEOUT_SECONDS)
+    except Exception as exc:  # noqa: BLE001 - live third-party call: soft-fail, never throw
+        print(json.dumps({"event": "primo_search_failed", "error": f"{type(exc).__name__}: {exc}"}))
+        return {"error": "catalog_unavailable", "note": _PRIMO_UNAVAILABLE_NOTE}, None
+    if not isinstance(data, dict):
+        print(json.dumps({"event": "primo_search_failed", "error": "unexpected response shape"}))
+        return {"error": "catalog_unavailable", "note": _PRIMO_UNAVAILABLE_NOTE}, None
+
+    total = _primo_total(data)
+    docs = data.get("docs")
+    docs = docs if isinstance(docs, list) else []
+
+    results = []
+    # Bound the total time spent on per-result availability lookups; past the budget the rest
+    # report 'unknown' rather than pushing the request toward the Lambda timeout.
+    deadline = time.monotonic() + PRIMO_AVAILABILITY_BUDGET_SECONDS
+    for doc in docs[:PRIMO_NUMBER_OF_RESULTS]:
+        parsed = _parse_primo_doc(doc)
+        if not parsed:
+            continue
+        if time.monotonic() < deadline:
+            availability = _primo_availability(parsed["record_id"], PRIMO_TIMEOUT_SECONDS)
+        else:
+            availability = {"status": "unknown", "location": "", "call_number": ""}
+        results.append(
+            {
+                "title": parsed["title"],
+                "author": parsed["author"],
+                "year": parsed["year"],
+                "type": parsed["type"],
+                "availability": availability,
+            }
+        )
+
+    result_json = {"query": query, "total": total, "results": results}
+    if not results:
+        result_json["note"] = (
+            "No matching records were found in the library catalog."
+            if total == 0
+            else "No usable catalog records were returned for this search."
+        )
+    source = None
+    if results:
+        source = {"uri": _primo_search_page(query), "excerpt": f"Gavilan Library catalog search: {query}"}
+    return result_json, source
+
+
+# --- Course reserves tool implementation (search_course_reserves) --------------------------
+#
+# A FOURTH tool, separate from search_book_catalog like database_catalog is separate. It searches
+# the Primo CourseReserves scope: textbooks/materials an instructor placed on reserve for a class.
+# Same posture as the general catalog tool - EVIDENCE, not a verdict: it returns candidate records
+# for the MODEL to judge, total == 0 is the ONLY clean "not on reserve" signal, every call is timed
+# out and soft-fails, parsing is defensive. The one difference is the crsinfo field, which links a
+# record to one or more COURSE CODES (a single reserve item can serve several courses).
+
+
+def _primo_reserves_search_request(query, limit, timeout):
+    """The Primo search call in the CourseReserves scope. Same shape as the general search, just a
+    different scope/tab - a course code or a title both match here via any,contains."""
+    params = {
+        "q": f"any,contains,{query}",
+        "inst": PRIMO_INST,
+        "vid": PRIMO_VID,
+        "scope": PRIMO_RESERVES_SCOPE,
+        "tab": PRIMO_RESERVES_TAB,
+        "pcAvailability": "true",
+        "skipDelivery": "Y",
+        "sort": "rank",
+        "lang": "en",
+        "limit": str(limit),
+        "offset": "0",
+    }
+    return _primo_get_json(f"{PRIMO_SEARCH_URL}?{urllib.parse.urlencode(params)}", timeout)
+
+
+def _parse_reserve_courses(display):
+    """The course codes a reserve item is on hold for, from the crsinfo field. A single item can be
+    on reserve for MULTIPLE courses. crsinfo is a list of strings shaped like
+    '$$R<code>$$V<code>: <code>; <dept>$$M<code>' (course-code formats vary - 'PSYC C1000' vs the
+    older 'PSYCH 10'); the $$R segment carries the course code. Defensive: crsinfo may be absent, a
+    bare string, or oddly shaped, and a single string can carry more than one $$R segment."""
+    raw = display.get("crsinfo")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    courses = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        for part in entry.split("$$"):
+            if part.startswith("R"):
+                code = part[1:].strip().rstrip("\\").strip()
+                if code and code not in courses:
+                    courses.append(code)
+    return courses
+
+
+def _parse_reserve_doc(doc):
+    """One CourseReserves `docs` entry -> {title, author, courses, record_id}, or None if there is
+    no usable title. Defensive against missing pnx sections, the $$C..$$V.. creator, and crsinfo."""
+    if not isinstance(doc, dict):
+        return None
+    pnx = doc.get("pnx")
+    pnx = pnx if isinstance(pnx, dict) else {}
+    display = pnx.get("display")
+    display = display if isinstance(display, dict) else {}
+    control = pnx.get("control")
+    control = control if isinstance(control, dict) else {}
+
+    title = _primo_first(display.get("title"))
+    if not title:
+        return None
+    creator = _primo_first(display.get("creator")) or _primo_first(display.get("contributor"))
+    author = creator.split("$$")[0].strip() if creator else ""
+    return {
+        "title": title,
+        "author": author,
+        "courses": _parse_reserve_courses(display),
+        "record_id": _primo_first(control.get("recordid")),
+    }
+
+
+def _reserves_search_page(query):
+    """A student-facing Primo course-reserves results URL for this query - the synthetic source and
+    the place to verify what is on reserve (mirrors _primo_search_page for the general catalog)."""
+    params = {
+        "query": f"any,contains,{query}",
+        "tab": PRIMO_RESERVES_TAB,
+        "search_scope": PRIMO_RESERVES_SCOPE,
+        "vid": PRIMO_VID,
+        "offset": "0",
+    }
+    return f"{PRIMO_DISCOVERY_URL}?{urllib.parse.urlencode(params)}"
+
+
+def _run_reserves_tool(tool_input):
+    """Execute search_course_reserves: a live Primo CourseReserves search plus a per-result
+    availability lookup.
+
+    Returns (result_json, source). result_json carries `total` (the ONLY clean not-on-reserve
+    signal, == 0) and up to PRIMO_NUMBER_OF_RESULTS candidate `results` (title/author/courses +
+    availability) for the MODEL to judge - the handler makes NO on/not-on-reserve decision. On a
+    blank query it returns an error result; on ANY live-call failure it soft-fails to a
+    'reserves_unavailable' result so the model can still answer. `source` is the reserves results
+    page for a lookup that produced candidates (deduped), otherwise None."""
+    query = ""
+    if isinstance(tool_input, dict):
+        query = (tool_input.get("query") or "").strip()
+    if not query:
+        return {"error": "No course or title was provided."}, None
+
+    try:
+        data = _primo_reserves_search_request(query, PRIMO_NUMBER_OF_RESULTS, PRIMO_TIMEOUT_SECONDS)
+    except Exception as exc:  # noqa: BLE001 - live third-party call: soft-fail, never throw
+        print(json.dumps({"event": "reserves_search_failed", "error": f"{type(exc).__name__}: {exc}"}))
+        return {"error": "reserves_unavailable", "note": _RESERVES_UNAVAILABLE_NOTE}, None
+    if not isinstance(data, dict):
+        print(json.dumps({"event": "reserves_search_failed", "error": "unexpected response shape"}))
+        return {"error": "reserves_unavailable", "note": _RESERVES_UNAVAILABLE_NOTE}, None
+
+    total = _primo_total(data)
+    docs = data.get("docs")
+    docs = docs if isinstance(docs, list) else []
+
+    results = []
+    deadline = time.monotonic() + PRIMO_AVAILABILITY_BUDGET_SECONDS
+    for doc in docs[:PRIMO_NUMBER_OF_RESULTS]:
+        parsed = _parse_reserve_doc(doc)
+        if not parsed:
+            continue
+        if time.monotonic() < deadline:
+            availability = _primo_availability(
+                parsed["record_id"], PRIMO_TIMEOUT_SECONDS, scope=PRIMO_RESERVES_SCOPE
+            )
+        else:
+            availability = {"status": "unknown", "location": "", "call_number": ""}
+        results.append(
+            {
+                "title": parsed["title"],
+                "author": parsed["author"],
+                "courses": parsed["courses"],
+                "availability": availability,
+            }
+        )
+
+    result_json = {"query": query, "total": total, "results": results}
+    if not results:
+        result_json["note"] = (
+            "No items on course reserve matched this search."
+            if total == 0
+            else "No usable course-reserve records were returned for this search."
+        )
+    source = None
+    if results:
+        source = {
+            "uri": _reserves_search_page(query),
+            "excerpt": f"Gavilan Library course reserves search: {query}",
+        }
+    return result_json, source
 
 
 def _output_guardrail_config():
@@ -659,7 +1229,8 @@ def _log_guardrail_assessment(response):
 
 
 def run_agent(messages):
-    """Agentic Bedrock Converse tool-use loop with KB semantic retrieval as the only tool.
+    """Agentic Bedrock Converse tool-use loop over four tools (KB search, database catalog,
+    live Primo book/media catalog, live Primo course reserves).
 
     `messages` is the seed conversation in Converse shape (a list of {role, content} turns,
     starting with user and ending with the newest user turn - see _seed_messages), already
@@ -743,6 +1314,21 @@ def run_agent(messages):
             elif name == CATALOG_TOOL_NAME:
                 result_json, source = _run_catalog_tool(tool_use.get("input"))
                 # A substantive catalog lookup contributes the synthetic A-Z-page source (deduped).
+                if source and source not in catalog_sources:
+                    catalog_sources.append(source)
+                status = "error" if "error" in result_json else "success"
+            elif name == PRIMO_TOOL_NAME:
+                result_json, source = _run_primo_tool(tool_use.get("input"))
+                # A lookup that produced candidates contributes the Primo results-page source
+                # (deduped; a per-query verify link, unlike the single A-Z page). A soft-fail or a
+                # no-match contributes none. status=error on a soft-fail lets the model recover.
+                if source and source not in catalog_sources:
+                    catalog_sources.append(source)
+                status = "error" if "error" in result_json else "success"
+            elif name == RESERVES_TOOL_NAME:
+                result_json, source = _run_reserves_tool(tool_use.get("input"))
+                # Same posture as the book catalog: a lookup with candidates contributes the
+                # reserves results-page source (deduped); a soft-fail or no-match contributes none.
                 if source and source not in catalog_sources:
                     catalog_sources.append(source)
                 status = "error" if "error" in result_json else "success"

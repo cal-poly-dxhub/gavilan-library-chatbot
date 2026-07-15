@@ -150,6 +150,27 @@ catalog:
   # so 15 min stale is fine and avoids an S3 GET per query.
   cache_ttl_seconds: 900
 
+# --- Primo book/media catalog tool (search_book_catalog) ---
+#
+# A THIRD agent tool: a LIVE search of Gavilan's Primo discovery catalog (an undocumented public
+# JSON endpoint the library sanctioned) for books/media. It returns candidate records + real-time
+# availability; the MODEL judges whether any is a real match (Primo is NOT authoritative about
+# absence - only total == 0 is a clean not-held signal). The endpoint identity (host, inst, vid,
+# scope) is tied to the institution and lives in code (app/handler.py), not here; only the
+# behavioral knobs below are tunable. It is a live third-party call inside the agent loop, so it
+# is timed out and soft-fails (a dead Primo never kills a query).
+primo:
+  # Per-HTTP-call socket timeout (seconds) for each Primo call (the search + each availability
+  # lookup). Bounds how long a slow Primo can hold the Converse loop / Lambda budget.
+  timeout_seconds: 5
+  # Number of candidate records returned to the model to judge. Each also costs one availability
+  # (delivery) call, so keep this small - a few good candidates is enough for the model to match.
+  number_of_results: 4
+  # Total wall-clock cap (seconds) across ALL per-result availability lookups in one search. Past
+  # it, remaining results report availability "unknown" instead of pushing toward the Lambda
+  # timeout. Sized so search + availability stay well under the Lambda 30s with room for Converse.
+  availability_budget_seconds: 8
+
 # --- Bedrock Guardrails ---
 #
 # TWO guardrails are built from this config:
