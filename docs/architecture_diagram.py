@@ -20,10 +20,15 @@ app/handler.py, scraper/):
     dims); FIXED_SIZE chunking on the S3 data source.
   - Vector store: Amazon S3 Vectors (CfnVectorBucket + CfnIndex, cosine, float32). The KB
     WRITES to it during ingestion and READS from it during query.
-  - Query path: API Gateway HTTP API v2 (POST /query) -> Lambda python3.13. The handler runs
-    an agentic Bedrock Converse tool-use loop (run_agent) with two tools:
-    search_library_info (KB Retrieve) and database_catalog (reads the catalog from S3). The
-    output guardrail is attached to every Converse call.
+  - Query path: API Gateway HTTP API v2 (POST /query) -> Lambda python3.13. The request
+    carries a multi-turn messages array (trimmed to the last 10 turns server-side). The handler
+    runs an agentic Bedrock Converse tool-use loop (run_agent) with FOUR tools:
+    search_library_info (KB Retrieve), database_catalog (reads the catalog from S3), and the two
+    live catalog tools search_book_catalog + search_course_reserves, which call the EXTERNAL Ex
+    Libris Primo discovery API directly (a search plus a per-record availability/delivery call).
+    So the query Lambda now reaches a third party on the hot path - it is no longer fully
+    AWS-internal; each Primo call is timed out and soft-fails. The output guardrail is attached
+    to every Converse call.
   - Widget delivery: private S3 bucket (widget.js) fronted by a CloudFront distribution with
     an OAC-secured origin, built in the SAME stack. Separate concern from the query path:
     CloudFront + S3 deliver the widget CODE to the browser; the injected widget then uses the
@@ -59,6 +64,10 @@ with Diagram(
 ):
     # External library website the scraper pulls from.
     library_site = InternetAlt1("Library website\n(curated seed URLs)")
+
+    # External (non-AWS) Ex Libris Primo discovery API the two live catalog tools call on the
+    # query hot path - the query Lambda is no longer fully AWS-internal.
+    primo_api = InternetAlt1("Primo / Ex Libris\nDiscovery API\n(external, non-AWS)")
 
     with Cluster("Ingestion  (weekly schedule + on deploy)"):
         scraper = Lambda("Scraper Lambda\n(fetch + extract;\nregenerate catalog)")
@@ -106,6 +115,10 @@ with Diagram(
     kb >> Edge(color="darkblue", style="dashed", label="read vectors") >> s3vectors
     # Tool 2 - database_catalog: read the catalog from S3.
     query_fn >> Edge(color="darkblue", style="dashed", label="database_catalog\n(read catalog)") >> catalog_bucket
+    # Tools 3 + 4 - the live Primo tools: outbound HTTPS to an EXTERNAL third party on the hot
+    # path (search + a per-record availability/delivery call), timed out and soft-failing.
+    query_fn >> Edge(color="darkblue", style="dashed", label="search_book_catalog\n(Primo search + availability)") >> primo_api
+    query_fn >> Edge(color="darkblue", style="dashed", label="search_course_reserves\n(Primo search + availability)") >> primo_api
     # Generation is screened by Bedrock Guardrails on every Converse call in the loop.
     query_fn >> Edge(style="dashed", label="Converse\n(each loop turn)") >> guardrails
     guardrails >> Edge(style="dashed", dir="both", label="screen input\n+ output") >> claude
