@@ -48,6 +48,8 @@ from aws_cdk import (
 )
 from constructs import Construct
 
+from infra.config import resolve_cors_allow_origins
+
 # Repo-root app/ directory holding the Lambda handler source (app/handler.py).
 # infra_stack.py is <repo>/infra/infra/infra_stack.py, so parents[2] is the repo root.
 _APP_DIR = Path(__file__).resolve().parents[2] / "app"
@@ -116,6 +118,9 @@ class GavilanChatbotStack(Stack):
         chunking_cfg = config["chunking"]
         scraper_cfg = config["scraper"]
         http_api_cfg = config["http_api"]
+        # Browser origin allowlist for the HTTP API. Resolved (and wildcard-rejected) in
+        # infra/config.py so the "never *" rule is enforced at synth, not just by convention.
+        cors_allow_origins = resolve_cors_allow_origins(config)
         request_cfg = config["request"]
         retrieval_cfg = config["retrieval"]
         generation_cfg = config["generation"]
@@ -808,15 +813,23 @@ class GavilanChatbotStack(Stack):
         query_lambda.node.add_dependency(knowledge_base)
 
         # HTTP API (API Gateway v2), NOT REST: ~71% cheaper for a Lambda-proxy job and we
-        # need none of the REST-only features. CORS is permissive for now.
-        # TODO: lock allow_origins to the library widget domain before launch.
-        # GET is allowed for the widget's fire-and-forget GET /warm ping.
+        # need none of the REST-only features.
+        #
+        # CORS is locked to the origins in config.yaml (cors.allow_origins) - the library site
+        # plus a dev localhost entry - never "*". Note what this is and isn't: CORS is enforced
+        # by browsers only, so it is not a security boundary (curl/scripts ignore it) and the
+        # stage throttling below remains the real cost cap. It does stop a third-party page
+        # from driving this billable endpoint from its visitors' browsers.
+        #
+        # Methods cover the real routes: POST (/query), GET (/warm), and OPTIONS (the preflight
+        # the gateway answers itself). Only Content-Type is allowed through; AllowCredentials is
+        # deliberately left off - we send no cookies or auth headers.
         http_api = apigwv2.HttpApi(
             self,
             "ChatbotHttpApi",
             api_name="gavilan-library-chatbot",
             cors_preflight=apigwv2.CorsPreflightOptions(
-                allow_origins=["*"],
+                allow_origins=cors_allow_origins,
                 allow_methods=[
                     apigwv2.CorsHttpMethod.GET,
                     apigwv2.CorsHttpMethod.POST,
