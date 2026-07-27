@@ -351,7 +351,13 @@ def test_tool_result_fed_back_to_model_with_passages_and_sources(monkeypatch):
     tool_names = {
         t["toolSpec"]["name"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]
     }
-    assert tool_names == {"search_library_info", "database_catalog", "search_book_catalog", "search_course_reserves"}
+    assert tool_names == {
+        "search_library_info",
+        "database_catalog",
+        "search_book_catalog",
+        "search_course_reserves",
+        "library_links",
+    }
     # The initial user message is the bare question (not a context-wrapped prompt).
     assert _user_text(bedrock) == "What are the library hours?"
     # The second call's messages carry the assistant tool_use turn AND a user toolResult.
@@ -1470,7 +1476,13 @@ def test_both_tools_advertised_with_differentiated_descriptions(monkeypatch):
     handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hi"})), None)
 
     tools = {t["toolSpec"]["name"]: t["toolSpec"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]}
-    assert set(tools) == {"search_library_info", "database_catalog", "search_book_catalog", "search_course_reserves"}
+    assert set(tools) == {
+        "search_library_info",
+        "database_catalog",
+        "search_book_catalog",
+        "search_course_reserves",
+        "library_links",
+    }
     cat_schema = tools["database_catalog"]["inputSchema"]["json"]
     assert set(cat_schema["properties"]) == {"query_type", "value"}
     assert cat_schema["properties"]["query_type"]["enum"] == ["name", "subject"]
@@ -2039,7 +2051,13 @@ def test_primo_tool_advertised_with_query_schema(monkeypatch):
     handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hi"})), None)
 
     tools = {t["toolSpec"]["name"]: t["toolSpec"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]}
-    assert set(tools) == {"search_library_info", "database_catalog", "search_book_catalog", "search_course_reserves"}
+    assert set(tools) == {
+        "search_library_info",
+        "database_catalog",
+        "search_book_catalog",
+        "search_course_reserves",
+        "library_links",
+    }
     primo_schema = tools["search_book_catalog"]["inputSchema"]["json"]
     assert set(primo_schema["properties"]) == {"query"}
     assert primo_schema["required"] == ["query"]
@@ -2334,7 +2352,13 @@ def test_reserves_tool_advertised_with_query_schema(monkeypatch):
     handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hi"})), None)
 
     tools = {t["toolSpec"]["name"]: t["toolSpec"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]}
-    assert set(tools) == {"search_library_info", "database_catalog", "search_book_catalog", "search_course_reserves"}
+    assert set(tools) == {
+        "search_library_info",
+        "database_catalog",
+        "search_book_catalog",
+        "search_course_reserves",
+        "library_links",
+    }
     res_schema = tools["search_course_reserves"]["inputSchema"]["json"]
     assert set(res_schema["properties"]) == {"query"}
     assert res_schema["required"] == ["query"]
@@ -2372,3 +2396,284 @@ def test_agent_routes_reserve_query_to_reserves_tool_and_contributes_source(monk
     assert tr["content"][0]["json"]["results"][0]["courses"] == ["PSYC C1000"]
     assert len(body["sources"]) == 1
     assert "CourseReserves" in body["sources"][0]["uri"]
+
+
+# --- library_links: curated canonical Gavilan URLs -------------------------------------------
+#
+# A STATIC, bundled table (app/data/library_links.json) - no S3, no live call, nothing to stub.
+# The tool exists so the model cites real URLs instead of writing one from memory, so these tests
+# care about two things: the right entries come back, and each MATCHED link reaches the response
+# `sources` (deduped) exactly like the database_catalog synthetic source does.
+
+
+LINKS_TOOL = "library_links"
+
+
+def links_tool_use_turn(topic=None, *, tool_use_id="tu-1"):
+    """A Converse response asking to call library_links. `topic` is optional in the real schema,
+    so topic=None sends an EMPTY input object, exactly as the model may."""
+    tool_input = {} if topic is None else {"topic": topic}
+    return {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"toolUse": {"toolUseId": tool_use_id, "name": LINKS_TOOL, "input": tool_input}}
+                ],
+            }
+        },
+        "stopReason": "tool_use",
+    }
+
+
+def _link_by_key(key):
+    (entry,) = [e for e in handler._LIBRARY_LINKS if e["key"] == key]
+    return entry
+
+
+# -- The bundled data file --
+
+
+def test_library_links_seed_has_the_expected_entries():
+    keys = [e["key"] for e in handler._LIBRARY_LINKS]
+    assert set(keys) == {
+        "gavilan_college_website",
+        "library_homepage",
+        "online_textbook_collections",
+        "research_guides",
+        "bookstore_course_materials",
+        "campus_map_main",
+        "campus_map_interactive",
+        "public_safety",
+        "interlibrary_loan",
+        "laptop_request",
+    }
+    assert len(keys) == len(set(keys))  # keys are unique - they identify a link
+
+
+def test_every_library_link_entry_is_well_formed():
+    for entry in handler._LIBRARY_LINKS:
+        assert entry["url"].startswith("https://"), entry["key"]
+        assert entry["label"].strip()
+        assert entry["use_when"].strip()
+
+
+def test_library_link_urls_are_the_curated_ones():
+    assert _link_by_key("campus_map_main")["url"] == (
+        "https://www.gavilan.edu/about/maps/main_map.php"
+    )
+    assert _link_by_key("bookstore_course_materials")["url"] == (
+        "https://gavilan.bkstr.com/pages/courses-materials-results"
+    )
+    assert _link_by_key("research_guides")["url"] == "https://gavilan.libguides.com/"
+    assert _link_by_key("interlibrary_loan")["url"] == "https://www.gavilan.edu/library/ill.php"
+
+
+# -- Lookup behavior (called directly; no loop) --
+
+
+def test_links_topic_match_returns_only_matching_entries_and_their_sources():
+    result, sources = handler._run_links_tool({"topic": "campus map"})
+    assert result["matched"] is True
+    keys = {link["key"] for link in result["links"]}
+    assert keys == {"campus_map_main", "campus_map_interactive"}
+    # Each matched link IS a canonical page, so each contributes a source.
+    assert sources == [
+        {"uri": link["url"], "excerpt": link["label"]} for link in result["links"]
+    ]
+
+
+def test_links_keyword_match_hits_the_right_entry():
+    for topic, key in [
+        ("bookstore", "bookstore_course_materials"),
+        ("interlibrary loan", "interlibrary_loan"),
+        ("laptop", "laptop_request"),
+        ("research guides", "research_guides"),
+        ("online textbooks", "online_textbook_collections"),
+        ("public safety", "public_safety"),
+    ]:
+        result, sources = handler._run_links_tool({"topic": topic})
+        assert result["matched"] is True, topic
+        assert key in {link["key"] for link in result["links"]}, topic
+        assert sources, topic
+
+
+def test_links_matching_is_whole_word_so_library_does_not_hit_interlibrary():
+    # Naive substring matching would make every "library" topic drag in Interlibrary Loan.
+    result, _ = handler._run_links_tool({"topic": "library home page"})
+    assert {link["key"] for link in result["links"]} == {"library_homepage"}
+
+
+def test_links_miss_returns_the_whole_table_with_a_note_and_no_sources():
+    # A miss must never leave the model empty-handed - that is when it would invent a URL - but a
+    # browse listing is not an answer to a specific question, so it contributes no sources.
+    result, sources = handler._run_links_tool({"topic": "underwater basket weaving"})
+    assert result["matched"] is False
+    assert len(result["links"]) == len(handler._LIBRARY_LINKS)
+    assert "note" in result
+    assert sources == []
+
+
+def test_links_no_topic_lists_everything():
+    for tool_input in ({}, {"topic": "  "}, {"topic": None}, None, "not a dict"):
+        result, sources = handler._run_links_tool(tool_input)
+        assert result["matched"] is False
+        assert len(result["links"]) == len(handler._LIBRARY_LINKS)
+        assert sources == []
+
+
+def test_links_result_carries_url_label_and_use_when_for_the_model():
+    result, _ = handler._run_links_tool({"topic": "bookstore"})
+    (link,) = result["links"]
+    assert set(link) == {"key", "label", "url", "use_when"}
+    assert link["url"] == "https://gavilan.bkstr.com/pages/courses-materials-results"
+    assert link["use_when"]
+
+
+# -- library_links inside the agent loop --
+
+
+def test_links_tool_advertised_with_optional_topic_schema(monkeypatch):
+    # The toolConfig now carries FIVE tools; library_links takes a single OPTIONAL `topic`.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("hi")])
+    _wire(monkeypatch, agent, bedrock)
+
+    handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hi"})), None)
+
+    tools = {t["toolSpec"]["name"]: t["toolSpec"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]}
+    assert set(tools) == {
+        "search_library_info",
+        "database_catalog",
+        "search_book_catalog",
+        "search_course_reserves",
+        "library_links",
+    }
+    links_schema = tools["library_links"]["inputSchema"]["json"]
+    assert set(links_schema["properties"]) == {"topic"}
+    # `topic` is optional: a miss still returns the whole table, so nothing is required.
+    assert "required" not in links_schema
+
+
+def test_agent_routes_link_question_to_links_tool_and_contributes_sources(monkeypatch):
+    # The model asks for a campus-map link; KB retrieval never runs and the real URLs come back
+    # as sources - the whole point of the tool.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            links_tool_use_turn("campus map"),
+            end_turn("Here's the campus map."),
+        ]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "where is the library on campus?"})), None
+    )
+
+    body = json.loads(resp["body"])
+    assert agent.calls == []  # KB search never ran
+    (tr,) = _catalog_tool_results(bedrock)
+    assert tr["status"] == "success"
+    assert tr["content"][0]["json"]["matched"] is True
+    uris = [s["uri"] for s in body["sources"]]
+    assert "https://www.gavilan.edu/about/maps/main_map.php" in uris
+    assert "https://www.gavilan.edu/about/maps/gilroy_interactive_map.php" in uris
+
+
+def test_links_source_deduped_across_multiple_links_calls(monkeypatch):
+    # Two lookups whose matches overlap contribute each URL only once.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            links_tool_use_turn("campus map", tool_use_id="tu-1"),
+            links_tool_use_turn("map", tool_use_id="tu-2"),
+            end_turn("Both maps."),
+        ]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "map?"})), None)
+
+    uris = [s["uri"] for s in json.loads(resp["body"])["sources"]]
+    assert len(uris) == len(set(uris)) == 2
+
+
+def test_links_and_search_sources_merge_and_dedupe(monkeypatch):
+    # Model uses BOTH tools: KB search (passages) + library_links (canonical URLs). They merge.
+    agent = FakeAgentRuntime()  # default two KB chunks
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            tool_use_turn(query="library hours", tool_use_id="tu-1"),
+            links_tool_use_turn("bookstore", tool_use_id="tu-2"),
+            end_turn("Combined answer."),
+        ]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours and books"})), None)
+
+    uris = [s["uri"] for s in json.loads(resp["body"])["sources"]]
+    assert "https://gav.edu/library/hours" in uris
+    assert "https://gav.edu/library/borrow" in uris
+    assert "https://gavilan.bkstr.com/pages/courses-materials-results" in uris
+    assert len(uris) == len(set(uris)) == 3
+
+
+def test_links_browse_listing_contributes_no_sources_in_the_loop(monkeypatch):
+    # A no-topic listing is a browse aid, not an answer, so the response carries no citations
+    # rather than the entire directory.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(
+        converse_script=[links_tool_use_turn(None), end_turn("Here's what I can point you to.")]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "what can you help with?"})), None
+    )
+
+    body = json.loads(resp["body"])
+    assert body["sources"] == []
+    (tr,) = _catalog_tool_results(bedrock)
+    assert tr["status"] == "success"
+    assert len(tr["content"][0]["json"]["links"]) == len(handler._LIBRARY_LINKS)
+
+
+def test_guardrail_block_drops_links_sources(monkeypatch):
+    # A guardrail block after a links lookup returns the block message with NO sources.
+    agent = FakeAgentRuntime()
+    blocked = "I'm not able to provide a response to that."
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            links_tool_use_turn("campus map"),
+            {
+                "output": {"message": {"role": "assistant", "content": [{"text": blocked}]}},
+                "stopReason": "guardrail_intervened",
+            },
+        ]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "x"})), None)
+    body = json.loads(resp["body"])
+    assert body["answer"] == blocked
+    assert body["sources"] == []
+
+
+def test_links_sources_are_not_in_full_context(monkeypatch):
+    # full_context is the KB passages the model actually saw; a curated link is not one.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(
+        converse_script=[links_tool_use_turn("laptop"), end_turn("Here's the laptop record.")]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "can I borrow a laptop?", "include_full_context": True})),
+        None,
+    )
+
+    body = json.loads(resp["body"])
+    assert body["full_context"] == []
+    assert len(body["sources"]) == 1

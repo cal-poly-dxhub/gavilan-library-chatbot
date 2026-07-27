@@ -167,6 +167,21 @@ catalog:
   # so 15 min stale is fine and avoids an S3 GET per query.
   cache_ttl_seconds: 900
 
+# --- Curated library links tool (library_links) ---
+#
+# A FIFTH agent tool: a small hand-authored table of the library's and college's canonical URLs
+# (library home page, campus map, bookstore, research guides, ILL, laptop record, ...). It exists
+# because no other path can produce these links - the KB only knows the scraped seed pages above,
+# database_catalog cites the A-Z page, and the Primo tools cite per-query search URLs - so without
+# it the model could only surface such a link by writing a URL from memory.
+#
+# Unlike the database catalog this is STATIC: it is bundled with the query Lambda, so there is no
+# S3 object, no scraper step, and no cache TTL to tune. Edit app/data/<data_file> and redeploy.
+# The single knob is the bundled filename, and the stack uses it for BOTH the Lambda asset include
+# and the LIBRARY_LINKS_FILE env var so the two can never drift.
+library_links:
+  data_file: library_links.json
+
 # --- Primo book/media catalog tool (search_book_catalog) ---
 #
 # A THIRD agent tool: a LIVE search of Gavilan's Primo discovery catalog (an undocumented public
