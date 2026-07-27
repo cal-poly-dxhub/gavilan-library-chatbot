@@ -84,7 +84,7 @@ Needs `bedrock:ApplyGuardrail` on the guardrail ARN alongside `InvokeModel`, or 
 
 ## Hard rules
 
-- **Do not touch Git.** Never commit or do anything related to GitHub.
+- **No Git by default.** Do not commit, stage, push, or take any other git/GitHub action unless the task order explicitly instructs a commit. When it does, follow that instruction exactly and do nothing else with git.
 - **Behavior and tool routing live in the system prompt + tool descriptions, not hardcoded Lambda branches.** Tool choice is the model's (`toolChoice` auto); textbook clarifying questions and out-of-scope handling are prompt instructions.
 
 ## Writing style
