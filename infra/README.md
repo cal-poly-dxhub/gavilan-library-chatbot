@@ -1,58 +1,36 @@
+# Infrastructure (CDK)
 
-# Welcome to your CDK Python project!
+AWS CDK (Python) app that provisions the entire Gavilan Library Chatbot: the Bedrock Knowledge Base and its Amazon S3 Vectors store, the scraper Lambda (plus its weekly schedule and one-click deploy trigger), the catalog bucket, the query Lambda and HTTP API, the Bedrock guardrails, and the CloudFront-fronted widget bucket. Everything is L1 `Cfn*` constructs (see the architecture doc for why).
 
-This is a blank project for CDK development with Python.
+The app reads all changeable settings from the repo-root `config.yaml` at synth time; edit values there, not in the stack.
 
-The `cdk.json` file tells the CDK Toolkit how to execute your app.
+## Layout
 
-This project is set up like a standard Python project.  The initialization
-process also creates a virtualenv within this project, stored under the `.venv`
-directory.  To create the virtualenv it assumes that there is a `python3`
-(or `python` for Windows) executable in your path with access to the `venv`
-package. If for any reason the automatic creation of the virtualenv fails,
-you can create the virtualenv manually.
+- `app.py` — CDK entrypoint; loads `config.yaml` and instantiates the stack.
+- `infra/infra_stack.py` — the stack (`GavilanChatbotStack`).
+- `infra/config.py` — `load_config()` and CORS-origin resolution; resolves `config.yaml` from the repo root.
+- `tests/unit/` — `test_infra_stack.py` (`Template.from_stack` assertions) and `test_handler.py` (query-Lambda tests with boto3 stubbed, so no live AWS is needed).
 
-To manually create a virtualenv on MacOS and Linux:
+## Prerequisites
 
-```
-$ python3 -m venv .venv
-```
+See the [root README](../README.md#prerequisites): AWS credentials, Bedrock model access, Python 3.11+, the CDK CLI, and a bootstrapped account/region.
 
-After the init process completes and the virtualenv is created, you can use the following
-step to activate your virtualenv.
+## Commands
 
-```
-$ source .venv/bin/activate
-```
+Run from this directory with the virtualenv active.
 
-If you are a Windows platform, you would activate the virtualenv like this:
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt -r requirements-dev.txt
 
-```
-% .venv\Scripts\activate.bat
-```
-
-Once the virtualenv is activated, you can install the required dependencies.
-
-```
-$ pip install -r requirements.txt
+cdk synth        # emit CloudFormation offline (no credentials needed)
+python -m pytest # unit tests (no boto3 install, no live AWS)
+cdk deploy       # deploy (needs credentials + a bootstrapped account)
+cdk diff         # compare deployed stack with local state
+cdk destroy      # tear everything down
 ```
 
-At this point you can now synthesize the CloudFormation template for this code.
+Pinned versions: `aws-cdk-lib==2.260.0`, CDK CLI `2.1129.0`.
 
-```
-$ cdk synth
-```
-
-To add additional dependencies, for example other CDK libraries, just add
-them to your `requirements.txt` file and rerun the `python -m pip install -r requirements.txt`
-command.
-
-## Useful commands
-
- * `cdk ls`          list all stacks in the app
- * `cdk synth`       emits the synthesized CloudFormation template
- * `cdk deploy`      deploy this stack to your default AWS account/region
- * `cdk diff`        compare deployed stack with current state
- * `cdk docs`        open CDK documentation
-
-Enjoy!
+`cdk deploy` outputs a paste-ready widget embed tag, the CloudFront domain, and the `/query` URL. CloudFront is slow to create and destroy (~15-30 min each), which dominates deploy/destroy wall-clock.

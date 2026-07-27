@@ -1,9 +1,9 @@
 # Eval-harness infrastructure config.
 #
-# SDK/boto3 operational-tooling config (separate from the app's root config.yaml). The
-# retrieve-eval path is fully filled for account 202712152316 / us-west-2. The generate-eval
-# fields (generate.bot_api_url) remain TBD - that path is out of scope until the bot capture
-# stage is implemented.
+# SDK/boto3 operational-tooling config (separate from the app's root config.yaml). Fill the
+# placeholders below (account id, role, bucket, knowledge_base_id) with your own deployed
+# resources. The generate-eval fields (generate.bot_api_url) remain TBD - that path is out of
+# scope until the bot capture stage is implemented.
 
 eval:
   # AWS region where Bedrock evaluation jobs run. Must match the KB's region and the evaluator
@@ -14,12 +14,12 @@ eval:
   # IAM role Bedrock assumes to run the job. Needs read/write on the eval S3 bucket, InvokeModel
   # on the evaluator model, and Retrieve/RetrieveAndGenerate on the KB. Standalone dev/ops role,
   # NOT part of the CDK app stack (created via CLI).
-  role_arn: "arn:aws:iam::202712152316:role/gavilan-bedrock-eval-role"
+  role_arn: "arn:aws:iam::123456789012:role/gavilan-bedrock-eval-role"
 
   # Dedicated S3 bucket for eval input (JSONL datasets) and Bedrock output (results). CORS is NOT
   # required for knowledge-base evaluation jobs (only human-based eval needs it). Standalone,
   # not in the CDK stack.
-  bucket: "gavilan-chatbot-eval-202712152316"
+  bucket: "gavilan-chatbot-eval-123456789012"
 
   # Key prefixes within the bucket.
   input_prefix: "eval/input"
@@ -37,7 +37,7 @@ eval:
   # Builtin.ContextCoverage + Builtin.ContextRelevance.
   retrieve:
     # KB whose retrieval quality is being evaluated (the deployed S3 Vectors KB).
-    knowledge_base_id: "NJHDEJYBHJ"
+    knowledge_base_id: "XXXXXXXXXX"
     # How many chunks Retrieve returns per query. This duplicates the root config.yaml's
     # retrieval.number_of_results and can silently drift from it: to evaluate the PRODUCTION
     # configuration, keep this equal to that value, or the eval measures a different retrieval

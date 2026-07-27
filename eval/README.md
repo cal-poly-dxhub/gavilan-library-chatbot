@@ -3,7 +3,7 @@
 SDK/boto3 operational tooling that measures the chatbot's retrieval and generation
 quality with Amazon Bedrock native RAG evaluation.
 
-Ooperates on infra that already exists and runs on demand.
+Operates on infra that already exists and runs on demand.
 
 ## Layout
 
@@ -36,8 +36,9 @@ Fully blank rows are skipped. A row with only one of question/reference_answer i
   the bucket needs a CORS configuration.
 - An IAM role Bedrock can assume with read/write on that bucket and evaluator model access
   (set its ARN in `eval_config.yaml`).
-- Fill in the TBD values in `eval_config.yaml` (region, `role_arn`, `bucket`,
-  `evaluator_model_id`).
+- Replace the placeholder values in `eval_config.yaml` (`role_arn`, `bucket`,
+  `knowledge_base_id`, and `region`/`evaluator_model_id` if you differ) with your own
+  deployed resources. The account id `123456789012` is a placeholder.
 
 ## Running the tests (offline)
 

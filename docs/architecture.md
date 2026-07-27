@@ -1,8 +1,8 @@
 # Gavilan Library Chatbot — Architecture
 
 **What:** RAG chatbot for Gavilan College Library. Answers operational questions (hours, checkout, textbooks, "what does the library offer"), routes research questions and out-of-scope issues.
-**Client:** Gavilan College Library via Cal Poly DxHub.
-**Status:** deployed to the gavilan AWS account; validated end-to-end (query path, four tools, multi-turn, guardrails).
+**Built with:** Cal Poly DxHub, for Gavilan College Library.
+**Status:** validated end-to-end (query path, four tools, multi-turn, guardrails).
 **Updated:** 2026-07-15
 
 ---

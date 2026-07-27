@@ -11,9 +11,8 @@ knowledge_base:
   vector_dimension: 1024
 
 vector_store:
-  # Amazon S3 Vectors store (replaces OpenSearch Serverless). Semantic-search-only (no hybrid):
-  # the cheap/light tradeoff the sponsor chose. Keyword coverage is handled later by agentifying
-  # the bot with a structured lookup tool (out of scope here).
+  # Amazon S3 Vectors store. Semantic-search-only (no hybrid): a deliberate cost/simplicity
+  # tradeoff. Keyword coverage is handled by agentifying the bot with a structured lookup tool.
   #
   # Vector-bucket names follow S3-style rules (3-63 chars, lowercase letters/numbers/hyphens).
   vector_bucket_name: gavilan-library-vectors
@@ -39,7 +38,7 @@ vector_store:
 
 data_source:
   web_crawler:
-    # Seed URLs. Placeholder for now; the real sponsor list drops in here later.
+    # Seed URLs to crawl. Replace with the library pages you want ingested.
     seed_urls:
       - https://www.gavilan.edu/library/
     # Blacklist regex patterns (exclusion filters). Empty for now.
@@ -57,9 +56,9 @@ data_source:
 #
 # Replaces the removed managed Web Crawler. For now it runs locally (scraper/scraper.py) and
 # writes clean markdown + a metadata JSON sidecar per page to output_dir for manual inspection;
-# a Lambda wrapper that uploads to the KB S3 source bucket comes next. seed_urls is an EXPLICIT
-# curated list - NO recursive crawling (the managed crawler over-crawled the /library/ tree and
-# hit ingestion limits; an explicit list is also how the sponsor's URL list will arrive).
+# a Lambda wrapper uploads to the KB S3 source bucket. seed_urls is an EXPLICIT curated list -
+# NO recursive crawling (the managed crawler over-crawled the /library/ tree and hit ingestion
+# limits, so pages are listed explicitly instead).
 scraper:
   seed_urls:
     - https://www.gavilan.edu/library/howdoi.php

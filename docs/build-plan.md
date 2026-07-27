@@ -32,13 +32,11 @@
 
 ### Next
 
-- [x] **Deploy + validate live** — deployed to the gavilan account; `/query` validated end-to-end (four tools, multi-turn, guardrails, live Primo). Remaining spot checks: catalog populated from a real scrape, widget from the hosted script tag
-- [ ] **Provide sponsor context** — final seed URLs + any blacklist into `config.yaml`; sponsor Q&A set into `eval/datasets/`
-- [ ] **CORS lockdown** — restrict `allow_origins` to the library widget domain before launch
+- [x] **Deploy + validate live** — `/query` validated end-to-end (four tools, multi-turn, guardrails, live Primo). Remaining spot checks: catalog populated from a real scrape, widget from the hosted script tag
+- [x] **CORS lockdown** — `allow_origins` restricted to the widget domain via `cors.allow_origins` in config.yaml; wildcard rejected at synth
+- [ ] **Provide library context** — final seed URLs + any blacklist into `config.yaml`; Q&A set into `eval/datasets/`
 - [ ] **Parallelize Primo availability calls** — the per-record delivery calls run sequentially under a wall-clock budget; fan them out so slow availability lookups don't push toward the Lambda timeout
-- [ ] **Docs refresh** — CLAUDE.md + architecture.md done (four tools, multi-turn, Primo dependency); README + build-plan + diagram this pass
 - [ ] **Iterate** (eval-driven) — tune chunking, prompt behavior, guardrail thresholds; re-run retrieve + answer-quality evals
-- [ ] Confirm with Darren/sponsor: any institutional WAF mandate
 
 ---
 
@@ -48,4 +46,4 @@
 - [ ] **Authenticated Alma API** — real-time due dates + copy counts via the staff Alma API (API key); the upgrade path beyond the public Primo discovery endpoint's "catalog shows available" ceiling
 - [ ] Custom chunking Lambda (trafilatura) — if eval shows boilerplate hurting retrieval
 - [ ] **More agent tools** — two live-catalog tools shipped (Primo general catalog + course reserves); add others as gaps surface in eval
-- [ ] Production hardening: auth (if sponsor wants), WAF (only if compliance-mandated)
+- [ ] Production hardening: auth (if required), WAF (only if compliance-mandated)

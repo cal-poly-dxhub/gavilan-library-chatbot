@@ -14,14 +14,14 @@
     ============================================================================
     HOW TO RUN
     ============================================================================
-    1. STAMP THE API URL. Replace the https://gdysv675oh.execute-api.us-west-2.amazonaws.com/query token in the widget <script>
+    1. STAMP THE API URL. Replace the https://98epl0bry3.execute-api.us-west-2.amazonaws.com/query token in the widget <script>
        tag near the bottom of this file with the `ChatbotApiUrl` value from your
        CDK deploy outputs, e.g.
          https://abc123.execute-api.us-west-2.amazonaws.com/query
        Use it AS-IS: it already ends in /query, which is exactly what the widget's
        `data-api-url` attribute expects. (This widget reads the FULL /query URL
        from data-api-url and derives /warm from it; it does NOT append the path
-       itself, so do NOT strip /query.) Leave https://gdysv675oh.execute-api.us-west-2.amazonaws.com/query as a token in the
+       itself, so do NOT strip /query.) Leave https://98epl0bry3.execute-api.us-west-2.amazonaws.com/query as a token in the
        committed file so it survives redeploys - only stamp your local copy.
 
     2. SERVE OVER LOCALHOST (not file://). Browsers treat file:// as a null origin
@@ -136,7 +136,7 @@
       <p class="host-note">
         The endpoint lives in ONE place: the <code>data-api-url</code> attribute
         on the <code>widget.js</code> script tag below, stamped in place of the
-        <code>https://gdysv675oh.execute-api.us-west-2.amazonaws.com/query</code> token. Paste the <code>ChatbotApiUrl</code> value
+        <code>https://98epl0bry3.execute-api.us-west-2.amazonaws.com/query</code> token. Paste the <code>ChatbotApiUrl</code> value
         from the CDK outputs there as-is (it already ends in <code>/query</code>).
         No mock.js is loaded on this page.
       </p>
@@ -147,15 +147,15 @@
     ============================================================
     LIVE EMBED. This is the same one tag the real library site
     uses. No mock.js is present, so the widget talks to the real
-    backend. Replace https://gdysv675oh.execute-api.us-west-2.amazonaws.com/query with the deployed /query URL
+    backend. Replace https://98epl0bry3.execute-api.us-west-2.amazonaws.com/query with the deployed /query URL
     (the CDK `ChatbotApiUrl` output), used AS-IS:
 
       data-api-url="https://abc123.execute-api.us-west-2.amazonaws.com/query"
 
-    Keep https://gdysv675oh.execute-api.us-west-2.amazonaws.com/query a token in the committed file; stamp only
+    Keep https://98epl0bry3.execute-api.us-west-2.amazonaws.com/query a token in the committed file; stamp only
     your local copy so it survives redeploys.
     ============================================================
   -->
-  <script src="widget.js" data-api-url="https://gdysv675oh.execute-api.us-west-2.amazonaws.com/query" defer></script>
+  <script src="widget.js" data-api-url="https://98epl0bry3.execute-api.us-west-2.amazonaws.com/query" defer></script>
 </body>
 </html>

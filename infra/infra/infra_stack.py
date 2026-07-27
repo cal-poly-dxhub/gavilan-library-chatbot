@@ -147,10 +147,9 @@ class GavilanChatbotStack(Stack):
         #
         # S3 Vectors replaces the OpenSearch Serverless collection/index as the KB vector store:
         # near-zero cost, no cluster / VPC / FGAC / security policies. SEMANTIC-SEARCH-ONLY (no
-        # hybrid) - the accepted tradeoff for the sponsor's cheap/light requirement; keyword
-        # coverage is added later by agentifying the bot with a structured lookup tool (out of
-        # scope here). Encryption defaults to SSE-S3 (AWS-managed keys); revisit if the sponsor
-        # requires a customer-managed KMS key.
+        # hybrid) - the accepted cost/simplicity tradeoff; keyword coverage is added later by
+        # agentifying the bot with a structured lookup tool (out of scope here). Encryption
+        # defaults to SSE-S3 (AWS-managed keys); revisit if a customer-managed KMS key is required.
         vector_bucket = s3vectors.CfnVectorBucket(
             self,
             "VectorBucket",
