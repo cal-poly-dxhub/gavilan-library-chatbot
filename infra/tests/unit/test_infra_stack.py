@@ -5,7 +5,9 @@ import re
 import aws_cdk as core
 import aws_cdk.assertions as assertions
 
-from infra.config import load_config
+import pytest
+
+from infra.config import load_config, resolve_cors_allow_origins
 from infra.infra_stack import GavilanChatbotStack
 
 CONFIG = load_config()
@@ -238,6 +240,43 @@ def test_generation_inference_and_query_limit_wired_to_lambda_env():
             }
         ),
     )
+
+
+def test_cors_allow_origins_locked_to_config_and_never_wildcard():
+    # Pre-launch hardening: the browser origin allowlist is the production library site plus a
+    # dev-only localhost entry, driven from config.yaml. A wildcard here would let any page on
+    # the internet drive this billable endpoint (Bedrock + Primo) from its visitors' browsers.
+    assert resolve_cors_allow_origins(CONFIG) == [
+        "https://www.gavilan.edu",
+        "http://localhost:8000",
+    ]
+    assert "*" not in resolve_cors_allow_origins(CONFIG)
+
+    # ...and that resolved list is what actually reaches the synthesized API.
+    template = _template()
+    api = _one(template, "AWS::ApiGatewayV2::Api")
+    cors = api["Properties"]["CorsConfiguration"]
+    assert cors["AllowOrigins"] == ["https://www.gavilan.edu", "http://localhost:8000"], cors
+    assert "*" not in cors["AllowOrigins"], cors
+    # Methods must cover the real routes (POST /query, GET /warm) plus the OPTIONS preflight
+    # the gateway answers itself; only Content-Type is allowed through.
+    assert set(cors["AllowMethods"]) == {"GET", "POST", "OPTIONS"}, cors
+    assert cors["AllowHeaders"] == ["Content-Type"], cors
+    # No cookies or auth headers are sent, so credentialed CORS stays off.
+    assert not cors.get("AllowCredentials", False), cors
+
+
+def test_cors_config_rejects_wildcard_and_missing_origins():
+    # The "never *" rule is enforced at synth, not just by whatever config.yaml happens to say.
+    wildcard = copy.deepcopy(CONFIG)
+    wildcard["cors"]["allow_origins"] = ["*"]
+    with pytest.raises(ValueError, match=r"must not contain"):
+        resolve_cors_allow_origins(wildcard)
+
+    # A missing/empty allowlist is a loud failure, never a silent permissive fallback.
+    for bad in ({}, {"cors": {}}, {"cors": {"allow_origins": []}}):
+        with pytest.raises(ValueError):
+            resolve_cors_allow_origins(bad)
 
 
 def test_http_api_stage_throttled_from_config():

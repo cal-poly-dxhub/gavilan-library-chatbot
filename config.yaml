@@ -103,6 +103,24 @@ http_api:
   throttling_rate_limit: 10     # steady-state requests per second across the stage
   throttling_burst_limit: 20    # maximum burst (bucket capacity)
 
+# --- CORS (browser preflight allowlist for the HTTP API) ---
+#
+# Which page origins a BROWSER will let call /query and /warm. The widget is embedded on
+# https://www.gavilan.edu/library/, but the browser sends a host-only Origin header
+# (https://www.gavilan.edu) - the path is irrelevant to CORS, so do not add one here.
+#
+# This is NOT a security boundary: CORS is browser-enforced only, so curl/scripts bypass it
+# entirely. API Gateway stage throttling above stays the real cost cap. What this DOES buy is
+# stopping a random third-party site from silently driving our billable /query endpoint
+# (Bedrock + Primo spend) from its visitors' browsers.
+#
+# Never set this to "*" - the stack rejects a wildcard at synth. We send no cookies or auth
+# headers, so AllowCredentials stays off and the wildcard-with-credentials rules do not apply.
+cors:
+  allow_origins:
+    - https://www.gavilan.edu       # production: the library site hosting the widget
+    - http://localhost:8000         # DEV ONLY (frontend/demo.html) - safe to delete for final launch
+
 request:
   # Max characters accepted for a user query. Over this, the handler returns HTTP 400 BEFORE
   # any retrieval or guardrail call. This is the real server-side size control
