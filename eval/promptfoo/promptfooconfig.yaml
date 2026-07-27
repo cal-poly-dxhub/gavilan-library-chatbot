@@ -35,15 +35,23 @@ providers:
       method: POST
       headers:
         Content-Type: application/json
-      body:
-        # The real multi-turn /query contract. Single user turn == a fresh conversation.
-        messages:
-          - role: user
-            content: '{{question}}'
-        # Opt-in eval flag the query Lambda already supports: adds `full_context` to the
-        # response - the un-deduped, un-truncated KB passages the model actually saw.
-        # The widget never sets it, so this does not change production behavior.
-        include_full_context: true
+      # The real multi-turn /query contract. Built as a template rather than a static object
+      # so a row can carry prior conversation turns: set `prior_turns` in the dataset and
+      # they are prepended, oldest first, before the current question. Rows that omit it get
+      # a single user turn (a fresh conversation), which is the common case.
+      #
+      # `include_full_context` is the opt-in eval flag the query Lambda already supports: it
+      # adds `full_context` to the response - the un-deduped, un-truncated KB passages the
+      # model actually saw. The widget never sets it, so production behavior is unchanged.
+      body: |
+        {
+          "messages": [
+            {% for t in prior_turns %}{"role": {{ t.role | dump }}, "content": {{ t.content | dump }}},
+            {% endfor %}
+            {"role": "user", "content": {{ question | dump }}}
+          ],
+          "include_full_context": true
+        }
       # The grid column (and every deterministic assertion) sees ONLY the answer text, so
       # the side-by-side view stays readable and `contains`/`regex` checks can't accidentally
       # match against retrieved context. The retrieved passages ride along in `metadata`,
@@ -60,6 +68,11 @@ providers:
         })
 
 defaultTest:
+  # Rows that don't set `prior_turns` send a single user turn. Overridden per row for
+  # multi-turn cases (e.g. the laptop-renewal follow-up).
+  vars:
+    prior_turns: []
+
   options:
     # LLM-as-judge over Bedrock, so no OpenAI key is needed. Same model family the bot
     # itself generates with; a strong judge matters more than a cheap one on a 11-row set.
@@ -185,4 +198,10 @@ defaultTest:
       metric: no_dashes
       value: '[—–]'
 
-tests: file://dataset.yaml
+tests:
+  # The library staff's own worked examples of what a good answer looks like. This is the
+  # authoritative behavior spec - several rows are expected to FAIL today against the
+  # deployed prompt + knowledge base. That is the point; see README.md ("Known gaps").
+  - file://dataset-staff-examples.yaml
+  # Generic coverage of the four tools and the out-of-scope paths.
+  - file://dataset.yaml
