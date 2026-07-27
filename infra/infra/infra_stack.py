@@ -129,6 +129,11 @@ class GavilanChatbotStack(Stack):
         # Live Primo book/media catalog tool (search_book_catalog) behavioral knobs. Optional so a
         # config without a `primo` block still synths; the handler carries matching defaults.
         primo_cfg = config.get("primo", {})
+        # Curated library_links tool: a STATIC table bundled with the query Lambda (no S3, no
+        # scraper, no TTL), so its one knob is the bundled filename. Read once here and used for
+        # BOTH the asset include and the handler env var, so a rename cannot leave the Lambda
+        # bundling one file and reading another. Optional; the handler carries the same default.
+        library_links_file = config.get("library_links", {}).get("data_file", "library_links.json")
 
         kb_name = kb_cfg["name"]
         # S3 Vectors store knobs (replaces the OpenSearch Serverless collection/index).
@@ -760,9 +765,10 @@ class GavilanChatbotStack(Stack):
             "QueryFunction",
             runtime=_lambda.Runtime.PYTHON_3_13,
             handler="handler.lambda_handler",
-            # Ship the handler, the system prompt, and the static database catalog (under data/);
-            # keep __pycache__ / stray files out so the asset hash tracks real source changes.
-            # Re-including a nested file needs its parent dir un-excluded too, hence "!data".
+            # Ship the handler, the system prompt, and the static data files under data/ (the
+            # database-catalog seed + the curated library_links table); keep __pycache__ / stray
+            # files out so the asset hash tracks real source changes. Re-including a nested file
+            # needs its parent dir un-excluded too, hence "!data".
             code=_lambda.Code.from_asset(
                 str(_APP_DIR),
                 exclude=[
@@ -771,6 +777,7 @@ class GavilanChatbotStack(Stack):
                     "!system_prompt.md",
                     "!data",
                     "!data/database_catalog.json",
+                    f"!data/{library_links_file}",
                 ],
             ),
             role=query_lambda_role,
@@ -799,6 +806,9 @@ class GavilanChatbotStack(Stack):
                 "CATALOG_BUCKET": catalog_bucket.bucket_name,
                 "CATALOG_KEY": catalog_key,
                 "CATALOG_CACHE_TTL_SECONDS": str(catalog_cfg["cache_ttl_seconds"]),
+                # Curated library_links table, bundled above from the same config value. No IAM
+                # and no bucket: the handler just reads this file out of its own asset at import.
+                "LIBRARY_LINKS_FILE": library_links_file,
                 # Live Primo book/media catalog tool (search_book_catalog). No IAM: it is an
                 # outbound HTTPS call, not an AWS API. Knobs from config.yaml (handler has defaults).
                 "PRIMO_TIMEOUT_SECONDS": str(primo_cfg.get("timeout_seconds", 5)),
