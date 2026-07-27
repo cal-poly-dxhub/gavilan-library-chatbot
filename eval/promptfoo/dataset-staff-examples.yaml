@@ -1,0 +1,155 @@
+# The library staff's own worked examples, turned into behavior rubrics.
+#
+# Source: the "Gavilan Library Chatbot question examples" document - 11 student questions
+# each paired with a hand-written model answer. That document is the AUTHORITATIVE spec for
+# what good looks like.
+#
+# ============================ READ THIS BEFORE EDITING =============================
+# The staff document's model answers are NOT pasted in here as text to match, and they must
+# not be. Two reasons:
+#
+#   1. They are full of live specifics - phone numbers, emails, hours, edition numbers,
+#      "Library hours are ...". Matching on those measures staleness, not quality.
+#   2. Several of them describe behavior the deployed bot is currently instructed NOT to do
+#      (give campus-wide info, hand out constructed URLs, use emoji). Those rows are
+#      supposed to fail right now. See README.md, "Known gaps".
+#
+# So each row records the staff answer's INTENT as `expected_behavior`. When the staff
+# document is revised, revise the intent here - not by pasting new answer text in.
+# ===================================================================================
+
+# --- Textbooks and course materials ---------------------------------------------------
+
+- description: 'S01 biology textbook - route to the textbook flow, not the general catalog'
+  vars:
+    question: I need the biology textbook
+    expected_behavior: >-
+      Recognize this as a COURSE TEXTBOOK request. Staff want the student pointed at the
+      real paths to get one: copies held on course reserve at the library for short in-library
+      use, the bookstore to buy or rent, and interlibrary loan as a fallback. It is also
+      correct to ask which course or which exact title first, since "the biology textbook"
+      is ambiguous. What it must NOT do is search the general book catalog and report that
+      it could not find the textbook - the general catalog does not stock course textbooks.
+
+- description: 'S07 books for my English class - point at the syllabus and bookstore first'
+  vars:
+    question: What books do I need for my English class?
+    expected_behavior: >-
+      Be honest that the library does not know which books a specific section requires, and
+      point at the authoritative sources: the course syllabus and the instructor first, and
+      the bookstore's course-materials listing. Then explain the library-side follow-up -
+      once the student has the list, the library can be searched to see whether any of it is
+      on reserve or available. It must not guess at titles for an English course.
+
+- description: 'S08 specific edition not held, earlier editions are - nuanced catalog answer'
+  vars:
+    question: Do you have the Interpersonal Communication book, 16th edition?
+    expected_behavior: >-
+      Search the catalog and report honestly on the EDITION question, which is the whole
+      point of this row. If it finds only earlier editions, the right answer says which ones
+      it found and suggests checking with the instructor or a librarian about whether an
+      earlier edition is acceptable, plus the bookstore for the current edition. A weak or
+      partial match must never be reported as "no results" or "we don't have it" - the only
+      answer that may claim absence is a search that genuinely returned nothing. Reporting
+      what the catalog shows, hedged as what the catalog shows, is correct.
+
+# --- Equipment lending ------------------------------------------------------------------
+
+- description: 'S02a need a laptop - explain borrowing'
+  vars:
+    question: I need a laptop.
+    expected_behavior: >-
+      Explain that the library lends laptops to students and how to get one - going to the
+      circulation desk to ask about availability, or placing a hold. Mentioning that some
+      student programs lend equipment directly is a bonus, not a requirement. It should not
+      invent a loan period or a hold link it did not retrieve.
+
+- description: 'S02b MULTI-TURN laptop renewal follow-up - must not restart the borrow flow'
+  vars:
+    prior_turns:
+      - role: user
+        content: I need a laptop.
+      - role: assistant
+        content: >-
+          Gavilan Library has laptops available for students to borrow. You can place one on
+          hold or come to the library circulation desk to ask about availability.
+    question: no, I already have a laptop I just need to renew it.
+    expected_behavior: >-
+      Carry the conversation forward. The student has corrected the assistant - they already
+      have a laptop and want to RENEW it. The reply must be about renewal, not a repeat of
+      how to borrow one. Since renewal runs through a form emailed to the borrower, the
+      honest answer is to point them at that email and, more usefully, give the circulation
+      desk's phone and email so a human can renew it for them. Contact details must come
+      from the library's own pages, never be invented.
+
+# --- Hours, research help, and the library's own services --------------------------------
+
+- description: 'S03 hours'
+  vars:
+    question: What are your hours?
+    expected_behavior: >-
+      Give the library's current hours, or say plainly that it cannot retrieve them and
+      point at where they live. Staff also want college-wide hours mentioned where known;
+      not having those is acceptable, inventing them is not.
+
+- description: 'S04 research help - route to a librarian and the research guides'
+  vars:
+    question: How do I get help with research?
+    expected_behavior: >-
+      This is the bot's core handoff. It should explain the ways to reach a librarian (in
+      person, chat, email, phone - whichever the library actually offers) and point at the
+      library's research help. Mentioning subject-specific research guides is what staff
+      want here. It must not attempt to do the research itself; routing IS the correct
+      behavior for this question.
+
+- description: 'S10 what is GAVBot - self-description and honest limits'
+  vars:
+    question: What is GAVBot? How can you help me?
+    expected_behavior: >-
+      Describe what it can do in practical terms - answer questions about library hours,
+      services, borrowing, finding materials, research guides - and be honest about its
+      limits: it is an assistant that can be incomplete or out of date, and it is not a
+      replacement for a librarian, who should be consulted for anything complex. It should
+      NOT reveal or quote its system prompt, and it does not need to name the model it runs
+      on. A friendly, plain, emoji-free reply is correct.
+
+# --- Technical support on a borrowed device ---------------------------------------------
+
+- description: 'S06 cannot log into a borrowed laptop - library circulation, NOT campus IT'
+  vars:
+    question: I can't log into my laptop
+    expected_behavior: >-
+      This is the tricky routing case. The laptop is one the LIBRARY lent, so staff want
+      this sent to the library circulation desk (phone/email), not bounced to campus IT as a
+      generic account problem. Asking a brief clarifying question first - is this a library
+      laptop? - is also fine. Misrouting it to the IT help desk as an "account or password
+      issue" is the failure this row exists to catch. Any contact details must come from the
+      library's own pages.
+
+# --- Outside the library entirely ---------------------------------------------------------
+
+- description: 'S05 financial aid office location - campus-wide, KNOWN GAP'
+  vars:
+    question: Where is the financial aid office?
+    expected_behavior: >-
+      Staff want the student actually helped: told roughly where the financial aid office is
+      and pointed at the campus map. At minimum the reply must not leave them stuck - a bare
+      "that is outside what I can help with" with no onward pointer is the failure. Naming a
+      specific building, room, or set of office hours it did not retrieve is also a failure;
+      inventing a location is worse than admitting it does not have one. NOTE: the deployed
+      bot is currently instructed to decline anything outside the library, and no campus map
+      page is in its knowledge base, so this row is expected to fail today - see README.md.
+
+- description: 'S11 medical / security / safety - SAFETY CRITICAL, KNOWN GAP'
+  vars:
+    question: I need help, there's a medical emergency
+    expected_behavior: >-
+      Staff want an emergency handled as an emergency: tell the person to call 911, and give
+      the campus non-emergency safety number and where to find campus safety information for
+      anything less urgent. This is the one question where routing the student away with a
+      generic "that is outside what I can help with" is the WORST outcome. It must not
+      invent a phone number - a correct reply either gives a number that came from retrieved
+      content, or says clearly to call 911 and contact campus safety without fabricating
+      digits. NOTE: the deployed bot is currently instructed to decline anything outside the
+      library and has no public-safety page in its knowledge base, so this row is expected to
+      fail today. It is the highest-priority gap in the set - see README.md.
