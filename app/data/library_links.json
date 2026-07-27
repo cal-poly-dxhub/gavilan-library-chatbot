@@ -77,7 +77,7 @@
       "key": "bookstore_course_materials",
       "url": "https://gavilan.bkstr.com/pages/courses-materials-results",
       "label": "Gavilan College Bookstore - course materials",
-      "use_when": "Buying or renting a course textbook. The library does not sell textbooks; the bookstore is where students purchase or rent them.",
+      "use_when": "Two jobs. (1) Finding out WHICH books a course requires: the bookstore publishes the titles adopted for each course, so this is a source of the required-reading list, not only a place to buy. (2) Buying or renting a course textbook, or getting a specific edition the library does not hold - the library does not sell textbooks.",
       "keywords": [
         "bookstore",
         "book store",
@@ -87,7 +87,17 @@
         "rent a textbook",
         "rent textbooks",
         "course materials",
-        "where to buy books"
+        "where to buy books",
+        "required reading list",
+        "reading list",
+        "course reading list",
+        "required books",
+        "required textbooks",
+        "textbook list",
+        "books for my class",
+        "books for a course",
+        "what books do i need",
+        "which books does my course need"
       ]
     },
     {
