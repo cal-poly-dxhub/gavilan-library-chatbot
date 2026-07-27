@@ -35,10 +35,17 @@ Wiring comes from env vars set by the CDK stack.
     calling the tool (e.g. a greeting), `sources` is [].
   - When the tool retrieves nothing relevant, the system prompt instructs the model to say
     it does not have the information.
-  - When the request sets `include_full_context: true`, the response also carries
-    `full_context`: the full, un-deduped, un-truncated retrieved passages (`[{text, source}]`)
-    the model actually saw, for answer-quality eval. The widget never sets the flag, so its
-    responses are exactly the `{answer, sources}` shape above.
+  - When the request sets `include_full_context: true`, the response also carries an OPT-IN
+    DEBUG PAYLOAD, for answer-quality eval:
+      * `full_context`: the full, un-deduped, un-truncated KB passages (`[{text, source}]`)
+        the model saw from `search_library_info`.
+      * `tool_calls`: an ordered trace of EVERY tool call the loop made - one entry per
+        toolUse block, `{tool, input, status, returned_results, result}`, where `result` is
+        the exact JSON handed back to the model as that call's `toolResult` content. This is
+        the whole evidence base the model answered from, KB and non-KB alike; `full_context`
+        alone only ever shows one of the five tools.
+    The widget never sets the flag, so its responses are exactly the `{answer, sources}`
+    shape above. Nothing here changes what is sent to the model.
 """
 
 import base64
@@ -1388,6 +1395,49 @@ def _log_guardrail_assessment(response):
     )
 
 
+# --- Tool-call trace (opt-in debug payload only) -------------------------------------------
+#
+# `full_context` shows the KB passages and nothing else, so an answer built from the database
+# catalog, the curated links, or either Primo tool looked context-free to anything reading the
+# response - which made the eval's groundedness axis unwinnable for four of the five tools. The
+# trace below closes that: every toolResult the model received, in order, plus which tool
+# produced it. Recorded from values run_agent already computed; it feeds nothing back into the
+# loop and never appears without the include_full_context flag.
+
+# The key each tool uses for its substantive payload, checked in order. `matched` comes first
+# because library_links returns the WHOLE table on a miss - a non-empty `links` list there means
+# "here is the directory", not "I found what you asked for".
+_RESULT_PAYLOAD_KEYS = ("matched", "passages", "results", "databases", "links")
+
+
+def _returned_results(result_json):
+    """Whether a tool call actually found what it was asked for.
+
+    An error (including a Primo soft-fail) is never a result. Otherwise the first payload key
+    present decides: passages found, candidate records found, databases matched, links matched.
+    A result with none of those keys is a database_catalog NAME lookup, whose answer IS the
+    held/not-held verdict - authoritative either way, so it counts as a result."""
+    if not isinstance(result_json, dict) or "error" in result_json:
+        return False
+    for key in _RESULT_PAYLOAD_KEYS:
+        if key in result_json:
+            return bool(result_json[key])
+    return True
+
+
+def _tool_call_record(name, tool_input, status, result_json):
+    """One entry in the ordered `tool_calls` trace: which tool the model called, the input it
+    passed, the status the loop reported back, whether the call found anything, and the exact
+    JSON the model received as that call's toolResult content."""
+    return {
+        "tool": name,
+        "input": tool_input,
+        "status": status,
+        "returned_results": _returned_results(result_json),
+        "result": result_json,
+    }
+
+
 def run_agent(messages):
     """Agentic Bedrock Converse tool-use loop over five tools (KB search, database catalog,
     live Primo book/media catalog, live Primo course reserves, curated library links).
@@ -1406,12 +1456,16 @@ def run_agent(messages):
     whole loop (empty if the model answered directly, e.g. a greeting). A safety cap of
     MAX_AGENT_ITERATIONS bounds the loop.
 
-    Returns {"answer", "blocked", "chunks", "catalog_sources"}: `chunks` are the KB passages from
-    search_library_info (drive `sources` + eval full_context); `catalog_sources` are the synthetic
-    source entries the non-KB tools contributed (the A-Z databases page, the per-query Primo
-    search pages, and each canonical URL a matched library_links lookup returned)."""
+    Returns {"answer", "blocked", "chunks", "catalog_sources", "tool_calls"}: `chunks` are the KB
+    passages from search_library_info (drive `sources` + eval full_context); `catalog_sources` are
+    the synthetic source entries the non-KB tools contributed (the A-Z databases page, the
+    per-query Primo search pages, and each canonical URL a matched library_links lookup returned);
+    `tool_calls` is the ordered observability trace of every tool the model invoked (see
+    _tool_call_record). The trace is recorded from what the loop already computed - it never
+    changes what is sent to the model."""
     collected_chunks = []
     catalog_sources = []
+    tool_calls = []
     answer = ""
     tool_config = _tool_config()
     guardrail = _output_guardrail_config()
@@ -1443,6 +1497,9 @@ def run_agent(messages):
                 "blocked": True,
                 "chunks": [],
                 "catalog_sources": [],
+                # The trace is debug-only and never reaches the widget, so a block keeps it:
+                # knowing which tools ran before the block is exactly what you want here.
+                "tool_calls": tool_calls,
             }
 
         out_message = response.get("output", {}).get("message", {}) or {}
@@ -1457,6 +1514,7 @@ def run_agent(messages):
                 "blocked": False,
                 "chunks": collected_chunks,
                 "catalog_sources": catalog_sources,
+                "tool_calls": tool_calls,
             }
 
         # tool_use: echo the assistant turn back verbatim (it carries the toolUse blocks), then
@@ -1507,6 +1565,9 @@ def run_agent(messages):
                 # recover rather than silently hanging.
                 result_json = {"error": f"Unknown tool: {name}"}
                 status = "error"
+            # Observability only: record what this call was and what it handed back, from the
+            # values already computed above. Nothing below is read by the loop.
+            tool_calls.append(_tool_call_record(name, tool_use.get("input"), status, result_json))
             tool_results.append(
                 {
                     "toolResult": {
@@ -1527,6 +1588,7 @@ def run_agent(messages):
         "blocked": False,
         "chunks": collected_chunks,
         "catalog_sources": catalog_sources,
+        "tool_calls": tool_calls,
     }
 
 
@@ -1653,8 +1715,9 @@ def _seed_messages(conversation):
     return messages
 
 
-# Optional request flag: when true, /query additionally returns the full retrieved passages
-# (what the model actually saw). The answer-quality eval sets it; the widget never does.
+# Optional request flag: when true, /query additionally returns the debug payload - the full
+# retrieved KB passages AND the ordered trace of every tool call the loop made (what the model
+# actually saw). The answer-quality eval sets it; the widget never does.
 _FULL_CONTEXT_FLAG = "include_full_context"
 
 
@@ -1781,7 +1844,10 @@ def _handle_query(event):
                 sources.append(cs)
     payload = {"answer": result["answer"], "sources": sources}
     if include_full_context:
+        # Opt-in debug payload. `full_context` is the KB passages; `tool_calls` is every tool
+        # result the model saw, which is the only view that covers the four non-KB tools.
         payload["full_context"] = _full_context(chunks)
+        payload["tool_calls"] = result.get("tool_calls", [])
     return _response(200, payload)
 
 
