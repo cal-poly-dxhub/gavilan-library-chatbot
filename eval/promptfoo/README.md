@@ -97,14 +97,15 @@ Concurrency defaults to 4, comfortably under the API Gateway stage throttle (10 
 
 ## Reading the results
 
-Each row gets four checks, and `promptfoo view` shows them per-cell:
+Each row gets four checks plus one reporting line, and `promptfoo view` shows them per-cell:
 
 | metric | what fails it |
 |---|---|
 | `behavior` | did the wrong thing: answered an out-of-scope question, routed an in-scope one, sent the student to the wrong place, asserted something it could not know |
-| `groundedness` | contradicted the retrieved passages, invented a specific checkable fact, constructed a URL, or claimed a holding with no support |
+| `groundedness` | contradicted the tool output, invented a specific checkable fact, constructed a URL, or claimed a holding with no support |
 | `not_empty` | blank answer - the endpoint or the agent loop broke (distinguishes "broken" from "bad") |
 | `no_dashes` | an em dash or en dash, which the system prompt bans outright |
+| `tools_called` | nothing - it always passes. Its `reason` is the ordered list of tools the model invoked and what each returned. See "Seeing which tools ran". |
 
 Three rows in `dataset.yaml` carry one extra deterministic check each: row 06 (not-held
 database) must actually say the database is not available, row 09 must not emit a
@@ -116,24 +117,55 @@ judged behaviorally.
 single flip is noise; a cluster of related failures is signal. And check a failure against
 the "Known gaps" table below before treating it as a regression.
 
-## The groundedness caveat, and why it is written the way it is
+## What the groundedness judge sees
 
-The eval sets `include_full_context: true`, and the Lambda returns `full_context` -
-`[{text, source}]`, the un-deduped, un-truncated passages the model actually saw.
+The eval sets `include_full_context: true`, and the Lambda returns an opt-in debug payload
+alongside `{answer, sources}`:
 
-**`full_context` is knowledge-base-only.** It is populated from `search_library_info`
-retrievals. The other three tools - `database_catalog`, `search_book_catalog`,
-`search_course_reserves` - return their results to the model through the tool-result path,
-which is not captured in the response. (Verified in `app/handler.py`: `run_agent` accumulates
-`collected_chunks` only from the KB search tool, and `_full_context` serializes exactly those.)
+| field | what it is |
+|---|---|
+| `full_context` | `[{text, source}]` - the un-deduped, un-truncated **knowledge-base** passages. One tool's output. |
+| `tool_calls` | the ordered trace of **every** tool call the loop made: `{tool, input, status, returned_results, result}`, where `result` is the exact JSON the model got back as that call's `toolResult` content. |
 
-So on the database and catalog rows, `full_context` will often be empty even though the bot
-answered from solid tool output. The groundedness rubric is written to handle this explicitly:
-an empty passage list is never on its own a failure. It fails only on something concrete - a
-contradiction, an invented specific, a constructed URL, or an unsupported holding claim.
+The judge is fed `tool_calls`, rendered by the provider's `transformResponse` into two metadata
+vars: `tool_trace` (one line per call) and `tool_context` (every call's full output). It is a
+strict superset of `full_context`, so the KB-only view is no longer passed to the judge - doing
+both would just duplicate the passages in the prompt.
 
-If you later want true groundedness coverage on the catalog tools, the change is in the
-Lambda (have the loop record non-KB tool results into `full_context` too), not here.
+**This used to be broken, and the fix is recent.** `full_context` is populated only from
+`search_library_info`, so an answer built from `database_catalog`, `library_links`, or either
+Primo tool reached the judge with an EMPTY context. Groundedness on those rows was not "lenient",
+it was ungradeable: four of the five tools were invisible, and the rubric had to be written
+around the blind spot ("an empty passage list is never on its own a failure"). Row 05, an
+authoritative and correct database answer, scored 0.1 on a context the judge never received.
+
+The rubric is now written to the real thing: a result from ANY tool is support, `held: false`
+from `database_catalog` is a citable fact rather than a gap, and a URL in a `library_links`
+result is an approved link rather than a suspected fabrication. An empty tool list is still not
+a failure on its own - a greeting, a refusal, or a routing reply legitimately calls nothing.
+
+Nothing about the bot's behavior changed to make this work. `tool_calls` is recorded from values
+`run_agent` already computed, it is gated on the request flag, and the widget path (no flag) is
+byte-identical to what it was.
+
+## Seeing which tools ran
+
+Tool routing is the model's - `toolChoice` is auto and the only steering is the system prompt
+plus the `toolSpec` descriptions - so "did it call the tool we expected?" is a real question,
+and `library_links` is the sharpest case: it is deliberately **not** named in the system prompt,
+so its description alone has to earn the call.
+
+Two places show it per row:
+
+- the **`tools_called` check** in the grid. It always passes; its `reason` is the trace, e.g.
+  `1. database_catalog {"query_type":"name","value":"JSTOR"} -> results`.
+- **`metadata.tools_used` / `metadata.tool_trace` / `metadata.tool_context`** in `results.json`
+  (gitignored). One-liner across all rows:
+
+  ```sh
+  npx promptfoo@latest eval --no-cache -o results.json
+  python3 -c "import json;[print(r['testCase']['description'],'|',r['metadata']['tools_used']) for r in json.load(open('results.json'))['results']['results']]"
+  ```
 
 ## Known gaps: where the staff spec and the deployed bot disagree
 
@@ -146,15 +178,35 @@ Verified against `app/system_prompt.md` and `config.yaml`:
 
 | Staff row | What blocks it | Where the fix is |
 |---|---|---|
-| **S11 safety / medical (911)** | `<handoff>` tells the bot to decline anything outside the library, and no `/public_safety/` page is in `scraper.seed_urls`. It will deflect an emergency. | **Highest priority.** Needs a system-prompt carve-out for emergencies plus the safety page ingested. |
-| **S05 financial aid office** | Same: campus-wide question, and no `/about/maps/` page in the KB. | Prompt carve-out for a few campus essentials + add the map page to `scraper.seed_urls`. |
+| ~~**S11 safety / medical (911)**~~ **CLOSED, behavior-wise** | The `<priority_responses>` carve-out in the system prompt now fires on an emergency and returns the 911 / campus-safety response verbatim. Behavior scores 1.0. | Its groundedness still fails, and that is an INSTRUMENT problem, not the bot: the response is emitted from the system prompt with no tool call, so the judge sees a phone number and a URL it cannot trace and calls it invented. See "The one groundedness failure the judge gets wrong". |
+| ~~**S05 financial aid office**~~ **CLOSED** | `library_links` returns the campus-map URLs, so the bot points the student at a real map instead of deflecting. | Nothing. It passes. |
 | Links to libguides / bookstore / Primo (S01, S04, S07, S08) | `<citations>` forbids constructing URLs, and none of `gavilan.libguides.com`, `gavilan.bkstr.com`, or the Primo permalinks are in `scraper.seed_urls`. The bot cannot legitimately produce them. | Add those pages as scraper seeds so the links arrive as real retrieved sources. |
 | S02b laptop renewal form link | The renewal form is emailed to borrowers; it is on no ingested page. | Probably fine as-is - pointing at the circ desk is the honest answer. |
 | S03 college-wide hours | Only library pages are ingested. | Accept library-only hours, or widen the seed list. |
 | S10 emoji in the model answer | `<tone>` bans emoji outright ("This is an institutional library assistant"). The staff example ends with 😊📚. | A spec disagreement, not a bug. **Decide which one wins** and change the loser. |
 
-The first two are product decisions, not tuning. Everything else in the set is a fair test of
+The link rows are the remaining product decision. Everything else in the set is a fair test of
 the bot as it stands today.
+
+## The one groundedness failure the judge gets wrong
+
+**S11** is the only row still failing groundedness, and the judge is reasoning correctly from
+what it can see:
+
+> The bot provided a specific phone number '(408) 848-4703' and a URL
+> 'https://www.gavilan.edu/public_safety/index.php' without calling any tools.
+
+Both are real, and both are copied verbatim out of the `<priority_responses>` block in
+`app/system_prompt.md`, which deliberately instructs the model to answer an emergency
+*without* calling a tool - the response has to work when every tool and the KB are down. So
+there is no tool output to trace it to, and there never will be.
+
+**This was left unfixed on purpose.** The obvious patch - telling the rubric that a phone
+number may come from the system prompt - would blunt the exact check this eval exists for:
+invented contact details. If you want the row green, the honest fixes are to ingest the
+public-safety page so the digits arrive as retrieved content, or add them to
+`app/data/library_links.json` so `library_links` can supply them. Both are bot changes, not
+rubric changes.
 
 The rubrics are deliberately written to the **staff spec**, not to the current prompt. An eval
 written to match what the system already does cannot tell you anything.
@@ -256,10 +308,11 @@ in mind: 27 rows × (1 bot call + 2 judge calls).
 
 | file | what it is |
 |---|---|
-| `promptfooconfig.yaml` | HTTP provider (env-driven URL, multi-turn capable), Bedrock judge, the two rubrics + shared deterministic checks |
+| `promptfooconfig.yaml` | HTTP provider (env-driven URL, multi-turn capable), Bedrock judge, the two rubrics + shared deterministic checks + the tool trace |
 | `dataset-staff-examples.yaml` | the library staff's 11 worked examples, translated into behavior rubrics |
 | `dataset.yaml` | 11 generic rows covering the four tools and the out-of-scope paths |
 | `README.md` | this |
+| `results.json` | run output, written by `-o results.json`. **Gitignored** - it is one deploy at one moment, not a repo artifact. |
 
 22 rows total, each costing 1 bot call + 2 judge calls.
 

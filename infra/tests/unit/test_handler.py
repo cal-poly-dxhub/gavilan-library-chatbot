@@ -2677,3 +2677,352 @@ def test_links_sources_are_not_in_full_context(monkeypatch):
     body = json.loads(resp["body"])
     assert body["full_context"] == []
     assert len(body["sources"]) == 1
+
+
+# --- Phase 5: tool_calls trace (opt-in debug payload) ---------------------------
+#
+# The eval's groundedness judge only ever saw `full_context`, which is populated from
+# search_library_info alone. An answer built from database_catalog, library_links, or either
+# Primo tool therefore looked context-free, and could not be graded. `tool_calls` closes that:
+# every toolResult the model received, in order. It is debug-only - the widget path (no flag)
+# must stay byte-identical, which is what the first two tests here pin down.
+
+
+def _tool_call_names(body):
+    return [c["tool"] for c in body["tool_calls"]]
+
+
+def _sent_tool_result_jsons(bedrock):
+    """Every toolResult json the loop actually handed back to the model, across all converse
+    calls, in order. The trace must match this exactly - it is a record of what was sent, not a
+    second rendering of it."""
+    seen = []
+    for call in bedrock.converse_calls:
+        for message in call["messages"]:
+            for block in message.get("content", []):
+                if "toolResult" in block:
+                    payload = block["toolResult"]["content"][0]["json"]
+                    if payload not in seen:
+                        seen.append(payload)
+    return seen
+
+
+def _all_five_tools_script():
+    """One converse script in which the model calls every tool once, then answers."""
+    return [
+        tool_use_turn(query="library hours", tool_use_id="tu-1"),
+        catalog_tool_use_turn("name", "JSTOR", tool_use_id="tu-2"),
+        links_tool_use_turn("bookstore", tool_use_id="tu-3"),
+        primo_tool_use_turn("the great gatsby", tool_use_id="tu-4"),
+        reserves_tool_use_turn("PSYC C1000", tool_use_id="tu-5"),
+        end_turn("Here is everything."),
+    ]
+
+
+def test_widget_path_unchanged_even_when_every_tool_ran(monkeypatch):
+    # THE regression that matters: with no flag, the response is exactly {answer, sources} - no
+    # tool_calls, no full_context - however many tools the loop ran.
+    _wire_primo(monkeypatch, _primo_search_payload([_primo_doc("The Great Gatsby", rid="alma1")]))
+    bedrock = FakeBedrockRuntime(converse_script=_all_five_tools_script())
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "everything"})), None)
+
+    body = json.loads(resp["body"])
+    assert set(body.keys()) == {"answer", "sources"}
+    assert "tool_calls" not in body
+
+
+def test_flag_false_omits_tool_calls(monkeypatch):
+    bedrock = FakeBedrockRuntime(
+        converse_script=[catalog_tool_use_turn("name", "JSTOR"), end_turn("No JSTOR.")]
+    )
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "JSTOR?", "include_full_context": False})), None
+    )
+    body = json.loads(resp["body"])
+    assert "tool_calls" not in body
+    assert "full_context" not in body
+
+
+def test_tool_calls_traces_every_tool_in_invocation_order(monkeypatch):
+    _wire_primo(
+        monkeypatch,
+        _primo_search_payload([_primo_doc("The Great Gatsby", rid="alma1")]),
+        {"alma1": _delivery_available()},
+    )
+    bedrock = FakeBedrockRuntime(converse_script=_all_five_tools_script())
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "everything", "include_full_context": True})), None
+    )
+    body = json.loads(resp["body"])
+
+    assert _tool_call_names(body) == [
+        "search_library_info",
+        "database_catalog",
+        "library_links",
+        "search_book_catalog",
+        "search_course_reserves",
+    ]
+    # The model's own input for each call is recorded verbatim, which is how the eval answers
+    # "was library_links ever called, and with what topic?".
+    assert [c["input"] for c in body["tool_calls"]] == [
+        {"query": "library hours"},
+        {"query_type": "name", "value": "JSTOR"},
+        {"topic": "bookstore"},
+        {"query": "the great gatsby"},
+        {"query": "PSYC C1000"},
+    ]
+    assert all(c["status"] == "success" for c in body["tool_calls"])
+
+
+def test_tool_calls_results_are_exactly_what_was_sent_to_the_model(monkeypatch):
+    # "In the form the model received them as toolResult content" - not a re-rendering.
+    _wire_primo(monkeypatch, _primo_search_payload([_primo_doc("The Great Gatsby", rid="alma1")]))
+    bedrock = FakeBedrockRuntime(converse_script=_all_five_tools_script())
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "everything", "include_full_context": True})), None
+    )
+    body = json.loads(resp["body"])
+
+    assert [c["result"] for c in body["tool_calls"]] == _sent_tool_result_jsons(bedrock)
+
+
+def test_tool_calls_exposes_the_catalog_result_full_context_cannot_show(monkeypatch):
+    # The row that proved the bug: an authoritative database answer, graded against an EMPTY
+    # context because full_context is KB-only. tool_calls carries the actual verdict.
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            catalog_tool_use_turn("name", "Opposing Viewpoints In Context"),
+            end_turn("Yes, the library has it."),
+        ]
+    )
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(
+            json.dumps({"query": "do you have Opposing Viewpoints?", "include_full_context": True})
+        ),
+        None,
+    )
+    body = json.loads(resp["body"])
+
+    assert body["full_context"] == []  # still KB-only, unchanged
+    (call,) = body["tool_calls"]
+    assert call["tool"] == "database_catalog"
+    assert call["returned_results"] is True
+    assert call["result"]["held"] is True
+    assert call["result"]["name"] == "Opposing Viewpoints In Context"
+
+
+def test_tool_calls_exposes_library_links_result_and_its_topic(monkeypatch):
+    bedrock = FakeBedrockRuntime(
+        converse_script=[links_tool_use_turn("campus map"), end_turn("Here is the map.")]
+    )
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "campus map?", "include_full_context": True})), None
+    )
+    body = json.loads(resp["body"])
+
+    assert body["full_context"] == []
+    (call,) = body["tool_calls"]
+    assert call["tool"] == "library_links"
+    assert call["input"] == {"topic": "campus map"}
+    assert call["result"]["matched"] is True
+    assert call["returned_results"] is True
+    # The full curated rows the model was handed, keys and URLs intact - the eval can now see
+    # exactly which links it was given rather than inferring them from the answer text.
+    assert [link["key"] for link in call["result"]["links"]] == [
+        "campus_map_main",
+        "campus_map_interactive",
+    ]
+    assert all(link["url"] for link in call["result"]["links"])
+
+
+def test_tool_calls_exposes_primo_records_with_availability(monkeypatch):
+    _wire_primo(
+        monkeypatch,
+        _primo_search_payload([_primo_doc("The Great Gatsby", author="Fitzgerald$$Qauthor", rid="alma1")], total=7),
+        {"alma1": _delivery_available()},
+    )
+    bedrock = FakeBedrockRuntime(
+        converse_script=[primo_tool_use_turn("the great gatsby"), end_turn("The catalog shows a copy.")]
+    )
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "gatsby?", "include_full_context": True})), None
+    )
+    body = json.loads(resp["body"])
+
+    assert body["full_context"] == []
+    (call,) = body["tool_calls"]
+    assert call["tool"] == "search_book_catalog"
+    assert call["result"]["total"] == 7
+    assert call["result"]["results"][0]["title"] == "The Great Gatsby"
+    assert call["result"]["results"][0]["availability"]["status"] == "available"
+    assert call["returned_results"] is True
+
+
+def test_tool_calls_exposes_course_reserves_records(monkeypatch):
+    _wire_primo(
+        monkeypatch,
+        _primo_search_payload([_reserve_doc("Introduction to psychology", courses=["PSYC C1000"], rid="r1")], total=3),
+    )
+    bedrock = FakeBedrockRuntime(
+        converse_script=[reserves_tool_use_turn("PSYC C1000"), end_turn("It is on reserve.")]
+    )
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "psych textbook on reserve?", "include_full_context": True})),
+        None,
+    )
+    body = json.loads(resp["body"])
+
+    (call,) = body["tool_calls"]
+    assert call["tool"] == "search_course_reserves"
+    assert call["result"]["results"][0]["courses"] == ["PSYC C1000"]
+    assert call["returned_results"] is True
+
+
+def test_tool_calls_records_kb_passages_the_model_saw(monkeypatch):
+    # The KB tool is traced too, so tool_calls is the single complete view of the evidence.
+    bedrock = FakeBedrockRuntime(converse_script=search_then_answer("Open 9 to 5."))
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "hours?", "include_full_context": True})), None
+    )
+    body = json.loads(resp["body"])
+
+    (call,) = body["tool_calls"]
+    assert call["tool"] == "search_library_info"
+    assert call["returned_results"] is True
+    assert [p["text"] for p in call["result"]["passages"]] == [c["text"] for c in body["full_context"]]
+
+
+def test_tool_calls_marks_a_primo_soft_fail_as_an_errored_call(monkeypatch):
+    _wire_primo(monkeypatch, None, search_exc=RuntimeError("primo down"))
+    bedrock = FakeBedrockRuntime(
+        converse_script=[primo_tool_use_turn("gatsby"), end_turn("Catalog search is unavailable.")]
+    )
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "gatsby?", "include_full_context": True})), None
+    )
+    (call,) = json.loads(resp["body"])["tool_calls"]
+
+    assert call["status"] == "error"
+    assert call["returned_results"] is False
+    assert call["result"]["error"] == "catalog_unavailable"
+
+
+def test_tool_calls_records_an_unknown_tool_request(monkeypatch):
+    bedrock = FakeBedrockRuntime(
+        converse_script=[tool_use_turn(name="not_a_tool"), end_turn("Sorry, I cannot do that.")]
+    )
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "x", "include_full_context": True})), None
+    )
+    (call,) = json.loads(resp["body"])["tool_calls"]
+
+    assert call["tool"] == "not_a_tool"
+    assert call["status"] == "error"
+    assert call["returned_results"] is False
+
+
+def test_direct_answer_reports_an_empty_trace(monkeypatch):
+    # A greeting calls nothing. An empty trace is the honest record of that, and tells the judge
+    # the answer was not supposed to have evidence behind it.
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("Hi! How can I help?")])
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "hi", "include_full_context": True})), None
+    )
+    body = json.loads(resp["body"])
+
+    assert body["tool_calls"] == []
+    assert body["full_context"] == []
+
+
+def test_guardrail_block_still_reports_the_tools_that_ran(monkeypatch):
+    # Sources are dropped on a block (they would be misleading next to a block message), but the
+    # debug trace is not user-facing, and "what ran before the block" is exactly what you need.
+    blocked = "I'm not able to provide a response to that."
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            catalog_tool_use_turn("name", "JSTOR"),
+            {
+                "output": {"message": {"role": "assistant", "content": [{"text": blocked}]}},
+                "stopReason": "guardrail_intervened",
+            },
+        ]
+    )
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "x", "include_full_context": True})), None
+    )
+    body = json.loads(resp["body"])
+
+    assert body["answer"] == blocked
+    assert body["sources"] == []
+    assert _tool_call_names(body) == ["database_catalog"]
+
+
+def test_multiple_calls_to_one_tool_are_all_traced(monkeypatch):
+    # The model may search several times; each call is its own trace entry, in order.
+    bedrock = FakeBedrockRuntime(
+        converse_script=[multi_tool_use_turn("hours", "parking"), end_turn("Both answered.")]
+    )
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "hours and parking", "include_full_context": True})),
+        None,
+    )
+    body = json.loads(resp["body"])
+
+    assert _tool_call_names(body) == ["search_library_info", "search_library_info"]
+    assert [c["input"]["query"] for c in body["tool_calls"]] == ["hours", "parking"]
+
+
+# -- _returned_results (called directly) --
+
+
+def test_returned_results_is_false_for_an_error_result():
+    assert handler._returned_results({"error": "catalog_unavailable"}) is False
+
+
+def test_returned_results_follows_the_matched_flag_for_links():
+    # A links MISS returns the whole table, so a non-empty `links` list is not a match. `matched`
+    # is the real signal and takes precedence.
+    miss, _ = handler._run_links_tool({"topic": "zzz nothing matches this"})
+    assert miss["links"]  # the whole directory came back
+    assert handler._returned_results(miss) is False
+    hit, _ = handler._run_links_tool({"topic": "campus map"})
+    assert handler._returned_results(hit) is True
+
+
+def test_returned_results_counts_a_not_held_verdict_as_a_result():
+    # database_catalog is authoritative about absence: "not held" IS the answer, not a miss.
+    assert handler._returned_results({"held": False, "name": "JSTOR"}) is True
+
+
+def test_returned_results_is_false_for_empty_payload_lists():
+    assert handler._returned_results({"passages": []}) is False
+    assert handler._returned_results({"query": "x", "total": 0, "results": []}) is False
+    assert handler._returned_results({"subject": "basketry", "databases": []}) is False

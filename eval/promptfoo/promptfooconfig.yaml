@@ -40,9 +40,12 @@ providers:
       # they are prepended, oldest first, before the current question. Rows that omit it get
       # a single user turn (a fresh conversation), which is the common case.
       #
-      # `include_full_context` is the opt-in eval flag the query Lambda already supports: it
-      # adds `full_context` to the response - the un-deduped, un-truncated KB passages the
-      # model actually saw. The widget never sets it, so production behavior is unchanged.
+      # `include_full_context` is the opt-in eval flag the query Lambda supports. It adds a
+      # DEBUG PAYLOAD to the response: `full_context` (the un-deduped, un-truncated KB
+      # passages) and `tool_calls` (an ordered trace of EVERY tool the model invoked, each
+      # entry `{tool, input, status, returned_results, result}`, where `result` is the exact
+      # JSON the model received as that call's toolResult). The widget never sets the flag, so
+      # production behavior is unchanged.
       body: |
         {
           "messages": [
@@ -54,14 +57,26 @@ providers:
         }
       # The grid column (and every deterministic assertion) sees ONLY the answer text, so
       # the side-by-side view stays readable and `contains`/`regex` checks can't accidentally
-      # match against retrieved context. The retrieved passages ride along in `metadata`,
-      # which the groundedness assertion pulls out via its own `transform` (see below).
+      # match against tool output. Everything else rides along in `metadata`, which lands in
+      # results.json per row and which the groundedness assertion pulls out via its own
+      # `transform` (see below).
+      #
+      # `tool_context` is the whole evidence base: every tool's output, in call order. It is a
+      # strict superset of the old KB-only `retrieved_context`, which is why that var is gone -
+      # feeding both would just duplicate the KB passages in the judge prompt.
       transformResponse: |
         ({
           output: json.answer || '',
           metadata: {
-            retrieved_context: (json.full_context || [])
-              .map((c, i) => '[' + (i + 1) + '] ' + c.text + (c.source ? '\n    (source: ' + c.source + ')' : ''))
+            tools_used: (json.tool_calls || []).map((t) => t.tool).join(', ') || '(none)',
+            tool_trace: (json.tool_calls || [])
+              .map((t, i) => (i + 1) + '. ' + t.tool + ' ' + JSON.stringify(t.input || {})
+                + ' -> ' + (t.status === 'error' ? 'ERROR' : (t.returned_results ? 'results' : 'no results')))
+              .join('\n'),
+            tool_context: (json.tool_calls || [])
+              .map((t, i) => '[' + (i + 1) + '] TOOL ' + t.tool
+                + '\n    input: ' + JSON.stringify(t.input || {})
+                + '\n    returned: ' + JSON.stringify(t.result, null, 2).split('\n').map((l) => '      ' + l).join('\n').trim())
               .join('\n\n'),
             source_uris: (json.sources || []).map((s) => s.uri).join('\n'),
           },
@@ -124,22 +139,32 @@ defaultTest:
         else.
 
     # --- 2. GROUNDEDNESS ---------------------------------------------------------------
-    # `transform` reshapes what THIS assertion's judge sees: the answer plus the retrieved
-    # passages from provider metadata. The grid column and the other assertions are
-    # unaffected - they still see the bare answer.
+    # `transform` reshapes what THIS assertion's judge sees: the answer plus the COMPLETE tool
+    # evidence from provider metadata. The grid column and the other assertions are unaffected -
+    # they still see the bare answer.
+    #
+    # This used to feed only `retrieved_context` (knowledge-base passages), which is one of the
+    # bot's five tools. An answer built from the database catalog, the curated links, or either
+    # Primo search therefore reached the judge with an EMPTY context, and the rubric had to be
+    # written around that blind spot - four of five tools were structurally ungradeable. The
+    # Lambda now returns the full `tool_calls` trace, so the judge sees what the model saw.
     - type: llm-rubric
       metric: groundedness
       transform: |
-        const ctx = (context.metadata && context.metadata.retrieved_context) || '';
+        const ctx = (context.metadata && context.metadata.tool_context) || '';
+        const trace = (context.metadata && context.metadata.tool_trace) || '';
         const uris = (context.metadata && context.metadata.source_uris) || '';
         return [
           'THE ANSWER THE BOT GAVE:',
           output,
           '',
-          'KNOWLEDGE-BASE PASSAGES RETRIEVED FOR THIS QUESTION:',
-          ctx.trim() ? ctx : '(NONE - see the rubric; this is expected for some questions)',
+          'TOOLS THE BOT CALLED, IN ORDER:',
+          trace.trim() ? trace : '(none - the bot answered without calling any tool)',
           '',
-          'SOURCE LINKS THE BOT ATTACHED:',
+          'EVERYTHING THOSE TOOLS RETURNED (the complete evidence the bot had):',
+          ctx.trim() ? ctx : '(NOTHING - no tool was called; see the rubric)',
+          '',
+          'SOURCE LINKS ATTACHED TO THIS ANSWER (assembled by the SERVER from the tools that ran - the model did not write these):',
           uris.trim() ? uris : '(none)',
         ].join('\n');
       value: |
@@ -147,41 +172,64 @@ defaultTest:
         in this system is enforced by the prompt, not by a guardrail, so this is the check that
         matters most.
 
-        You are given the answer, plus the knowledge-base passages that were retrieved for it.
+        You are given the answer, the list of tools the bot called, and the COMPLETE output of
+        every one of those calls - exactly what the bot had in front of it when it wrote the
+        answer. Nothing is withheld from you.
 
-        CRITICAL - READ THIS BEFORE GRADING:
-        The retrieved passages are the output of ONE of the bot's four tools: the website
-        knowledge-base search. The other three tools (the research-database catalog, the live
-        book catalog, and the live course-reserves search) return their results through a
-        different path that is NOT captured here. So an EMPTY or INCOMPLETE passage list is
-        normal and is NOT by itself evidence of hallucination. It usually means the bot
-        answered from a catalog or live-search tool, or correctly answered without a tool at
-        all (a greeting, a refusal, a routing reply, a clarifying question).
+        The bot has five tools, and all five report here:
+        - search_library_info: semantic search of the library website. Returns `passages`.
+        - database_catalog: AUTHORITATIVE lookup of the research-database list. Returns
+          `held: true/false` for a named database (a `held: false` verdict is a solid,
+          citable fact, not a gap), or a list of `databases` for a subject.
+        - search_book_catalog / search_course_reserves: LIVE searches of the library's Primo
+          catalog. Returns `total` plus candidate `results` with availability. These are
+          EVIDENCE, not a verdict: only `total: 0` authoritatively means "not held".
+        - library_links: a curated table of official Gavilan URLs. Any URL appearing in a
+          `library_links` result is a REAL, approved link - the bot did not construct it.
+
+        A tool result is support. A claim backed by ANY of the tool output above is grounded,
+        whichever tool produced it. Do not privilege the knowledge-base passages over the other
+        four; do not treat a catalog or links result as weaker evidence.
+
+        THE SOURCE-LINK LIST IS NOT SOMETHING THE MODEL WROTE. The server builds it from the
+        tools that actually ran and attaches it to the answer. A URL that appears there is real
+        and approved by construction - it is NOT a candidate hallucination, and repeating one in
+        the answer text is correct behavior, not a constructed link. Only a URL that appears in
+        NEITHER the tool output NOR that list is suspect.
+
+        AN EMPTY TOOL LIST IS NOT BY ITSELF A FAILURE. Calling no tool is correct for a
+        greeting, a refusal, a routing reply, a clarifying question, or a statement of the
+        bot's own limits. Judge those on whether they assert library FACTS without support.
 
         FAIL only when you can point at something concretely wrong:
-        - The answer CONTRADICTS a retrieved passage.
+        - The answer CONTRADICTS the tool output (says a database is held when the catalog says
+          `held: false`, reports availability the catalog record does not show, claims a search
+          returned nothing when `total` is greater than 0, names a course the reserve record
+          does not list).
         - The answer states a specific, checkable fact (a time, a date, a price, a fee, a room,
           a call number, a phone number, an email address, a policy limit, a loan period, a
-          named title or author) that no passage supports AND that the bot has no plausible way
-          to know. Specific invented detail is the failure mode; general statements about how
-          libraries work are not.
-        - The answer gives a URL or web address that does not appear in the retrieved passages
-          or source links. The bot is instructed never to construct a link from memory.
-        - The answer asserts the library definitely does or does not have something, with no
-          support for that claim.
+          named title or author) that NO tool output supports AND that the bot has no plausible
+          way to know. Specific invented detail is the failure mode; general statements about
+          how libraries work are not.
+        - The answer gives a URL or web address that appears in NONE of the tool output and in
+          none of the source links. The bot is instructed never to construct a link from memory.
+        - The answer asserts the library definitely does or does not have something with no
+          support - including calling a fuzzy Primo miss (nonzero `total`, no good match) a
+          confirmed absence.
 
         PASS when:
-        - Every checkable claim traces to a passage, or
+        - Every checkable claim traces to some tool's output, or
         - The answer is appropriately hedged ("the catalog shows...", "check with a librarian
           to confirm", "I don't have that information"), or
         - The answer is a refusal, routing, greeting, or clarifying question that asserts no
           library facts at all, or
-        - There are no passages and the answer makes no specific unsupported claim.
+        - No tool was called and the answer makes no specific unsupported claim.
 
         Hedged uncertainty is CORRECT behavior for this bot and must never be marked down.
         Being wrong is worse than saying "I don't know" - grade accordingly.
 
     # --- 3-4. DETERMINISTIC CHECKS -----------------------------------------------------
+    # (5 below is reporting, not a check.)
     # Kept few and genuinely safe. These are invariants of the system prompt, not guesses
     # about what the answer should say.
 
@@ -197,6 +245,23 @@ defaultTest:
     - type: not-regex
       metric: no_dashes
       value: '[—–]'
+
+    # --- 5. TOOL TRACE (reporting, not a check) ----------------------------------------
+    # ALWAYS PASSES. It exists so which tools ran on a row is readable straight off the grid,
+    # instead of decoding it from the answer text or digging through results.json. Tool routing
+    # is the model's, driven only by the system prompt and the toolSpec descriptions, so
+    # "did it call the tool we expected?" is a first-class question here - `library_links` in
+    # particular is deliberately absent from the system prompt and routes off its description
+    # alone, and until this trace existed there was no way to tell whether it was ever called.
+    - type: javascript
+      metric: tools_called
+      value: |
+        const trace = (context.metadata && context.metadata.tool_trace) || '';
+        return {
+          pass: true,
+          score: 1,
+          reason: trace.trim() ? trace : '(no tools called)',
+        };
 
 tests:
   # The library staff's own worked examples of what a good answer looks like. This is the

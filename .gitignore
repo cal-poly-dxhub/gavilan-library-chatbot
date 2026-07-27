@@ -32,3 +32,8 @@ Thumbs.db
 
 # --- Scraper ---
 scraper_output/
+
+# --- Eval ---
+# promptfoo run output: a ~1MB per-run dump of live answers and judge reasoning. Useful while
+# tuning, never a repo artifact - it is a snapshot of one deploy at one moment.
+eval/promptfoo/results.json
