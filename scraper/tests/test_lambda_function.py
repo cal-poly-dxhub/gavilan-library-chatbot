@@ -243,3 +243,92 @@ def test_regenerate_catalog_skipped_without_bucket(monkeypatch):
     status = lf.regenerate_catalog([_db_result(_TWO_DB_TABLE)], s3)
     assert status["catalog"].startswith("skipped")
     s3.put_object.assert_not_called()
+
+
+# --- Pruning and KB exclusion ----------------------------------------------------------------
+#
+# Before this the uploader could only ever put_object, so a page removed from seed_urls kept its
+# document in the bucket and stayed indexed forever - de-seeding was a silent no-op. These pin the
+# fix and, more importantly, the safety property: pruning keys off CONFIGURATION, not off what a
+# given run managed to fetch.
+
+
+def _paginated(keys):
+    """A MagicMock paginator whose paginate() yields one page of the given object keys."""
+    paginator = MagicMock()
+    paginator.paginate.return_value = [{"Contents": [{"Key": k} for k in keys]}]
+    return paginator
+
+
+def test_expected_kb_keys_covers_the_seed_list_minus_exclusions():
+    keys = lf.expected_kb_keys(["https://x/a", "https://x/b"], ["https://x/b"])
+    a = lf.slugify_url("https://x/a")
+    b = lf.slugify_url("https://x/b")
+    assert keys == {f"{a}.md", f"{a}.md.metadata.json"}
+    assert f"{b}.md" not in keys
+
+
+def test_prune_deletes_only_what_configuration_no_longer_wants(monkeypatch):
+    s3, _ = _wire(monkeypatch, [_ok()])
+    s3.get_paginator.return_value = _paginated(
+        ["keep.md", "keep.md.metadata.json", "stale.md", "stale.md.metadata.json"]
+    )
+
+    deleted = lf.prune_stale_objects(s3, "kb-bucket", {"keep.md", "keep.md.metadata.json"})
+
+    assert sorted(deleted) == ["stale.md", "stale.md.metadata.json"]
+    assert {c.kwargs["Key"] for c in s3.delete_object.call_args_list} == {
+        "stale.md",
+        "stale.md.metadata.json",
+    }
+
+
+def test_prune_never_raises_when_s3_refuses(monkeypatch):
+    # Housekeeping must not break a scrape that already succeeded - e.g. if the role is missing
+    # s3:ListBucket, the run should still upload and ingest.
+    s3, _ = _wire(monkeypatch, [_ok()])
+    s3.get_paginator.side_effect = RuntimeError("AccessDenied")
+
+    assert lf.prune_stale_objects(s3, "kb-bucket", {"keep.md"}) == []
+
+
+def test_a_failed_fetch_does_not_delete_that_page_from_the_knowledge_base(monkeypatch):
+    # THE point of keying on config. Both pages are seeded; /b 404s this run. Pruning by what
+    # uploaded successfully would delete /b's document and silently drop its answers from the bot
+    # until someone noticed. Its last-good document must survive a transient failure.
+    s3, _ = _wire(monkeypatch, [_ok(), _fail()])
+    b_slug = lf.slugify_url("https://x/b")
+    s3.get_paginator.return_value = _paginated(
+        ["x-a-hash.md", "x-a-hash.md.metadata.json", f"{b_slug}.md", f"{b_slug}.md.metadata.json"]
+    )
+
+    lf.handler({}, None)
+
+    deleted = {c.kwargs["Key"] for c in s3.delete_object.call_args_list}
+    assert deleted == set()  # nothing pruned, despite /b producing no upload this run
+
+
+def test_kb_excluded_page_is_scraped_but_never_uploaded(monkeypatch):
+    # databases.php is the real case: regenerate_catalog needs its HTML, the knowledge base does
+    # not need its text. It stays in SEED_URLS and is skipped at upload time.
+    s3, _ = _wire(monkeypatch, [_ok()])
+    monkeypatch.setenv("KB_EXCLUDE_URLS", json.dumps(["https://x/a"]))
+    s3.get_paginator.return_value = _paginated(["x-a-hash.md", "x-a-hash.md.metadata.json"])
+
+    out = lf.handler({}, None)
+
+    s3.put_object.assert_not_called()
+    assert out["uploaded"] == 0
+    # ...and the prune retires the copy a previous run had already indexed.
+    assert sorted(out["pruned"]) == ["x-a-hash.md", "x-a-hash.md.metadata.json"]
+
+
+def test_ingestion_runs_for_a_prune_only_change(monkeypatch):
+    # A run that only REMOVES pages still has to re-ingest, or the deleted document keeps its
+    # vectors and the bot keeps answering from content that is no longer in the bucket.
+    s3, bedrock_agent = _wire(monkeypatch, [_fail()])
+    s3.get_paginator.return_value = _paginated(["gone.md"])
+
+    lf.handler({}, None)
+
+    bedrock_agent.start_ingestion_job.assert_called_once()

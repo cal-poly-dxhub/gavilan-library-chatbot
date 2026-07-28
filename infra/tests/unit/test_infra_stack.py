@@ -162,6 +162,24 @@ def test_s3_data_source_points_at_source_bucket_with_crawler_chunking():
     )
 
 
+def test_data_source_name_carries_the_chunking_config():
+    # Chunking is IMMUTABLE in Bedrock, so changing it makes CloudFormation replace the data
+    # source - and CloudFormation creates the replacement BEFORE deleting the original. A fixed
+    # name collides inside the knowledge base and kills the deploy mid-update with
+    # "DataSource with name ... already exists (409 AlreadyExists)", which is exactly what
+    # happened on the 300 -> 600 token change. The name has to move when the chunking moves.
+    template = _template()
+    (source,) = template.find_resources("AWS::Bedrock::DataSource").values()
+    name = source["Properties"]["Name"]
+    chunking = CONFIG["chunking"]
+
+    assert str(chunking["max_tokens"]) in name, name
+    assert str(chunking["overlap_percentage"]) in name, name
+    assert chunking["strategy"].lower().replace("_", "") in name, name
+    # Bedrock's own constraint on the field: alphanumerics separated by single _ or -.
+    assert re.fullmatch(r"([0-9a-zA-Z][_-]?){1,100}", name), name
+
+
 def test_data_source_created_after_knowledge_base():
     template = _template()
     sources = template.find_resources("AWS::Bedrock::DataSource")
@@ -588,20 +606,42 @@ def test_scraper_lambda_env_wires_bucket_kb_and_data_source():
     assert "SOURCE_BUCKET" in env and "KNOWLEDGE_BASE_ID" in env and "DATA_SOURCE_ID" in env
 
 
-def test_scraper_role_can_put_objects_and_start_ingestion():
+def test_scraper_role_can_write_prune_and_start_ingestion():
     template = _template()
     statements = [
         stmt
         for policy in template.find_resources("AWS::IAM::Policy").values()
         for stmt in policy["Properties"]["PolicyDocument"]["Statement"]
     ]
-    puts = [s for s in statements if s["Action"] == "s3:PutObject"]
-    assert len(puts) == 1, puts
-    assert "KnowledgeBaseSourceBucket" in json.dumps(puts[0]["Resource"])
+
+    # Objects: write the fresh documents AND delete the ones the seed list no longer calls for.
+    # Without DeleteObject the prune soft-fails and de-seeding a page is a silent no-op - the
+    # document stays in the bucket and stays indexed forever.
+    writes = [s for s in statements if s["Action"] == ["s3:PutObject", "s3:DeleteObject"]]
+    assert len(writes) == 1, writes
+    assert "KnowledgeBaseSourceBucket" in json.dumps(writes[0]["Resource"])
+
+    # ListBucket is granted on the BUCKET arn, not the object arn: the prune has to enumerate
+    # what is actually there before it can tell what is stale.
+    lists = [s for s in statements if s["Action"] == "s3:ListBucket"]
+    source_lists = [s for s in lists if "KnowledgeBaseSourceBucket" in json.dumps(s["Resource"])]
+    assert len(source_lists) == 1, source_lists
+    assert "/*" not in json.dumps(source_lists[0]["Resource"])
 
     ingest = [s for s in statements if s["Action"] == "bedrock:StartIngestionJob"]
     assert len(ingest) == 1, ingest
     assert "KnowledgeBase" in json.dumps(ingest[0]["Resource"])
+
+
+def test_scraper_env_carries_the_kb_exclusion_list():
+    # databases.php must stay in SEED_URLS (regenerate_catalog parses its HTML) while being kept
+    # out of the knowledge base. If these two ever disagree, either the catalog freezes or the
+    # largest redundant document in the corpus comes back.
+    env = _scraper_function(_template())["Properties"]["Environment"]["Variables"]
+    excluded = json.loads(env["KB_EXCLUDE_URLS"])
+    assert excluded == CONFIG["scraper"].get("kb_exclude_urls", [])
+    for url in excluded:
+        assert url in CONFIG["scraper"]["seed_urls"], url
 
 
 def test_eventbridge_schedule_targets_the_scraper_lambda():

@@ -6,8 +6,13 @@ every successful page to the KB's S3 source bucket, and triggers a Bedrock inges
 knowledge base picks up the fresh content. Partial failures are tolerated: failed URLs are logged
 and skipped, and ingestion still runs as long as at least one page was uploaded.
 
+It also PRUNES: objects the configuration no longer calls for are deleted from the source
+bucket before ingestion, so removing a page from seed_urls actually removes it from the
+knowledge base instead of leaving it indexed forever (see prune_stale_objects).
+
 Runtime wiring (all from stack-set env vars; boto3 from the Lambda runtime, deps from the layer):
   SEED_URLS               JSON array of URLs to scrape
+  KB_EXCLUDE_URLS         JSON array of seed URLs to scrape but NOT index (see handler)
   SCRAPE_TIMEOUT_SECONDS  per-request HTTP timeout
   SCRAPER_USER_AGENT      identifying User-Agent
   SOURCE_BUCKET           KB S3 source bucket to upload into
@@ -24,7 +29,7 @@ from datetime import datetime, timezone
 
 import boto3
 
-from scraper import extract_database_catalog, scrape_urls, validate_held_list
+from scraper import extract_database_catalog, scrape_urls, slugify_url, validate_held_list
 
 LOG = logging.getLogger()
 LOG.setLevel(logging.INFO)
@@ -234,8 +239,59 @@ def _metadata_body(metadata: dict) -> bytes:
     return json.dumps({"metadataAttributes": attributes}).encode("utf-8")
 
 
+def expected_kb_keys(seed_urls, kb_exclude_urls):
+    """Every object key the KB source bucket SHOULD hold after a healthy run.
+
+    Derived from configuration (the seed list minus the KB-excluded pages), NOT from what this
+    run happened to upload - see prune_stale_objects for why that distinction is load-bearing."""
+    excluded = set(kb_exclude_urls or [])
+    keys = set()
+    for url in seed_urls:
+        if url in excluded:
+            continue
+        slug = slugify_url(url)
+        keys.add(f"{slug}.md")
+        keys.add(f"{slug}.md.metadata.json")
+    return keys
+
+
+def prune_stale_objects(s3, bucket, expected_keys):
+    """Delete KB source objects that configuration no longer calls for. Returns the deleted keys.
+
+    WHY THIS EXISTS: the uploader only ever put_objects, so before this a page removed from
+    seed_urls simply stopped being refreshed while its document stayed in the bucket and stayed
+    indexed forever. De-seeding was a silent no-op.
+
+    WHY IT PRUNES AGAINST CONFIG, NOT AGAINST THIS RUN'S UPLOADS: pruning by what succeeded would
+    make one transient fetch failure delete that page from the knowledge base - a 404 on
+    howdoi.php for a single week would drop every checkout answer the bot has until someone
+    noticed. Keying on the configured seed list means a failed fetch leaves the last-good document
+    in place, the same posture regenerate_catalog already takes with the database catalog.
+
+    Never raises: a prune failure must not break a scrape that has already succeeded."""
+    deleted: list[str] = []
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket):
+            for obj in page.get("Contents") or []:
+                key = obj["Key"]
+                if key in expected_keys:
+                    continue
+                s3.delete_object(Bucket=bucket, Key=key)
+                deleted.append(key)
+                LOG.info("pruned stale KB object: %s", key)
+    except Exception as exc:  # noqa: BLE001 - pruning is housekeeping, never fatal
+        LOG.exception("prune failed (ignored): %s", exc)
+    return deleted
+
+
 def handler(event, context):
     seed_urls = json.loads(os.environ["SEED_URLS"])
+    # Pages fetched for their side effects but deliberately kept OUT of the knowledge base.
+    # databases.php is the case this exists for: regenerate_catalog parses its HTML to rebuild the
+    # held database_catalog, so it must stay in seed_urls - but its content is redundant with that
+    # catalog and it is the largest remaining document in the corpus, so it should not be indexed.
+    kb_exclude_urls = json.loads(os.environ.get("KB_EXCLUDE_URLS", "[]"))
     timeout = float(os.environ.get("SCRAPE_TIMEOUT_SECONDS", "20"))
     user_agent = os.environ.get("SCRAPER_USER_AGENT") or None
     bucket = os.environ["SOURCE_BUCKET"]
@@ -249,11 +305,19 @@ def handler(event, context):
 
     s3 = _s3_client()
     uploaded_keys: list[str] = []
+    # Every object key written this run (markdown AND sidecars) - the prune guard below unions
+    # these in so a run can never delete what it just uploaded.
+    uploaded_object_keys: list[str] = []
     failures: list[dict] = []
+    excluded = set(kb_exclude_urls)
     for result in results:
         if not result.ok:
             LOG.warning("scrape failed: %s (%s)", result.url, result.error)
             failures.append({"url": result.url, "error": result.error})
+            continue
+        if result.url in excluded:
+            # Still scraped (regenerate_catalog needs the HTML); just never indexed.
+            LOG.info("kb-excluded, not uploaded: %s", result.url)
             continue
         md_key = f"{result.slug}.md"
         meta_key = f"{result.slug}.md.metadata.json"
@@ -270,14 +334,29 @@ def handler(event, context):
             ContentType="application/json",
         )
         uploaded_keys.append(md_key)
+        uploaded_object_keys.extend((md_key, meta_key))
         LOG.info("uploaded %s (<- %s)", md_key, result.url)
 
+    # Drop anything configuration no longer calls for, BEFORE ingestion, so the same job that
+    # indexes the new content also retires the removed content.
+    #
+    # The uploaded keys are unioned in as a belt-and-braces guard: expected_kb_keys derives slugs
+    # from the seed URL while the uploader uses result.slug, and although both slugify the same
+    # input today, any future divergence (a redirect used for slugging, a slug scheme change)
+    # would otherwise make the prune delete the very objects this run just wrote. Whatever we
+    # uploaded is by definition wanted.
+    expected = expected_kb_keys(seed_urls, kb_exclude_urls) | set(uploaded_object_keys)
+    pruned_keys = prune_stale_objects(s3, bucket, expected)
+
     LOG.info(
-        "scrape complete: %d uploaded, %d failed", len(uploaded_keys), len(failures)
+        "scrape complete: %d uploaded, %d failed, %d pruned",
+        len(uploaded_keys),
+        len(failures),
+        len(pruned_keys),
     )
 
     ingestion_job_id = None
-    if uploaded_keys:
+    if uploaded_keys or pruned_keys:
         response = _bedrock_agent_client().start_ingestion_job(
             knowledgeBaseId=kb_id,
             dataSourceId=data_source_id,
@@ -300,6 +379,7 @@ def handler(event, context):
 
     return {
         "uploaded": len(uploaded_keys),
+        "pruned": pruned_keys,
         "failed": failures,
         "ingestionJobId": ingestion_job_id,
         **catalog_status,

@@ -6,16 +6,18 @@ Fronted by an API Gateway HTTP API (payload format 2.0) with two routes on this 
          user query.
       1. run_agent() -> an AGENTIC Bedrock Converse tool-use loop under the real system
          prompt (app/system_prompt.md), with the OUTPUT guardrail (content filters, answer
-         side only) attached to every Converse call as a backstop. The model is given FIVE
+         side only) attached to every Converse call as a backstop. The model is given FOUR
          tools: `search_library_info` (KB `Retrieve`), `database_catalog` (authoritative
          research-database lookup from static JSON), `search_book_catalog` (a LIVE search of
-         the Primo book/media catalog), `search_course_reserves` (a LIVE search of the
-         Primo course-reserves scope), and `library_links` (a curated table of canonical
-         Gavilan URLs, from static JSON) - the two live catalog tools return evidence the
+         the Primo book/media catalog), and `search_course_reserves` (a LIVE search of the
+         Primo course-reserves scope) - the two live catalog tools return evidence the
          model judges, not an authoritative verdict. The model decides which to call and how
          often. The loop feeds each tool result back and re-calls Converse until stopReason ==
          "end_turn" (or a safety iteration cap). Sources accumulate from every tool the model
          triggered during the loop.
+         The curated table of canonical Gavilan URLs is NOT a tool: it takes no input and
+         returns the same rows every time, so it is injected into the Converse `system`
+         payload on every request instead. See _links_block().
   - GET /warm -> _handle_warm(): a retrieval-only pre-warm before the first real query. No
       generation, no guardrail.
 
@@ -43,12 +45,16 @@ Wiring comes from env vars set by the CDK stack.
         toolUse block, `{tool, input, status, returned_results, result}`, where `result` is
         the exact JSON handed back to the model as that call's `toolResult` content. This is
         the whole evidence base the model answered from, KB and non-KB alike; `full_context`
-        alone only ever shows one of the five tools.
+        alone only ever shows one of the four tools.
+      * `library_links`: the curated URL table the model was handed in its `system` payload.
+        It is not a tool result, so it appears in neither field above - without it a correct
+        curated link reads as ungrounded to the eval judge.
     The widget never sets the flag, so its responses are exactly the `{answer, sources}`
     shape above. Nothing here changes what is sent to the model.
 """
 
 import base64
+import datetime
 import json
 import os
 import ssl
@@ -123,10 +129,8 @@ _FALLBACK_BLOCK_MESSAGE = (
 #                          databases for subject Y?), from a bundled static JSON.
 SEARCH_TOOL_NAME = "search_library_info"
 CATALOG_TOOL_NAME = "database_catalog"
-# library_links - a curated directory of canonical Gavilan URLs (see the library_links section
-# below). Deliberately NOT named in the system prompt: it is routed purely by its toolSpec
-# description, which is where this project's tool-routing behavior is supposed to live.
-LINKS_TOOL_NAME = "library_links"
+# NOTE: there is no library_links TOOL any more. The curated URL directory is injected into the
+# Converse `system` payload on every request instead - see _links_block() for why.
 # search_book_catalog - a LIVE search of the Primo book/media catalog. Unlike database_catalog
 # (authoritative), this returns EVIDENCE (candidate records + availability) and the MODEL judges
 # whether any is a real match; total == 0 is the only clean not-held signal. See the Primo section.
@@ -162,6 +166,50 @@ _WARM_QUERY = "library hours"
 _PROMPT_PATH = Path(__file__).resolve().parent / "system_prompt.md"
 SYSTEM_PROMPT = _PROMPT_PATH.read_text(encoding="utf-8").strip()
 
+# The model is not told the date by anything else, and the library's hours are published as
+# SEMESTER BLOCKS ("Spring Semester 2026 (January 26 - May 22)"). Without today's date it cannot
+# tell which block is current, so "what are your hours?" gets all three semesters dumped on it -
+# the honest answer for a model that does not know the day. The finaid and bookstore pages are
+# scoped the same way ("Summer Hours: July 6 - August 1, 2026"), so this is not hours-only.
+#
+# PACIFIC, not the Lambda's UTC: after 5pm Pacific, UTC is already tomorrow, which would flip a
+# Friday answer to Saturday's "closed". zoneinfo reads the OS tzdata (present on Amazon Linux
+# 2023); if that lookup ever fails, fall back to a fixed -08:00 rather than silently serving UTC.
+_LIBRARY_TZ = "America/Los_Angeles"
+
+
+def _today_pacific():
+    """Today's date at the library, as YYYY-MM-DD plus the weekday. Never raises."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        now = datetime.datetime.now(ZoneInfo(_LIBRARY_TZ))
+    except Exception:  # noqa: BLE001 - missing tzdata must not take the request down
+        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-8)))
+    return now.strftime("%A, %Y-%m-%d")
+
+
+def _system_blocks():
+    """The Converse `system` payload: the packaged prompt, today's date, and the curated links.
+
+    Separate blocks rather than one interpolated string so the prompt itself stays a static
+    asset - the date and the link table are the injected parts, and keeping them apart makes
+    that obvious in a trace.
+    """
+    return [
+        {"text": SYSTEM_PROMPT},
+        {
+            "text": (
+                f"Today's date is {_today_pacific()} (Pacific, the library's local time). "
+                "Use it to decide which semester, term, or seasonal hours block currently "
+                "applies, and give the person the one that is in effect now rather than "
+                "listing every block you retrieved. If a date range makes the current block "
+                "ambiguous, say which one you used."
+            )
+        },
+        {"text": _links_block()},
+    ]
+
 # Database catalog (Phase 2b: self-updating).
 #   - The HELD list is regenerated weekly by the scraper and written to S3; this Lambda reads the
 #     fresh copy from CATALOG_BUCKET/CATALOG_KEY at query time (cached per container, see below).
@@ -193,19 +241,23 @@ _CATALOG_SOURCE = {
 #
 # A small HAND-AUTHORED table of the library's and college's front-door URLs (library home page,
 # campus map, bookstore, research guides, ILL, laptop record, ...). It exists because NO other
-# path produces these links: the KB only knows the ~16 scraped seed pages, database_catalog cites
+# path produces these links: the KB only knows the scraped seed pages, database_catalog cites
 # the A-Z page, and the Primo tools cite per-query search URLs. Without it the model could only
 # surface such a link by writing a URL from memory - the exact hallucination the system prompt's
 # <citations> rules forbid.
+#
+# The model gets the WHOLE table, every request, in its `system` payload, and no matching happens
+# here - which entry fits is the model's judgement, made from each row's `label` and `use_when`.
+# Those two fields are therefore load-bearing: they are the only steer on the choice.
 #
 # STATIC and bundled with the Lambda, like the database_catalog SEED: no scraper, no S3, no cache
 # TTL, nothing to refresh at runtime. Editing the JSON + redeploying is the whole update path.
 # The filename comes from config.yaml (library_links.data_file); the stack wires the SAME value
 # into both the Lambda asset bundle and this env var, so the two cannot drift.
 #
-# Boundary with the other tools: library_links = front-door campus/library POINTERS;
-# database_catalog = research databases; the Primo tools = live catalog/reserves; the KB =
-# scraped library page content.
+# Boundary with the tools: this table = front-door campus/library POINTERS; database_catalog =
+# research databases; the Primo tools = live catalog/reserves; the KB = scraped library page
+# content.
 LIBRARY_LINKS_FILE = os.environ.get("LIBRARY_LINKS_FILE", "library_links.json")
 _LIBRARY_LINKS_PATH = Path(__file__).resolve().parent / "data" / LIBRARY_LINKS_FILE
 _LIBRARY_LINKS = json.loads(_LIBRARY_LINKS_PATH.read_text(encoding="utf-8")).get("links", [])
@@ -376,7 +428,7 @@ def retrieve(query):
 
 
 def _tool_config():
-    """The Converse `toolConfig`: five tools the model routes between (toolChoice left at the
+    """The Converse `toolConfig`: four tools the model routes between (toolChoice left at the
     model's default `auto`, so it may also answer a greeting without any tool):
       - search_library_info: semantic search over the library website (hours, services, policies,
         how-to, borrowing, contact, general questions).
@@ -386,23 +438,31 @@ def _tool_config():
         records + availability for a title/author/work; EVIDENCE the model judges, not a verdict.
       - search_course_reserves: LIVE search of the Primo CourseReserves scope - textbooks/materials
         on reserve for a class, by course code or title; same EVIDENCE-not-verdict posture.
-      - library_links: the curated directory of canonical Gavilan URLs - the ONLY source of the
-        front-door links (campus map, bookstore, research guides, ILL, laptop, ...) no other tool
-        can produce.
-    The descriptions are deliberately differentiated so the model picks the right one."""
+    The descriptions are deliberately differentiated so the model picks the right one.
+
+    The curated URL directory is NOT here: it is a constant, so it is injected into the `system`
+    payload every request instead of being a tool the model has to remember to call. See
+    _links_block()."""
     return {
         "tools": [
             {
                 "toolSpec": {
                     "name": SEARCH_TOOL_NAME,
                     "description": (
-                        "Search the Gavilan College Library's website content for general library "
-                        "information: hours, locations, checkout and borrowing policies, laptops "
-                        "and equipment, textbooks and course reserves, services, contact info, and "
-                        "how-to/FAQ questions. Answer from the results it returns rather than from "
-                        "memory. You may call it more than once with different queries. Do NOT use "
-                        "this to check whether a specific named research database is available or "
-                        "to list databases by subject - use database_catalog for that."
+                        "Search the Gavilan College Library's own website content. CALL THIS "
+                        "BEFORE ANSWERING any question about the library or the campus, including "
+                        "ones you think you already know the answer to and ones you suspect are "
+                        "handled by another department - the content covers more than you expect, "
+                        "and answering without checking is how wrong answers happen. A first "
+                        "search is run for you automatically at the start of every conversation "
+                        "turn; call it again yourself whenever those results are thin, off-target, "
+                        "or do not cover part of what was asked. It covers hours, locations, "
+                        "checkout and borrowing policies, laptops and equipment, textbooks and "
+                        "course reserves, services, contact info, campus offices and buildings, "
+                        "the bookstore, and how-to/FAQ questions. Answer from the results it "
+                        "returns rather than from memory. Do NOT use this to check whether a "
+                        "specific named research database is available or to list databases by "
+                        "subject - use database_catalog for that."
                     ),
                     "inputSchema": {
                         "json": {
@@ -537,53 +597,6 @@ def _tool_config():
                     },
                 }
             },
-            {
-                "toolSpec": {
-                    "name": LINKS_TOOL_NAME,
-                    "description": (
-                        "Get the library's and the college's OFFICIAL web links, from a curated "
-                        "list of canonical Gavilan URLs. Use this ANY TIME your answer would send "
-                        "a student to a web page. The URLs it returns are real and verified - "
-                        "never write a Gavilan URL from memory, and never build one by guessing a "
-                        "path. If the link you want is not returned here and did not come from "
-                        "another tool's results, describe where to go in words instead of "
-                        "inventing a link. It covers: the library home page and OneSearch; the "
-                        "main Gavilan College website (for non-library college matters like "
-                        "admissions, registration, counseling, or financial aid); online textbook "
-                        "and e-book collections; subject research guides (LibGuides); the "
-                        "bookstore page for buying or renting course textbooks; the Gilroy campus "
-                        "map (static and interactive) for finding a building or office; campus "
-                        "public safety; Interlibrary Loan requests for items Gavilan does not own; "
-                        "and borrowing a library laptop. Call it with `topic` describing what you "
-                        "need a link for - e.g. 'campus map', 'bookstore', 'research guides', "
-                        "'interlibrary loan', 'laptop', 'online textbooks' - and it returns the "
-                        "matching entries with a label and a note on when each applies. `topic` is "
-                        "optional and a miss is safe: if nothing matches, or you omit it, you get "
-                        "the whole list to choose from, so calling this is never wasted. This tool "
-                        "is a LINK DIRECTORY only - it does not search page content (use "
-                        "search_library_info), research databases (use database_catalog), the "
-                        "book/media catalog (use search_book_catalog), or course reserves (use "
-                        "search_course_reserves) - but it pairs well with them when the answer "
-                        "needs a place to send the student next."
-                    ),
-                    "inputSchema": {
-                        "json": {
-                            "type": "object",
-                            "properties": {
-                                "topic": {
-                                    "type": "string",
-                                    "description": (
-                                        "What you need a link for, e.g. 'campus map', "
-                                        "'bookstore', 'interlibrary loan', 'laptop', 'research "
-                                        "guides', 'online textbooks'. Optional - omit it to list "
-                                        "every available link."
-                                    ),
-                                }
-                            },
-                        }
-                    },
-                }
-            },
         ]
     }
 
@@ -687,31 +700,7 @@ def _run_catalog_tool(tool_input):
     return _catalog_name_lookup(value), _CATALOG_SOURCE
 
 
-# --- library_links tool implementation -----------------------------------------------------
-
-
-def _phrase_in(phrase, text):
-    """Whole-phrase containment over already-normalized text. Both sides are padded with spaces
-    so a phrase only matches on word boundaries: 'library' hits 'library home page' but NOT
-    'interlibrary loan', and 'map' hits 'campus map' but not 'mapping'."""
-    if not phrase or not text:
-        return False
-    return f" {phrase} " in f" {text} "
-
-
-def _link_matches(topic_norm, entry):
-    """Whether a normalized topic names this link entry. Checked against the entry's key (with
-    underscores read as spaces), its label, and its hand-authored keywords, matching in EITHER
-    direction so both a broad topic ('map') and a wordy one ('where is the campus map') hit."""
-    phrases = [(entry.get("key") or "").replace("_", " "), entry.get("label") or ""]
-    phrases.extend(entry.get("keywords") or [])
-    for phrase in phrases:
-        cand = _norm(phrase)
-        if not cand:
-            continue
-        if _phrase_in(cand, topic_norm) or _phrase_in(topic_norm, cand):
-            return True
-    return False
+# --- Curated links: rendered into the Converse system payload ------------------------------
 
 
 def _link_entry(entry):
@@ -725,50 +714,41 @@ def _link_entry(entry):
     }
 
 
-def _run_links_tool(tool_input):
-    """Execute the library_links tool: look up canonical Gavilan URLs from the bundled table.
+def _links_block():
+    """The curated link table rendered for the Converse `system` payload.
 
-    INTERFACE (deliberately forgiving, since the table is ~10 entries and a wrong guess is cheap):
-    `topic` is OPTIONAL free text. A topic that matches one or more entries returns just those; NO
-    topic, or a topic that matches nothing, returns the WHOLE table with a note. A miss must never
-    leave the model empty-handed - that is precisely the state in which it would invent a URL.
+    WHY THIS IS CONTEXT AND NOT A TOOL. It used to be `library_links`, a tool taking no input and
+    returning every row on every call - a constant function. A constant behind a tool call is
+    context with extra steps plus a chance to forget, and the model took that chance: it would
+    answer "where is the financial aid office" from retrieved text, feel finished, and never
+    reach for the map. That is the measured Tool-Skip failure mode (models skip a required call
+    ~12-26% of the time even when they internally register that it is needed), and no amount of
+    tool-description work fixes it, because the description is only read once the model has
+    already decided to look something up. Preloading deletes the decision.
 
-    Returns (result_json, sources). A MATCHED lookup contributes one synthetic source per matched
-    link: unlike database_catalog (whose answer is data ABOUT a page) these entries ARE the
-    canonical pages, so each is a legitimate source. The whole-table listing is a browse aid rather
-    than an answer to a specific question, so it contributes NO source - keeping to the same rule
-    as the other tools that only a substantive lookup adds one, and keeping the response from
-    carrying the entire directory as citations."""
-    topic = ""
-    if isinstance(tool_input, dict):
-        raw = tool_input.get("topic")
-        topic = raw.strip() if isinstance(raw, str) else ""
+    Cost: the table is 10 rows (~820 tokens) against the ~363 the deleted toolSpec description
+    charged on every request anyway, so the real delta is ~460 tokens - and a link answer no
+    longer spends a whole extra Converse round trip fetching a constant.
 
-    matches = []
-    if topic:
-        topic_norm = _norm(topic)
-        matches = [e for e in _LIBRARY_LINKS if _link_matches(topic_norm, e)]
+    Contributes nothing to `sources`, exactly as the tool did not: the table says which links
+    EXIST, not which one an answer used, so citing from it would credit pages never mentioned.
+    Links reach the student inline in the answer text instead.
 
-    if matches:
-        links = [_link_entry(e) for e in matches]
-        sources = [
-            {"uri": link["url"], "excerpt": link["label"]} for link in links if link["url"]
-        ]
-        return {"topic": topic, "matched": True, "links": links}, sources
-
-    result = {
-        "topic": topic,
-        "matched": False,
-        "links": [_link_entry(e) for e in _LIBRARY_LINKS],
-        "note": (
-            "Nothing matched that topic, so every curated link is listed - pick one if it fits. "
-            "If none of these is the right page, describe where to go in words rather than "
-            "writing a URL that is not on this list."
-            if topic
-            else "All curated library and campus links."
-        ),
-    }
-    return result, []
+    Revisit if the table outgrows ~30 rows; at that size an always-on block stops being cheap and
+    a tool with real filtering earns its place back."""
+    rows = []
+    for entry in _LIBRARY_LINKS:
+        row = _link_entry(entry)
+        rows.append(f"- {row['label']}: {row['url']}\n  Use when: {row['use_when']}")
+    return (
+        "CANONICAL GAVILAN LINKS. These URLs are curated by the library, verified, and current. "
+        "Together with the source links a tool returns, they are the ONLY web addresses you may "
+        "put in a reply. Copy one exactly as written here; never shorten it, complete it, or "
+        "adjust its path. Pick the entry that fits from its label and its 'Use when' note - that "
+        "judgement is yours. If none of them fits and no tool result supplied a link, describe "
+        "where to go in plain words rather than inventing a URL. Do not list these unprompted or "
+        "attach one to an answer that did not need it.\n\n" + "\n".join(rows)
+    )
 
 
 # --- Primo book/media catalog tool implementation ------------------------------------------
@@ -1398,23 +1378,23 @@ def _log_guardrail_assessment(response):
 # --- Tool-call trace (opt-in debug payload only) -------------------------------------------
 #
 # `full_context` shows the KB passages and nothing else, so an answer built from the database
-# catalog, the curated links, or either Primo tool looked context-free to anything reading the
-# response - which made the eval's groundedness axis unwinnable for four of the five tools. The
+# catalog or either Primo tool looked context-free to anything reading the
+# response - which made the eval's groundedness axis unwinnable for three of the four tools. The
 # trace below closes that: every toolResult the model received, in order, plus which tool
 # produced it. Recorded from values run_agent already computed; it feeds nothing back into the
 # loop and never appears without the include_full_context flag.
 
-# The key each tool uses for its substantive payload, checked in order. `matched` comes first
-# because library_links returns the WHOLE table on a miss - a non-empty `links` list there means
-# "here is the directory", not "I found what you asked for".
-_RESULT_PAYLOAD_KEYS = ("matched", "passages", "results", "databases", "links")
+# The key each tool uses for its substantive payload, checked in order. (`links` was here for the
+# retired library_links tool; the directory is now a system block, which the trace carries
+# separately as `library_links` - see _handle_query.)
+_RESULT_PAYLOAD_KEYS = ("passages", "results", "databases")
 
 
 def _returned_results(result_json):
     """Whether a tool call actually found what it was asked for.
 
     An error (including a Primo soft-fail) is never a result. Otherwise the first payload key
-    present decides: passages found, candidate records found, databases matched, links matched.
+    present decides: passages found, candidate records found, databases matched, links returned.
     A result with none of those keys is a database_catalog NAME lookup, whose answer IS the
     held/not-held verdict - authoritative either way, so it counts as a result."""
     if not isinstance(result_json, dict) or "error" in result_json:
@@ -1438,9 +1418,109 @@ def _tool_call_record(name, tool_input, status, result_json):
     }
 
 
+# --- Priming retrieval: the KB is the floor of every turn, not a choice --------------------
+#
+# WHY THIS IS MECHANICAL AND NOT A PROMPT RULE. <tools> already says "you do need one before
+# giving any factual answer about the library. Do not answer library facts from memory." That
+# instruction was live for every observed failure: asked where the financial aid office is, the
+# model declined three times and - told outright to use its retrieve tool - argued that doing so
+# "would just return irrelevant library results", with the answer sitting in the KB the whole
+# time. An instruction that loses an argument with the user will not be fixed by rewording, so
+# the retrieval happens before the model gets a say.
+#
+# The result is injected as a synthetic search_library_info toolResult rather than a <context>
+# block: passages reach the model in the shape it already understands, and `sources`,
+# full_context and the eval trace keep working unchanged. search_library_info stays in the
+# toolConfig, so a weak priming query is recoverable - the model can search again with better
+# terms. Worst case it starts with mediocre context instead of none.
+_PRIMING_USER_TURNS = 3
+_PRIMING_QUERY_MAX_CHARS = 400
+
+
+def _priming_query(messages):
+    """Build the priming retrieval query from the last few USER turns, newest last.
+
+    Not just the newest turn: mid-conversation messages are often pronoun-y fragments ("just give
+    me what i would need to do") that retrieve noise on their own. Carrying the prior turns adds
+    back the subject the follow-up omits."""
+    texts = []
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        for block in msg.get("content") or []:
+            text = block.get("text") if isinstance(block, dict) else None
+            if text and text.strip():
+                texts.append(text.strip())
+        if len(texts) >= _PRIMING_USER_TURNS:
+            break
+    query = " ".join(reversed(texts[:_PRIMING_USER_TURNS]))
+    return query[:_PRIMING_QUERY_MAX_CHARS].strip()
+
+
+def _prime_loop(messages, tool_calls):
+    """Retrieve once up front and append the call to `messages` as if the model had made it.
+
+    Mutates `messages` (appends the assistant toolUse + user toolResult pair, preserving the
+    alternation Converse requires) and appends to `tool_calls` so the eval trace shows the
+    priming call like any other. Returns the retrieved chunks.
+
+    Soft-fails: a retrieval error must not take the request down, because the loop can still
+    answer from the other tools. On failure nothing is appended and the model proceeds as before.
+    """
+    query = _priming_query(messages)
+    if not query:
+        return []
+    try:
+        chunks, result_json = _run_search_tool({"query": query})
+    except Exception as exc:  # noqa: BLE001 - priming is best-effort, never fatal
+        print(
+            json.dumps(
+                {
+                    "event": "priming_retrieval_failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        )
+        return []
+
+    tool_use_id = "priming-retrieval"
+    messages.append(
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "toolUse": {
+                        "toolUseId": tool_use_id,
+                        "name": SEARCH_TOOL_NAME,
+                        "input": {"query": query},
+                    }
+                }
+            ],
+        }
+    )
+    messages.append(
+        {
+            "role": "user",
+            "content": [
+                {
+                    "toolResult": {
+                        "toolUseId": tool_use_id,
+                        "content": [{"json": result_json}],
+                        "status": "success",
+                    }
+                }
+            ],
+        }
+    )
+    tool_calls.append(
+        _tool_call_record(SEARCH_TOOL_NAME, {"query": query}, "success", result_json)
+    )
+    return chunks
+
+
 def run_agent(messages):
-    """Agentic Bedrock Converse tool-use loop over five tools (KB search, database catalog,
-    live Primo book/media catalog, live Primo course reserves, curated library links).
+    """Agentic Bedrock Converse tool-use loop over four tools (KB search, database catalog,
+    live Primo book/media catalog, live Primo course reserves).
 
     `messages` is the seed conversation in Converse shape (a list of {role, content} turns,
     starting with user and ending with the newest user turn - see _seed_messages), already
@@ -1458,8 +1538,8 @@ def run_agent(messages):
 
     Returns {"answer", "blocked", "chunks", "catalog_sources", "tool_calls"}: `chunks` are the KB
     passages from search_library_info (drive `sources` + eval full_context); `catalog_sources` are
-    the synthetic source entries the non-KB tools contributed (the A-Z databases page, the
-    per-query Primo search pages, and each canonical URL a matched library_links lookup returned);
+    the synthetic source entries the non-KB tools contributed (the A-Z databases page and the
+    per-query Primo search pages; the curated link block contributes none - see _links_block);
     `tool_calls` is the ordered observability trace of every tool the model invoked (see
     _tool_call_record). The trace is recorded from what the loop already computed - it never
     changes what is sent to the model."""
@@ -1470,10 +1550,13 @@ def run_agent(messages):
     tool_config = _tool_config()
     guardrail = _output_guardrail_config()
 
+    # Seed the loop with a retrieval the model did not have to decide to make (see _prime_loop).
+    collected_chunks.extend(_prime_loop(messages, tool_calls))
+
     for _ in range(MAX_AGENT_ITERATIONS):
         kwargs = {
             "modelId": GENERATION_MODEL_ID,
-            "system": [{"text": SYSTEM_PROMPT}],
+            "system": _system_blocks(),
             "messages": messages,
             "toolConfig": tool_config,
             # Short, direct, low-variance answers for a factual FAQ bot. The maxTokens/temperature
@@ -1551,15 +1634,6 @@ def run_agent(messages):
                 if source and source not in catalog_sources:
                     catalog_sources.append(source)
                 status = "error" if "error" in result_json else "success"
-            elif name == LINKS_TOOL_NAME:
-                result_json, link_sources = _run_links_tool(tool_use.get("input"))
-                # Each MATCHED link is itself a canonical page, so every one is a source (deduped;
-                # the whole-table listing returns none). Purely a local table read - it cannot fail,
-                # so there is no error status to report.
-                for link_source in link_sources:
-                    if link_source not in catalog_sources:
-                        catalog_sources.append(link_source)
-                status = "success"
             else:
                 # The model requested a tool we did not define; report an error result so it can
                 # recover rather than silently hanging.
@@ -1828,8 +1902,8 @@ def _handle_query(event):
         return _error_response(stage, exc)
 
     # Sources: KB passages from search_library_info (deduped by uri) PLUS any synthetic sources
-    # the non-KB tools contributed (the A-Z page, the Primo search pages, matched library_links
-    # URLs). On an OUTPUT guardrail block the answer is the blocked message, so attach no sources
+    # the non-KB tools contributed (the A-Z page and the Primo search pages; the curated link
+    # block contributes none). On an OUTPUT guardrail block the answer is the blocked message, so attach no sources
     # at all. full_context stays KB-only (what the model semantically retrieved), so the synthetic
     # sources never pollute eval data.
     chunks = result["chunks"]
@@ -1845,9 +1919,14 @@ def _handle_query(event):
     payload = {"answer": result["answer"], "sources": sources}
     if include_full_context:
         # Opt-in debug payload. `full_context` is the KB passages; `tool_calls` is every tool
-        # result the model saw, which is the only view that covers the four non-KB tools.
+        # result the model saw, which is the only view that covers the three non-KB tools.
         payload["full_context"] = _full_context(chunks)
         payload["tool_calls"] = result.get("tool_calls", [])
+        # The curated URLs are context, not a tool result, so they appear in NEITHER of the two
+        # fields above. Without this the eval's groundedness judge sees a URL in the answer with
+        # no supporting evidence anywhere in the payload and marks a correct, curated link as
+        # ungrounded - a silent scoring regression that would read as a quality drop.
+        payload["library_links"] = [_link_entry(e) for e in _LIBRARY_LINKS]
     return _response(200, payload)
 
 

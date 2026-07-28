@@ -77,7 +77,16 @@ providers:
               .map((t, i) => '[' + (i + 1) + '] TOOL ' + t.tool
                 + '\n    input: ' + JSON.stringify(t.input || {})
                 + '\n    returned: ' + JSON.stringify(t.result, null, 2).split('\n').map((l) => '      ' + l).join('\n').trim())
-              .join('\n\n'),
+              .join('\n\n')
+              // The curated URL table is CONTEXT, not a tool result - it is injected into the
+              // Converse system payload on every request, so it appears in no tool_calls entry.
+              // Appending it here is what keeps a correct, curated link from reading as
+              // ungrounded to the judge below.
+              + '\n\n[SYSTEM CONTEXT] CANONICAL GAVILAN LINKS (given to the bot on every request,'
+              + ' not fetched)\n'
+              + (json.library_links || [])
+                .map((l) => '      ' + l.label + ': ' + l.url)
+                .join('\n'),
             source_uris: (json.sources || []).map((s) => s.uri).join('\n'),
           },
         })
@@ -176,7 +185,7 @@ defaultTest:
         every one of those calls - exactly what the bot had in front of it when it wrote the
         answer. Nothing is withheld from you.
 
-        The bot has five tools, and all five report here:
+        The bot has four tools, and all four report here:
         - search_library_info: semantic search of the library website. Returns `passages`.
         - database_catalog: AUTHORITATIVE lookup of the research-database list. Returns
           `held: true/false` for a named database (a `held: false` verdict is a solid,
@@ -184,12 +193,17 @@ defaultTest:
         - search_book_catalog / search_course_reserves: LIVE searches of the library's Primo
           catalog. Returns `total` plus candidate `results` with availability. These are
           EVIDENCE, not a verdict: only `total: 0` authoritatively means "not held".
-        - library_links: a curated table of official Gavilan URLs. Any URL appearing in a
-          `library_links` result is a REAL, approved link - the bot did not construct it.
 
-        A tool result is support. A claim backed by ANY of the tool output above is grounded,
-        whichever tool produced it. Do not privilege the knowledge-base passages over the other
-        four; do not treat a catalog or links result as weaker evidence.
+        You are ALSO given a [SYSTEM CONTEXT] block listing the CANONICAL GAVILAN LINKS. That
+        curated table is handed to the bot on every single request - it is not something the bot
+        fetched, and there will never be a tool call for it. Any URL appearing in that block is a
+        REAL, library-approved link that the bot copied, NOT one it constructed. Treat it as
+        support exactly like a tool result.
+
+        A tool result is support. A claim backed by ANY of the tool output above, or by the
+        canonical link block, is grounded, whichever produced it. Do not privilege the
+        knowledge-base passages over the others; do not treat a catalog result or a curated link
+        as weaker evidence.
 
         THE SOURCE-LINK LIST IS NOT SOMETHING THE MODEL WROTE. The server builds it from the
         tools that actually ran and attaches it to the answer. A URL that appears there is real
@@ -250,9 +264,9 @@ defaultTest:
     # ALWAYS PASSES. It exists so which tools ran on a row is readable straight off the grid,
     # instead of decoding it from the answer text or digging through results.json. Tool routing
     # is the model's, driven only by the system prompt and the toolSpec descriptions, so
-    # "did it call the tool we expected?" is a first-class question here - `library_links` in
-    # particular is deliberately absent from the system prompt and routes off its description
-    # alone, and until this trace existed there was no way to tell whether it was ever called.
+    # "did it call the tool we expected?" is a first-class question here. Note the curated URL
+    # table will NEVER appear in this trace: it stopped being a tool and is now injected into the
+    # system payload every request, precisely because the model kept not calling it.
     - type: javascript
       metric: tools_called
       value: |

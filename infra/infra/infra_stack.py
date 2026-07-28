@@ -309,12 +309,31 @@ class GavilanChatbotStack(Stack):
 
         # The KB ingests source content from the S3 bucket above (vector-store-agnostic, unlike
         # the managed Web Crawler which was hard-coupled to OpenSearch Serverless - that swap is
-        # what unblocks moving to a cheaper vector store later). Chunking is the SAME FIXED_SIZE
-        # config the crawler used, still from config.yaml (unchanged): maxTokens 300, overlap 20.
+        # what unblocks moving to a cheaper vector store later). Chunking comes from config.yaml.
+        #
+        # THE NAME CARRIES THE CHUNKING CONFIG ON PURPOSE. Chunking is immutable in Bedrock, so
+        # any change to it makes CloudFormation REPLACE this resource - and CloudFormation
+        # replaces by creating the new resource before deleting the old one. With a fixed name
+        # that collides inside the knowledge base and the deploy dies mid-update:
+        #   "DataSource with name gavilan-library-kb-s3 already exists (409 AlreadyExists)"
+        # Folding the chunking settings into the name makes the replacement name unique, so a
+        # chunking change is a config.yaml edit plus `cdk deploy` instead of manual AWS surgery.
+        # dataDeletionPolicy is DELETE (the Bedrock default), so the old chunks leave the vector
+        # index with the old data source rather than lingering alongside the new ones.
+        #
+        # The replacement starts EMPTY: deleting the old data source drops its vectors, and the
+        # new one has ingested nothing. The source bucket is untouched, so re-ingestion just needs
+        # an ingestion job - see the post-deploy note in CLAUDE.md.
+        chunk_suffix = "-".join(
+            [
+                chunking_cfg["strategy"].lower().replace("_", ""),
+                f"{chunking_cfg['max_tokens']}t{chunking_cfg['overlap_percentage']}p",
+            ]
+        )
         s3_data_source = bedrock.CfnDataSource(
             self,
             "S3DataSource",
-            name=f"{kb_name}-s3",
+            name=f"{kb_name}-s3-{chunk_suffix}",
             knowledge_base_id=knowledge_base.attr_knowledge_base_id,
             data_source_configuration=bedrock.CfnDataSource.DataSourceConfigurationProperty(
                 type="S3",
@@ -378,11 +397,22 @@ class GavilanChatbotStack(Stack):
                 )
             ],
         )
-        # Upload markdown + metadata sidecars into the KB source bucket (objects only, one bucket).
+        # Upload markdown + metadata sidecars into the KB source bucket, and DELETE the ones the
+        # seed list no longer calls for. Without the delete the uploader could only ever add: a page
+        # removed from seed_urls kept its document in the bucket and stayed indexed forever, so
+        # de-seeding was a silent no-op. See lambda_function.prune_stale_objects.
         scraper_lambda_role.add_to_policy(
             iam.PolicyStatement(
-                actions=["s3:PutObject"],
+                actions=["s3:PutObject", "s3:DeleteObject"],
                 resources=[source_bucket.arn_for_objects("*")],
+            )
+        )
+        # ListBucket is granted on the BUCKET arn, not the object arn - the prune has to enumerate
+        # what is actually there before it can tell what is stale.
+        scraper_lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:ListBucket"],
+                resources=[source_bucket.bucket_arn],
             )
         )
         # Trigger ingestion of the fresh content on the specific KB (StartIngestionJob is scoped
@@ -464,6 +494,9 @@ class GavilanChatbotStack(Stack):
             log_group=scraper_log_group,
             environment={
                 "SEED_URLS": json.dumps(scraper_cfg["seed_urls"]),
+                # Seed URLs fetched for their side effects but kept OUT of the knowledge base
+                # (databases.php: regenerate_catalog needs its HTML, the KB does not need its text).
+                "KB_EXCLUDE_URLS": json.dumps(scraper_cfg.get("kb_exclude_urls", [])),
                 "SCRAPE_TIMEOUT_SECONDS": str(scraper_cfg.get("timeout_seconds", 20)),
                 "SCRAPER_USER_AGENT": scraper_cfg.get("user_agent", ""),
                 "SOURCE_BUCKET": source_bucket.bucket_name,
