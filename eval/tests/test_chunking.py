@@ -175,3 +175,75 @@ def test_build_strategies_uses_the_deployed_settings_for_the_baseline_arm():
 def test_estimate_tokens_never_returns_zero_for_nonempty_text():
     assert estimate_tokens("a") >= 1
     assert estimate_tokens("") >= 1
+
+
+# --- Retrieval probe --------------------------------------------------------------------------
+#
+# The probe's job is to say whether the right DOCUMENT ranks. Its one dangerous failure mode is
+# scoring questions the KB was never meant to answer, which is exactly what the first live run did
+# - it reported a 37% miss rate that was entirely an artifact of databases.php being deliberately
+# unindexed. These pin that it cannot happen silently again.
+
+from retrieval_probe import DEFAULT_TOOL_ANSWERED, expected_doc, matches, probe, recall_at
+
+
+class _FakeRuntime:
+    """Returns a fixed uri list per query, in rank order."""
+
+    def __init__(self, by_query):
+        self.by_query = by_query
+        self.calls = []
+
+    def retrieve(self, **kwargs):
+        query = kwargs["retrievalQuery"]["text"]
+        self.calls.append(query)
+        return {
+            "retrievalResults": [
+                {"metadata": {"source_url": u}} for u in self.by_query.get(query, [])
+            ]
+        }
+
+
+def test_expected_doc_normalises_a_dataset_source():
+    assert expected_doc("about-the-library.php") == "about-the-library"
+    assert expected_doc("main_map.php") == "main-map"
+    assert expected_doc(None) is None
+
+
+def test_matches_tolerates_the_scrapers_host_prefix_and_hash():
+    assert matches("about-the-library", "https://www.gavilan.edu/library/about-the-library.php")
+    assert not matches("about-the-library", "https://www.gavilan.edu/library/howdoi.php")
+
+
+def test_recall_at_counts_only_ranks_within_k():
+    assert recall_at([1, 2, 5, None], 3) == pytest.approx(0.5)
+    assert recall_at([1, 2, 5, None], 8) == pytest.approx(0.75)
+    assert recall_at([], 3) == 0.0
+
+
+def test_probe_scores_the_rank_of_the_expected_document():
+    runtime = _FakeRuntime({"q1": ["https://x/other.php", "https://x/hours.php"]})
+    pairs = [QAPair("q1", "a", source="hours.php")]
+    result = probe(runtime, "kb", pairs, top_k=8)
+    assert result["ranks"] == [2]
+    assert result["scored"] == 1
+
+
+def test_probe_excludes_tool_answered_rows_instead_of_failing_them():
+    # databases.php is answered by the authoritative database_catalog tool and is deliberately not
+    # indexed. Counting it as a retrieval miss invents a failure rate - the bug this test exists for.
+    runtime = _FakeRuntime({})
+    pairs = [
+        QAPair("do you have JSTOR?", "no", source="databases.php"),
+        QAPair("what are the hours?", "9-5", source="about-the-library.php"),
+    ]
+    result = probe(runtime, "kb", pairs, top_k=8)
+
+    assert result["tool_rows"] == 1
+    assert result["scored"] == 1  # only the KB-answerable row
+    assert "do you have JSTOR?" not in runtime.calls  # not even retrieved
+    assert result["misses"] == [] or result["misses"][0][0] != "do you have JSTOR?"
+
+
+def test_tool_answered_default_covers_the_unindexed_page():
+    assert "databases.php" in DEFAULT_TOOL_ANSWERED
