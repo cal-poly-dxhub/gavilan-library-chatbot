@@ -124,7 +124,16 @@ chunking:
   # v1 uses managed FIXED_SIZE chunking (architecture.md Phase 1). Phase 2 moves to
   # HIERARCHICAL. One of: FIXED_SIZE, HIERARCHICAL, SEMANTIC, NONE.
   strategy: FIXED_SIZE
-  max_tokens: 300
+  # 600, not 300. The offline chunking eval (eval/run_chunking_eval.py) measured 300-token
+  # boundaries cutting 26% of golden answers in half - the library's hours table and staff
+  # directory live on one page and a 300-token window splits them, which is why several answers
+  # cited the right page but gave contact details with no hours. At 600 evidence integrity is
+  # 100%. CAVEAT: that eval measures BOUNDARIES only, never ranking - a bigger chunk averages its
+  # embedding over more text and can retrieve less precisely. Re-run eval/retrieval_probe.py
+  # after any change here and compare against the 300-token baseline (recall@1 71%, @3 88%,
+  # @5 94%, @8 100%). CHANGING THIS IS DESTRUCTIVE: Bedrock chunking is immutable, so CDK
+  # replaces the data source and the whole corpus re-indexes.
+  max_tokens: 600
   overlap_percentage: 20
 
 # --- Query path (Lambda + HTTP API) ---

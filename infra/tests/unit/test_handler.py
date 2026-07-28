@@ -417,7 +417,6 @@ def test_tool_result_fed_back_to_model_with_passages_and_sources(monkeypatch):
         "database_catalog",
         "search_book_catalog",
         "search_course_reserves",
-        "library_links",
     }
     # The initial user message is the bare question (not a context-wrapped prompt).
     assert _user_text(bedrock) == "What are the library hours?"
@@ -1550,7 +1549,6 @@ def test_both_tools_advertised_with_differentiated_descriptions(monkeypatch):
         "database_catalog",
         "search_book_catalog",
         "search_course_reserves",
-        "library_links",
     }
     cat_schema = tools["database_catalog"]["inputSchema"]["json"]
     assert set(cat_schema["properties"]) == {"query_type", "value"}
@@ -2125,7 +2123,6 @@ def test_primo_tool_advertised_with_query_schema(monkeypatch):
         "database_catalog",
         "search_book_catalog",
         "search_course_reserves",
-        "library_links",
     }
     primo_schema = tools["search_book_catalog"]["inputSchema"]["json"]
     assert set(primo_schema["properties"]) == {"query"}
@@ -2426,7 +2423,6 @@ def test_reserves_tool_advertised_with_query_schema(monkeypatch):
         "database_catalog",
         "search_book_catalog",
         "search_course_reserves",
-        "library_links",
     }
     res_schema = tools["search_course_reserves"]["inputSchema"]["json"]
     assert set(res_schema["properties"]) == {"query"}
@@ -2467,39 +2463,26 @@ def test_agent_routes_reserve_query_to_reserves_tool_and_contributes_source(monk
     assert "CourseReserves" in body["sources"][-1]["uri"]
 
 
-# --- library_links: curated canonical Gavilan URLs -------------------------------------------
+# --- Curated links: injected as a system block, not a tool ------------------------------------
 #
 # A STATIC, bundled table (app/data/library_links.json) - no S3, no live call, nothing to stub.
-# The tool exists so the model cites real URLs instead of writing one from memory. It takes NO
-# input and returns the WHOLE table every call: picking the right entry is the model's job, so
-# there is no server-side matching to test. What these tests pin is that the full table comes
-# back in the shape the model needs, that stray input never breaks it, and that the tool
-# contributes NO response `sources` (it reports which links exist, not which one was used).
-
-
-LINKS_TOOL = "library_links"
-
-
-def links_tool_use_turn(tool_input=None, *, tool_use_id="tu-1"):
-    """A Converse response asking to call library_links. The real schema takes no properties, so
-    the default is an EMPTY input object; pass a dict to simulate a model sending stray args."""
-    tool_input = {} if tool_input is None else tool_input
-    return {
-        "output": {
-            "message": {
-                "role": "assistant",
-                "content": [
-                    {"toolUse": {"toolUseId": tool_use_id, "name": LINKS_TOOL, "input": tool_input}}
-                ],
-            }
-        },
-        "stopReason": "tool_use",
-    }
+# It used to be the `library_links` TOOL. That tool took no input and returned every row on every
+# call - a constant function - and the model kept not calling it: it would answer "where is the
+# financial aid office" from retrieved text, feel finished, and never fetch the map. Preloading
+# the table into the Converse `system` payload deletes the decision the model was getting wrong.
+# What these tests pin: the table still reaches the model in the shape it needs, the tool is
+# really gone from toolConfig, and the eval debug payload carries the table (without which a
+# correct curated link reads as ungrounded to the groundedness judge).
 
 
 def _link_by_key(key):
     (entry,) = [e for e in handler._LIBRARY_LINKS if e["key"] == key]
     return entry
+
+
+def _system_text(bedrock, call_index=0):
+    """All the system blocks of one Converse call, concatenated."""
+    return "\n".join(b["text"] for b in bedrock.converse_calls[call_index]["system"])
 
 
 # -- The bundled data file --
@@ -2540,86 +2523,116 @@ def test_library_link_urls_are_the_curated_ones():
     assert _link_by_key("interlibrary_loan")["url"] == "https://www.gavilan.edu/library/ill.php"
 
 
-# -- Lookup behavior (called directly; no loop) --
-
-
-def test_links_always_returns_the_whole_table_and_no_sources():
-    # The model does the choosing, so every call hands over every entry. No sources: the table
-    # says which links EXIST, not which one the answer used.
-    result, sources = handler._run_links_tool({})
-    assert len(result["links"]) == len(handler._LIBRARY_LINKS)
-    assert {link["key"] for link in result["links"]} == {
-        e["key"] for e in handler._LIBRARY_LINKS
-    }
-    assert sources == []
-
-
-def test_links_ignores_any_input_it_is_handed():
-    # There is no input schema, but a model may still pass something. Anything at all must yield
-    # the same full table rather than an error - an empty-handed model is one that invents a URL.
-    for tool_input in ({}, {"topic": "bookstore"}, {"topic": None}, None, "not a dict", 7):
-        result, sources = handler._run_links_tool(tool_input)
-        assert len(result["links"]) == len(handler._LIBRARY_LINKS), tool_input
-        assert sources == [], tool_input
-
-
-def test_links_result_carries_url_label_and_use_when_for_the_model():
-    # label + use_when are load-bearing: with no server-side matching they are the ONLY steer on
-    # which link the model picks.
-    result, _ = handler._run_links_tool({})
-    for link in result["links"]:
-        assert set(link) == {"key", "label", "url", "use_when"}
-        assert link["url"].startswith("https://"), link["key"]
-        assert link["label"].strip(), link["key"]
-        assert link["use_when"].strip(), link["key"]
-    by_key = {link["key"]: link for link in result["links"]}
-    assert by_key["bookstore_course_materials"]["url"] == (
-        "https://gavilan.bkstr.com/pages/courses-materials-results"
-    )
-
-
 def test_links_table_carries_no_keywords():
-    # Keywords existed only to feed the removed string matcher. They were >40% of the data file
-    # and every new link needed them hand-authored; nothing reads them now.
+    # Keywords existed only to feed a removed string matcher. They were >40% of the data file and
+    # every new link needed them hand-authored; nothing reads them now.
     for entry in handler._LIBRARY_LINKS:
         assert "keywords" not in entry, entry["key"]
 
 
-# -- library_links inside the agent loop --
+# -- The rendered block --
 
 
-def test_links_tool_advertised_with_no_input_schema(monkeypatch):
-    # The toolConfig carries FIVE tools; library_links now takes NO input - the model reads the
-    # whole table and chooses, so there is nothing to pass.
+def test_links_block_carries_every_url_label_and_use_when():
+    # label + use_when are load-bearing: with no server-side matching they are the ONLY steer on
+    # which link the model picks.
+    block = handler._links_block()
+    for entry in handler._LIBRARY_LINKS:
+        assert entry["url"] in block, entry["key"]
+        assert entry["label"] in block, entry["key"]
+        assert entry["use_when"] in block, entry["key"]
+
+
+def test_links_block_tells_the_model_to_copy_urls_exactly():
+    # The whole point of the table is that the model never hand-writes a Gavilan URL.
+    block = handler._links_block().lower()
+    assert "exactly" in block
+    assert "inventing" in block or "invent" in block
+
+
+def test_links_block_warns_against_unprompted_listing():
+    # Ten URLs permanently in context invites link salad; the block has to clamp that itself,
+    # because the model no longer has "decide to call the tool" as a natural gate.
+    assert "unprompted" in handler._links_block().lower()
+
+
+# -- Inside the loop --
+
+
+def test_toolconfig_has_four_tools_and_no_links_tool(monkeypatch):
+    # The retired tool must be really gone: a constant behind a tool call is context with extra
+    # steps plus a chance to forget, and forgetting is the bug this change exists to fix.
     agent = FakeAgentRuntime()
     bedrock = FakeBedrockRuntime(converse_script=[end_turn("hi")])
     _wire(monkeypatch, agent, bedrock)
 
     handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hi"})), None)
 
-    tools = {t["toolSpec"]["name"]: t["toolSpec"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]}
-    assert set(tools) == {
+    tools = {t["toolSpec"]["name"] for t in bedrock.converse_calls[0]["toolConfig"]["tools"]}
+    assert tools == {
         "search_library_info",
         "database_catalog",
         "search_book_catalog",
         "search_course_reserves",
-        "library_links",
     }
-    links_schema = tools["library_links"]["inputSchema"]["json"]
-    assert links_schema["properties"] == {}
-    assert "required" not in links_schema
+    assert "library_links" not in tools
 
 
-def test_agent_routes_link_question_to_links_tool_and_gets_the_whole_table(monkeypatch):
-    # The model asks for a link; KB retrieval never runs, and the toolResult hands it every
-    # curated URL to choose from.
+def test_links_reach_the_model_on_every_request_without_being_asked_for(monkeypatch):
+    # THE regression test for this change. The model calls nothing, yet the campus map URL is in
+    # front of it - no tool call to skip.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("hi")])
+    _wire(monkeypatch, agent, bedrock)
+
+    handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hi"})), None)
+
+    system = _system_text(bedrock)
+    assert "https://www.gavilan.edu/about/maps/main_map.php" in system
+    assert "https://www.gavilan.edu/about/maps/gilroy_interactive_map.php" in system
+
+
+def test_links_stay_in_system_and_never_become_a_tool_result(monkeypatch):
+    # They are context, not evidence. A curated URL appearing as a toolResult would mean the tool
+    # came back.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(
+        converse_script=[tool_use_turn(query="library hours"), end_turn("Here you go.")]
+    )
+    _wire(monkeypatch, agent, bedrock)
+
+    handler.lambda_handler(_payload_v2_event(json.dumps({"query": "where is the library?"})), None)
+
+    for call in bedrock.converse_calls:
+        for message in call["messages"]:
+            for block in message.get("content", []):
+                assert "library_links" not in json.dumps(block.get("toolResult", {}))
+
+
+def test_links_are_present_on_every_turn_of_a_multi_turn_loop(monkeypatch):
+    # The system payload is rebuilt per Converse call; the table must not fall out mid-loop.
     agent = FakeAgentRuntime()
     bedrock = FakeBedrockRuntime(
         converse_script=[
-            links_tool_use_turn(),
-            end_turn("Here's the campus map."),
+            tool_use_turn(query="library hours", tool_use_id="tu-1"),
+            catalog_tool_use_turn("name", "JSTOR", tool_use_id="tu-2"),
+            end_turn("Done."),
         ]
     )
+    _wire(monkeypatch, agent, bedrock)
+
+    handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours and JSTOR"})), None)
+
+    assert len(bedrock.converse_calls) >= 2
+    for i in range(len(bedrock.converse_calls)):
+        assert "https://gavilan.libguides.com/" in _system_text(bedrock, i)
+
+
+def test_links_contribute_no_sources(monkeypatch):
+    # Unchanged from the tool era: the table says which links EXIST, not which one the answer
+    # used, so citing from it would credit pages the model never mentioned.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("Here's the campus map.")])
     _wire(monkeypatch, agent, bedrock)
 
     resp = handler.lambda_handler(
@@ -2627,41 +2640,18 @@ def test_agent_routes_link_question_to_links_tool_and_gets_the_whole_table(monke
     )
 
     body = json.loads(resp["body"])
-    assert len(agent.calls) == 1  # only the priming retrieval; the model ran no KB search itself
-    (tr,) = _catalog_tool_results(bedrock)
-    assert tr["status"] == "success"
-    returned = tr["content"][0]["json"]["links"]
-    assert len(returned) == len(handler._LIBRARY_LINKS)
-    urls = {link["url"] for link in returned}
-    assert "https://www.gavilan.edu/about/maps/main_map.php" in urls
-    assert "https://www.gavilan.edu/about/maps/gilroy_interactive_map.php" in urls
-    # The tool reports which links exist, not which one the answer used, so it cites nothing.
     assert body["sources"] == _priming_sources(agent)
-
-
-def test_repeated_links_calls_still_contribute_no_sources(monkeypatch):
-    agent = FakeAgentRuntime()
-    bedrock = FakeBedrockRuntime(
-        converse_script=[
-            links_tool_use_turn(tool_use_id="tu-1"),
-            links_tool_use_turn(tool_use_id="tu-2"),
-            end_turn("Both maps."),
-        ]
-    )
-    _wire(monkeypatch, agent, bedrock)
-
-    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "map?"})), None)
-
-    assert json.loads(resp["body"])["sources"] == _priming_sources(agent)
+    assert "https://www.gavilan.edu/about/maps/main_map.php" not in [
+        s["uri"] for s in body["sources"]
+    ]
 
 
 def test_links_call_leaves_kb_sources_untouched(monkeypatch):
-    # Model uses BOTH tools. The KB passages still cite normally; library_links adds nothing.
+    # KB passages still cite normally; the curated table adds nothing to `sources`.
     agent = FakeAgentRuntime()  # default two KB chunks
     bedrock = FakeBedrockRuntime(
         converse_script=[
             tool_use_turn(query="library hours", tool_use_id="tu-1"),
-            links_tool_use_turn(tool_use_id="tu-2"),
             end_turn("Combined answer."),
         ]
     )
@@ -2676,37 +2666,16 @@ def test_links_call_leaves_kb_sources_untouched(monkeypatch):
     assert len(uris) == len(set(uris)) == 2
 
 
-def test_guardrail_block_drops_links_sources(monkeypatch):
-    # A guardrail block after a links lookup returns the block message with NO sources.
+def test_links_are_not_in_full_context(monkeypatch):
+    # full_context is the KB passages the model actually retrieved; a curated link is not one.
     agent = FakeAgentRuntime()
-    blocked = "I'm not able to provide a response to that."
-    bedrock = FakeBedrockRuntime(
-        converse_script=[
-            links_tool_use_turn(),
-            {
-                "output": {"message": {"role": "assistant", "content": [{"text": blocked}]}},
-                "stopReason": "guardrail_intervened",
-            },
-        ]
-    )
-    _wire(monkeypatch, agent, bedrock)
-
-    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "x"})), None)
-    body = json.loads(resp["body"])
-    assert body["answer"] == blocked
-    assert body["sources"] == []  # a block drops every source, priming included
-
-
-def test_links_sources_are_not_in_full_context(monkeypatch):
-    # full_context is the KB passages the model actually saw; a curated link is not one.
-    agent = FakeAgentRuntime()
-    bedrock = FakeBedrockRuntime(
-        converse_script=[links_tool_use_turn(), end_turn("Here's the laptop record.")]
-    )
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("Here's the laptop record.")])
     _wire(monkeypatch, agent, bedrock)
 
     resp = handler.lambda_handler(
-        _payload_v2_event(json.dumps({"query": "can I borrow a laptop?", "include_full_context": True})),
+        _payload_v2_event(
+            json.dumps({"query": "can I borrow a laptop?", "include_full_context": True})
+        ),
         None,
     )
 
@@ -2715,11 +2684,46 @@ def test_links_sources_are_not_in_full_context(monkeypatch):
     assert body["sources"] == _priming_sources(agent)
 
 
+def test_debug_payload_carries_the_link_table_for_the_groundedness_judge(monkeypatch):
+    # The links are neither a tool result nor a KB passage, so without this field the eval judge
+    # sees a URL in the answer with no supporting evidence anywhere and marks a correct, curated
+    # link ungrounded - a silent scoring regression that reads as a quality drop.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("Here's the map.")])
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "where is financial aid?", "include_full_context": True})),
+        None,
+    )
+
+    body = json.loads(resp["body"])
+    assert len(body["library_links"]) == len(handler._LIBRARY_LINKS)
+    for link in body["library_links"]:
+        assert set(link) == {"key", "label", "url", "use_when"}
+    assert "https://www.gavilan.edu/about/maps/main_map.php" in {
+        link["url"] for link in body["library_links"]
+    }
+
+
+def test_widget_path_never_sees_the_link_table(monkeypatch):
+    # No flag means exactly {answer, sources}. The debug field must not leak into the widget shape.
+    agent = FakeAgentRuntime()
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("Here's the map.")])
+    _wire(monkeypatch, agent, bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "where is financial aid?"})), None
+    )
+
+    assert set(json.loads(resp["body"])) == {"answer", "sources"}
+
+
 # --- Phase 5: tool_calls trace (opt-in debug payload) ---------------------------
 #
 # The eval's groundedness judge only ever saw `full_context`, which is populated from
-# search_library_info alone. An answer built from database_catalog, library_links, or either
-# Primo tool therefore looked context-free, and could not be graded. `tool_calls` closes that:
+# search_library_info alone. An answer built from database_catalog or either Primo tool
+# therefore looked context-free, and could not be graded. `tool_calls` closes that:
 # every toolResult the model received, in order. It is debug-only - the widget path (no flag)
 # must stay byte-identical, which is what the first two tests here pin down.
 
@@ -2747,14 +2751,13 @@ def _sent_tool_result_jsons(bedrock):
     return seen
 
 
-def _all_five_tools_script():
+def _all_four_tools_script():
     """One converse script in which the model calls every tool once, then answers."""
     return [
         tool_use_turn(query="library hours", tool_use_id="tu-1"),
         catalog_tool_use_turn("name", "JSTOR", tool_use_id="tu-2"),
-        links_tool_use_turn(tool_use_id="tu-3"),
-        primo_tool_use_turn("the great gatsby", tool_use_id="tu-4"),
-        reserves_tool_use_turn("PSYC C1000", tool_use_id="tu-5"),
+        primo_tool_use_turn("the great gatsby", tool_use_id="tu-3"),
+        reserves_tool_use_turn("PSYC C1000", tool_use_id="tu-4"),
         end_turn("Here is everything."),
     ]
 
@@ -2763,7 +2766,7 @@ def test_widget_path_unchanged_even_when_every_tool_ran(monkeypatch):
     # THE regression that matters: with no flag, the response is exactly {answer, sources} - no
     # tool_calls, no full_context - however many tools the loop ran.
     _wire_primo(monkeypatch, _primo_search_payload([_primo_doc("The Great Gatsby", rid="alma1")]))
-    bedrock = FakeBedrockRuntime(converse_script=_all_five_tools_script())
+    bedrock = FakeBedrockRuntime(converse_script=_all_four_tools_script())
     _wire(monkeypatch, FakeAgentRuntime(), bedrock)
 
     resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "everything"})), None)
@@ -2793,7 +2796,7 @@ def test_tool_calls_traces_every_tool_in_invocation_order(monkeypatch):
         _primo_search_payload([_primo_doc("The Great Gatsby", rid="alma1")]),
         {"alma1": _delivery_available()},
     )
-    bedrock = FakeBedrockRuntime(converse_script=_all_five_tools_script())
+    bedrock = FakeBedrockRuntime(converse_script=_all_four_tools_script())
     _wire(monkeypatch, FakeAgentRuntime(), bedrock)
 
     resp = handler.lambda_handler(
@@ -2804,16 +2807,14 @@ def test_tool_calls_traces_every_tool_in_invocation_order(monkeypatch):
     assert _tool_call_names(body) == [
         "search_library_info",
         "database_catalog",
-        "library_links",
         "search_book_catalog",
         "search_course_reserves",
     ]
     # The model's own input for each call is recorded verbatim, which is how the eval answers
-    # "was library_links ever called?" (it takes no input, so its recorded input is empty).
+    # "which query did it actually run?".
     assert [c["input"] for c in _model_tool_calls(body)] == [
         {"query": "library hours"},
         {"query_type": "name", "value": "JSTOR"},
-        {},
         {"query": "the great gatsby"},
         {"query": "PSYC C1000"},
     ]
@@ -2823,7 +2824,7 @@ def test_tool_calls_traces_every_tool_in_invocation_order(monkeypatch):
 def test_tool_calls_results_are_exactly_what_was_sent_to_the_model(monkeypatch):
     # "In the form the model received them as toolResult content" - not a re-rendering.
     _wire_primo(monkeypatch, _primo_search_payload([_primo_doc("The Great Gatsby", rid="alma1")]))
-    bedrock = FakeBedrockRuntime(converse_script=_all_five_tools_script())
+    bedrock = FakeBedrockRuntime(converse_script=_all_four_tools_script())
     _wire(monkeypatch, FakeAgentRuntime(), bedrock)
 
     resp = handler.lambda_handler(
@@ -2859,30 +2860,6 @@ def test_tool_calls_exposes_the_catalog_result_full_context_cannot_show(monkeypa
     assert call["returned_results"] is True
     assert call["result"]["held"] is True
     assert call["result"]["name"] == "Opposing Viewpoints In Context"
-
-
-def test_tool_calls_exposes_the_full_library_links_table(monkeypatch):
-    bedrock = FakeBedrockRuntime(
-        converse_script=[links_tool_use_turn(), end_turn("Here is the map.")]
-    )
-    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
-
-    resp = handler.lambda_handler(
-        _payload_v2_event(json.dumps({"query": "campus map?", "include_full_context": True})), None
-    )
-    body = json.loads(resp["body"])
-
-    assert [p["text"] for p in body["full_context"]] == _PRIMING_PASSAGE_TEXTS
-    (call,) = _model_tool_calls(body)
-    assert call["tool"] == "library_links"
-    assert call["input"] == {}  # the tool takes no input
-    assert call["returned_results"] is True
-    # The full curated table the model was handed, keys and URLs intact - the eval can see
-    # exactly which links it had to choose from rather than inferring them from the answer text.
-    assert [link["key"] for link in call["result"]["links"]] == [
-        e["key"] for e in handler._LIBRARY_LINKS
-    ]
-    assert all(link["url"] for link in call["result"]["links"])
 
 
 def test_tool_calls_exposes_primo_records_with_availability(monkeypatch):
@@ -3047,12 +3024,11 @@ def test_returned_results_is_false_for_an_error_result():
     assert handler._returned_results({"error": "catalog_unavailable"}) is False
 
 
-def test_returned_results_counts_a_links_call_as_a_result():
-    # There is no longer a miss case: the tool always hands back the whole table, which IS what
-    # the model asked for, so a non-empty `links` list is a genuine result.
-    result, _ = handler._run_links_tool({})
-    assert result["links"]
-    assert handler._returned_results(result) is True
+def test_returned_results_no_longer_tracks_a_links_key():
+    # `links` was a payload key back when library_links was a tool. The directory is a system
+    # block now, so nothing in the trace carries that key and it must not linger as a rule that
+    # would quietly change how some future tool's payload is scored.
+    assert "links" not in handler._RESULT_PAYLOAD_KEYS
 
 
 def test_returned_results_counts_a_not_held_verdict_as_a_result():
