@@ -49,6 +49,7 @@ Wiring comes from env vars set by the CDK stack.
 """
 
 import base64
+import datetime
 import json
 import os
 import ssl
@@ -161,6 +162,48 @@ _WARM_QUERY = "library hours"
 # the from_asset(app/) bundle, next to this file. Read once at cold start.
 _PROMPT_PATH = Path(__file__).resolve().parent / "system_prompt.md"
 SYSTEM_PROMPT = _PROMPT_PATH.read_text(encoding="utf-8").strip()
+
+# The model is not told the date by anything else, and the library's hours are published as
+# SEMESTER BLOCKS ("Spring Semester 2026 (January 26 - May 22)"). Without today's date it cannot
+# tell which block is current, so "what are your hours?" gets all three semesters dumped on it -
+# the honest answer for a model that does not know the day. The finaid and bookstore pages are
+# scoped the same way ("Summer Hours: July 6 - August 1, 2026"), so this is not hours-only.
+#
+# PACIFIC, not the Lambda's UTC: after 5pm Pacific, UTC is already tomorrow, which would flip a
+# Friday answer to Saturday's "closed". zoneinfo reads the OS tzdata (present on Amazon Linux
+# 2023); if that lookup ever fails, fall back to a fixed -08:00 rather than silently serving UTC.
+_LIBRARY_TZ = "America/Los_Angeles"
+
+
+def _today_pacific():
+    """Today's date at the library, as YYYY-MM-DD plus the weekday. Never raises."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        now = datetime.datetime.now(ZoneInfo(_LIBRARY_TZ))
+    except Exception:  # noqa: BLE001 - missing tzdata must not take the request down
+        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-8)))
+    return now.strftime("%A, %Y-%m-%d")
+
+
+def _system_blocks():
+    """The Converse `system` payload: the packaged prompt plus today's date.
+
+    Two blocks rather than one interpolated string so the prompt itself stays a static asset -
+    the date is the only per-request part, and keeping it separate makes that obvious in a trace.
+    """
+    return [
+        {"text": SYSTEM_PROMPT},
+        {
+            "text": (
+                f"Today's date is {_today_pacific()} (Pacific, the library's local time). "
+                "Use it to decide which semester, term, or seasonal hours block currently "
+                "applies, and give the person the one that is in effect now rather than "
+                "listing every block you retrieved. If a date range makes the current block "
+                "ambiguous, say which one you used."
+            )
+        },
+    ]
 
 # Database catalog (Phase 2b: self-updating).
 #   - The HELD list is regenerated weekly by the scraper and written to S3; this Lambda reads the
@@ -400,13 +443,20 @@ def _tool_config():
                 "toolSpec": {
                     "name": SEARCH_TOOL_NAME,
                     "description": (
-                        "Search the Gavilan College Library's website content for general library "
-                        "information: hours, locations, checkout and borrowing policies, laptops "
-                        "and equipment, textbooks and course reserves, services, contact info, and "
-                        "how-to/FAQ questions. Answer from the results it returns rather than from "
-                        "memory. You may call it more than once with different queries. Do NOT use "
-                        "this to check whether a specific named research database is available or "
-                        "to list databases by subject - use database_catalog for that."
+                        "Search the Gavilan College Library's own website content. CALL THIS "
+                        "BEFORE ANSWERING any question about the library or the campus, including "
+                        "ones you think you already know the answer to and ones you suspect are "
+                        "handled by another department - the content covers more than you expect, "
+                        "and answering without checking is how wrong answers happen. A first "
+                        "search is run for you automatically at the start of every conversation "
+                        "turn; call it again yourself whenever those results are thin, off-target, "
+                        "or do not cover part of what was asked. It covers hours, locations, "
+                        "checkout and borrowing policies, laptops and equipment, textbooks and "
+                        "course reserves, services, contact info, campus offices and buildings, "
+                        "the bookstore, and how-to/FAQ questions. Answer from the results it "
+                        "returns rather than from memory. Do NOT use this to check whether a "
+                        "specific named research database is available or to list databases by "
+                        "subject - use database_catalog for that."
                     ),
                     "inputSchema": {
                         "json": {
@@ -1370,6 +1420,106 @@ def _tool_call_record(name, tool_input, status, result_json):
     }
 
 
+# --- Priming retrieval: the KB is the floor of every turn, not a choice --------------------
+#
+# WHY THIS IS MECHANICAL AND NOT A PROMPT RULE. <tools> already says "you do need one before
+# giving any factual answer about the library. Do not answer library facts from memory." That
+# instruction was live for every observed failure: asked where the financial aid office is, the
+# model declined three times and - told outright to use its retrieve tool - argued that doing so
+# "would just return irrelevant library results", with the answer sitting in the KB the whole
+# time. An instruction that loses an argument with the user will not be fixed by rewording, so
+# the retrieval happens before the model gets a say.
+#
+# The result is injected as a synthetic search_library_info toolResult rather than a <context>
+# block: passages reach the model in the shape it already understands, and `sources`,
+# full_context and the eval trace keep working unchanged. search_library_info stays in the
+# toolConfig, so a weak priming query is recoverable - the model can search again with better
+# terms. Worst case it starts with mediocre context instead of none.
+_PRIMING_USER_TURNS = 3
+_PRIMING_QUERY_MAX_CHARS = 400
+
+
+def _priming_query(messages):
+    """Build the priming retrieval query from the last few USER turns, newest last.
+
+    Not just the newest turn: mid-conversation messages are often pronoun-y fragments ("just give
+    me what i would need to do") that retrieve noise on their own. Carrying the prior turns adds
+    back the subject the follow-up omits."""
+    texts = []
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        for block in msg.get("content") or []:
+            text = block.get("text") if isinstance(block, dict) else None
+            if text and text.strip():
+                texts.append(text.strip())
+        if len(texts) >= _PRIMING_USER_TURNS:
+            break
+    query = " ".join(reversed(texts[:_PRIMING_USER_TURNS]))
+    return query[:_PRIMING_QUERY_MAX_CHARS].strip()
+
+
+def _prime_loop(messages, tool_calls):
+    """Retrieve once up front and append the call to `messages` as if the model had made it.
+
+    Mutates `messages` (appends the assistant toolUse + user toolResult pair, preserving the
+    alternation Converse requires) and appends to `tool_calls` so the eval trace shows the
+    priming call like any other. Returns the retrieved chunks.
+
+    Soft-fails: a retrieval error must not take the request down, because the loop can still
+    answer from the other tools. On failure nothing is appended and the model proceeds as before.
+    """
+    query = _priming_query(messages)
+    if not query:
+        return []
+    try:
+        chunks, result_json = _run_search_tool({"query": query})
+    except Exception as exc:  # noqa: BLE001 - priming is best-effort, never fatal
+        print(
+            json.dumps(
+                {
+                    "event": "priming_retrieval_failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        )
+        return []
+
+    tool_use_id = "priming-retrieval"
+    messages.append(
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "toolUse": {
+                        "toolUseId": tool_use_id,
+                        "name": SEARCH_TOOL_NAME,
+                        "input": {"query": query},
+                    }
+                }
+            ],
+        }
+    )
+    messages.append(
+        {
+            "role": "user",
+            "content": [
+                {
+                    "toolResult": {
+                        "toolUseId": tool_use_id,
+                        "content": [{"json": result_json}],
+                        "status": "success",
+                    }
+                }
+            ],
+        }
+    )
+    tool_calls.append(
+        _tool_call_record(SEARCH_TOOL_NAME, {"query": query}, "success", result_json)
+    )
+    return chunks
+
+
 def run_agent(messages):
     """Agentic Bedrock Converse tool-use loop over five tools (KB search, database catalog,
     live Primo book/media catalog, live Primo course reserves, curated library links).
@@ -1402,10 +1552,13 @@ def run_agent(messages):
     tool_config = _tool_config()
     guardrail = _output_guardrail_config()
 
+    # Seed the loop with a retrieval the model did not have to decide to make (see _prime_loop).
+    collected_chunks.extend(_prime_loop(messages, tool_calls))
+
     for _ in range(MAX_AGENT_ITERATIONS):
         kwargs = {
             "modelId": GENERATION_MODEL_ID,
-            "system": [{"text": SYSTEM_PROMPT}],
+            "system": _system_blocks(),
             "messages": messages,
             "toolConfig": tool_config,
             # Short, direct, low-variance answers for a factual FAQ bot. The maxTokens/temperature

@@ -145,7 +145,13 @@ request:
 
 retrieval:
   # Number of KB chunks to retrieve per query and feed to generation.
-  number_of_results: 5
+  #
+  # Raised 5 -> 8 after a live round where the answer to "how do I get help with research?" was
+  # missing the reference desk's phone/email/chat entirely: that block exists in libraryservices.php
+  # and simply lost a slot race, while two of the five slots went to near-miss noise (an A-Z link
+  # fragment from sites.php and a faculty-facing page). The block was retrievable, just ranked out.
+  # Cheapest lever available - config only, no re-ingest, and it costs a few hundred tokens a turn.
+  number_of_results: 8
 
 generation:
   # Bedrock-hosted Claude model for answer generation, invoked via a CROSS-REGION INFERENCE
