@@ -162,6 +162,24 @@ def test_s3_data_source_points_at_source_bucket_with_crawler_chunking():
     )
 
 
+def test_data_source_name_carries_the_chunking_config():
+    # Chunking is IMMUTABLE in Bedrock, so changing it makes CloudFormation replace the data
+    # source - and CloudFormation creates the replacement BEFORE deleting the original. A fixed
+    # name collides inside the knowledge base and kills the deploy mid-update with
+    # "DataSource with name ... already exists (409 AlreadyExists)", which is exactly what
+    # happened on the 300 -> 600 token change. The name has to move when the chunking moves.
+    template = _template()
+    (source,) = template.find_resources("AWS::Bedrock::DataSource").values()
+    name = source["Properties"]["Name"]
+    chunking = CONFIG["chunking"]
+
+    assert str(chunking["max_tokens"]) in name, name
+    assert str(chunking["overlap_percentage"]) in name, name
+    assert chunking["strategy"].lower().replace("_", "") in name, name
+    # Bedrock's own constraint on the field: alphanumerics separated by single _ or -.
+    assert re.fullmatch(r"([0-9a-zA-Z][_-]?){1,100}", name), name
+
+
 def test_data_source_created_after_knowledge_base():
     template = _template()
     sources = template.find_resources("AWS::Bedrock::DataSource")

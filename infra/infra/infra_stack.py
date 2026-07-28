@@ -309,12 +309,31 @@ class GavilanChatbotStack(Stack):
 
         # The KB ingests source content from the S3 bucket above (vector-store-agnostic, unlike
         # the managed Web Crawler which was hard-coupled to OpenSearch Serverless - that swap is
-        # what unblocks moving to a cheaper vector store later). Chunking is the SAME FIXED_SIZE
-        # config the crawler used, still from config.yaml (unchanged): maxTokens 300, overlap 20.
+        # what unblocks moving to a cheaper vector store later). Chunking comes from config.yaml.
+        #
+        # THE NAME CARRIES THE CHUNKING CONFIG ON PURPOSE. Chunking is immutable in Bedrock, so
+        # any change to it makes CloudFormation REPLACE this resource - and CloudFormation
+        # replaces by creating the new resource before deleting the old one. With a fixed name
+        # that collides inside the knowledge base and the deploy dies mid-update:
+        #   "DataSource with name gavilan-library-kb-s3 already exists (409 AlreadyExists)"
+        # Folding the chunking settings into the name makes the replacement name unique, so a
+        # chunking change is a config.yaml edit plus `cdk deploy` instead of manual AWS surgery.
+        # dataDeletionPolicy is DELETE (the Bedrock default), so the old chunks leave the vector
+        # index with the old data source rather than lingering alongside the new ones.
+        #
+        # The replacement starts EMPTY: deleting the old data source drops its vectors, and the
+        # new one has ingested nothing. The source bucket is untouched, so re-ingestion just needs
+        # an ingestion job - see the post-deploy note in CLAUDE.md.
+        chunk_suffix = "-".join(
+            [
+                chunking_cfg["strategy"].lower().replace("_", ""),
+                f"{chunking_cfg['max_tokens']}t{chunking_cfg['overlap_percentage']}p",
+            ]
+        )
         s3_data_source = bedrock.CfnDataSource(
             self,
             "S3DataSource",
-            name=f"{kb_name}-s3",
+            name=f"{kb_name}-s3-{chunk_suffix}",
             knowledge_base_id=knowledge_base.attr_knowledge_base_id,
             data_source_configuration=bedrock.CfnDataSource.DataSourceConfigurationProperty(
                 type="S3",

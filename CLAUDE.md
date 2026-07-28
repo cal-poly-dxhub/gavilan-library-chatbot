@@ -36,6 +36,21 @@ Then (from `infra/`, venv active):
 
 Pinned: `aws-cdk-lib==2.260.0`, CDK CLI `2.1129.0`.
 
+### Changing `chunking` in config.yaml
+
+Bedrock chunking is immutable, so this is a data-source REPLACEMENT, not an update. Two things follow:
+
+1. The data source name folds in the chunking settings (`gavilan-library-kb-s3-fixedsize-600t20p`). CloudFormation creates a replacement before deleting the original, so a fixed name collides inside the KB and the deploy dies with `409 AlreadyExists`. Do not "simplify" that name back to a constant.
+2. **The replacement starts EMPTY and `cdk deploy` does not refill it.** The scraper's deploy Trigger only re-fires when the scraper's own code changes, so a chunking-only deploy leaves a knowledge base with zero indexed documents - `/query` will answer everything with "I don't have that information". Kick ingestion by hand right after the deploy:
+
+```
+AWS_PROFILE=gavilan aws bedrock-agent list-data-sources --knowledge-base-id GLBDBZXOFU --region us-west-2
+AWS_PROFILE=gavilan aws bedrock-agent start-ingestion-job \
+  --knowledge-base-id GLBDBZXOFU --data-source-id <NEW_ID> --region us-west-2
+```
+
+The source bucket is untouched by the replacement, so ingestion just re-indexes what is already there. Then re-run `eval/retrieval_probe.py` - the offline chunking eval measures boundaries, never ranking, so live recall is the only check that a bigger chunk did not retrieve worse.
+
 Handler unit tests stub `boto3` in `sys.modules` and monkeypatch the client getters, so they need no boto3 install and no live AWS.
 
 ### CI
