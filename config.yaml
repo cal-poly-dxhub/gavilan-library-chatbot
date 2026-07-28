@@ -75,8 +75,17 @@ scraper:
     - https://www.gavilan.edu/library/facultyservices.php
     - https://www.gavilan.edu/library/otherlibraries.php
     - https://www.gavilan.edu/library/orientationrequest.php
+    # KEEP. Not for the KB - the scraper parses THIS page's HTML to regenerate the held
+    # database_catalog (lambda_function.regenerate_catalog looks for "databases.php" in the scrape
+    # results). Drop it from this list and the catalog silently freezes at its last-good copy.
     - https://www.gavilan.edu/library/databases.php
-    - https://www.gavilan.edu/library/sites.php
+    # REMOVED: sites.php ("Selected Websites by Subject"). 13,209 chars - the single largest noise
+    # source in the corpus. It is 133 alphabetical entries of EXTERNAL website names, and the
+    # extractor strips their URLs, so the bot could name a site but never link to it while
+    # <citations> forbids writing the URL from memory. In a live 11-question round it surfaced in
+    # 8 answers and contributed to none: subject words match nearly every query. Nothing is lost -
+    # researchassistance.php still describes the service, and the questions it would serve are
+    # research questions, which are out of scope by design.
     # Laptop and equipment support. The ONLY source for the program lending list (EOPS,
     # Non-Credit, CTE, El Centro, AEC), the semester renewal-by-emailed-form flow, and the
     # "laptop tech support goes to circulation, not IT" routing. Note it contradicts
