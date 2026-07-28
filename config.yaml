@@ -77,6 +77,21 @@ scraper:
     - https://www.gavilan.edu/library/orientationrequest.php
     - https://www.gavilan.edu/library/databases.php
     - https://www.gavilan.edu/library/sites.php
+    # Laptop and equipment support. The ONLY source for the program lending list (EOPS,
+    # Non-Credit, CTE, El Centro, AEC), the semester renewal-by-emailed-form flow, and the
+    # "laptop tech support goes to circulation, not IT" routing. Note it contradicts
+    # howdoi.php ("Reserves and semester laptops cannot be renewed") - staff are resolving.
+    - https://www.gavilan.edu/library/laptopsupport.php
+    # --- College pages, not library pages ---
+    # Every seed above is under /library/. These three answer questions the bot is actually
+    # asked but the library site cannot cover: where a campus office is, and which books a
+    # course requires. They widen scope past library operations, which is deliberate.
+    #   main_map      - Office Guide (Financial Aid Office -> SC) + Building Guide legend
+    #   finaid        - Financial Aid office hours
+    #   bookstore     - the bookstore as the per-course materials source, plus its hours
+    - https://www.gavilan.edu/about/maps/main_map.php
+    - https://www.gavilan.edu/finaid/index.php
+    - https://www.gavilan.edu/student/bookstore/index.php
   output_dir: ./scraper_output
   timeout_seconds: 20
   user_agent: "GavilanLibraryScraper/1.0 (+https://www.gavilan.edu/library/)"
