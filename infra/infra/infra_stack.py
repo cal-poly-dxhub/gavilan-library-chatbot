@@ -378,11 +378,22 @@ class GavilanChatbotStack(Stack):
                 )
             ],
         )
-        # Upload markdown + metadata sidecars into the KB source bucket (objects only, one bucket).
+        # Upload markdown + metadata sidecars into the KB source bucket, and DELETE the ones the
+        # seed list no longer calls for. Without the delete the uploader could only ever add: a page
+        # removed from seed_urls kept its document in the bucket and stayed indexed forever, so
+        # de-seeding was a silent no-op. See lambda_function.prune_stale_objects.
         scraper_lambda_role.add_to_policy(
             iam.PolicyStatement(
-                actions=["s3:PutObject"],
+                actions=["s3:PutObject", "s3:DeleteObject"],
                 resources=[source_bucket.arn_for_objects("*")],
+            )
+        )
+        # ListBucket is granted on the BUCKET arn, not the object arn - the prune has to enumerate
+        # what is actually there before it can tell what is stale.
+        scraper_lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:ListBucket"],
+                resources=[source_bucket.bucket_arn],
             )
         )
         # Trigger ingestion of the fresh content on the specific KB (StartIngestionJob is scoped
@@ -464,6 +475,9 @@ class GavilanChatbotStack(Stack):
             log_group=scraper_log_group,
             environment={
                 "SEED_URLS": json.dumps(scraper_cfg["seed_urls"]),
+                # Seed URLs fetched for their side effects but kept OUT of the knowledge base
+                # (databases.php: regenerate_catalog needs its HTML, the KB does not need its text).
+                "KB_EXCLUDE_URLS": json.dumps(scraper_cfg.get("kb_exclude_urls", [])),
                 "SCRAPE_TIMEOUT_SECONDS": str(scraper_cfg.get("timeout_seconds", 20)),
                 "SCRAPER_USER_AGENT": scraper_cfg.get("user_agent", ""),
                 "SOURCE_BUCKET": source_bucket.bucket_name,

@@ -75,9 +75,10 @@ scraper:
     - https://www.gavilan.edu/library/facultyservices.php
     - https://www.gavilan.edu/library/otherlibraries.php
     - https://www.gavilan.edu/library/orientationrequest.php
-    # KEEP. Not for the KB - the scraper parses THIS page's HTML to regenerate the held
-    # database_catalog (lambda_function.regenerate_catalog looks for "databases.php" in the scrape
-    # results). Drop it from this list and the catalog silently freezes at its last-good copy.
+    # Stays in the SEED list but is excluded from the KB below: the scraper parses this page's
+    # HTML to regenerate the held database_catalog (lambda_function.regenerate_catalog looks for
+    # "databases.php" in the scrape results), so dropping it here would silently freeze the
+    # catalog at its last-good copy.
     - https://www.gavilan.edu/library/databases.php
     # REMOVED: sites.php ("Selected Websites by Subject"). 13,209 chars - the single largest noise
     # source in the corpus. It is 133 alphabetical entries of EXTERNAL website names, and the
@@ -101,6 +102,16 @@ scraper:
     - https://www.gavilan.edu/about/maps/main_map.php
     - https://www.gavilan.edu/finaid/index.php
     - https://www.gavilan.edu/student/bookstore/index.php
+  # Scraped for their side effects, never indexed. The scraper fetches these normally but does not
+  # upload them to the KB source bucket, and the prune step keeps them out of it.
+  #   databases.php - regenerate_catalog needs its HTML, but the CONTENT is redundant: the whole
+  #   page is names + descriptions by subject, which is exactly what the authoritative
+  #   database_catalog tool serves, and its one unique line (off-campus access needs your library
+  #   card or GavID) is already duplicated in researchassistance.php. At 15,221 chars it would
+  #   otherwise be a third of the entire corpus and it surfaced as retrieval noise 5 times in one
+  #   live round without ever contributing to an answer.
+  kb_exclude_urls:
+    - https://www.gavilan.edu/library/databases.php
   output_dir: ./scraper_output
   timeout_seconds: 20
   user_agent: "GavilanLibraryScraper/1.0 (+https://www.gavilan.edu/library/)"
