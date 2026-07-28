@@ -38,6 +38,25 @@ Pinned: `aws-cdk-lib==2.260.0`, CDK CLI `2.1129.0`.
 
 Handler unit tests stub `boto3` in `sys.modules` and monkeypatch the client getters, so they need no boto3 install and no live AWS.
 
+### CI
+
+`.github/workflows/ci.yml` runs on PRs into `main`/`dev` and on pushes to them. Four parallel jobs, one per test surface, all hermetic (no AWS creds, no deployed endpoint):
+
+| Job (check name) | Where | Command | Install |
+| --- | --- | --- | --- |
+| `infra tests (CDK stack + Lambda handler)` | `infra/` | `python -m pytest -v` | `requirements.txt` + `requirements-dev.txt` |
+| `scraper tests` | `scraper/` | `python -m pytest tests -v` | `requirements.txt` + `requirements-dev.txt` |
+| `eval harness tests` | `eval/` | `python -m pytest tests -v` | `requirements-dev.txt` ONLY |
+| `widget tests` | repo root | `node frontend/test/widget.contract.test.js` | none (dependency-free, no package.json) |
+
+Python pinned to 3.13 to match the Lambda runtime (`_LAMBDA_PYTHON`); Node 22 for the widget.
+
+CI notes, so nobody "fixes" these back:
+- **No `cdk synth` job.** `test_infra_stack.py` already builds the real stack via `load_config()` + `GavilanChatbotStack(...)`, so synth would only cover `app.py`/`cdk.json` glue, and it would need a Node + pinned CDK CLI install plus a network-bound asset bundle (the scraper deps layer shells out to `pip --platform`, Docker fallback).
+- **The eval job installs `requirements-dev.txt` only, never `requirements.txt`.** `eval/tests/conftest.py` stubs boto3 *only if it is not already importable*; installing the real boto3 would silently disable the no-live-AWS guard.
+- **No `paths:` filters.** A required check skipped by a paths filter reports as pending forever and blocks the PR. All four suites together are ~11s of test time, so filtering buys nothing.
+- **The deployed-infra evals stay out of CI**: the Bedrock runners in `eval/` and the `eval/promptfoo/` answer-quality loop need real credentials, a live `/query`, and cost money per run.
+
 ## Vector store
 
 Amazon S3 Vectors (`s3vectors.CfnVectorBucket` + `CfnIndex`); the KB `StorageConfiguration` type is `S3_VECTORS`, referencing the index by `IndexArn` (that one field only - passing IndexName/VectorBucketArn too makes CloudFormation reject the config as ambiguous). Config lives in `config.yaml` under `vector_store`:
@@ -69,11 +88,12 @@ Query flow (`run_agent`): the newest user turn is the current question; the trim
   - `data/database_catalog.json` - bundled seed catalog: the hand-authored not-held list + a fallback held list, merged with the S3 held list at read time.
   - `data/library_links.json` - bundled, hand-authored table of canonical Gavilan URLs behind the `library_links` tool (library home page, college site, online textbook collections, research guides, bookstore, campus maps, public safety, ILL, laptop record). Fully static: no scraper, no S3, no cache. Edit + redeploy to change.
   - `primo_search.py` - standalone CLI for exploring the Primo discovery API (dev tool; NOT imported by the handler and NOT in the `from_asset` bundle).
-- `scraper/` - scraper Lambda source. `scraper.py` (pure fetch/extract, incl. `extract_database_catalog` HTML parse) + `lambda_function.py` (S3 upload, KB ingestion trigger, catalog regeneration: parse -> Sonnet enrichment -> guard -> write to the catalog bucket). Own `.venv`/tests (needs trafilatura).
+- `scraper/` - scraper Lambda source. `scraper.py` (pure fetch/extract, incl. `extract_database_catalog` HTML parse) + `lambda_function.py` (S3 upload, KB ingestion trigger, catalog regeneration: parse -> Sonnet enrichment -> guard -> write to the catalog bucket). Own `.venv`/tests (needs trafilatura). `requirements-dev.txt` pins pytest to the same version as `infra/` and `eval/`; the tests need the runtime deps too, so install both files.
 - `eval/` - Bedrock RAG eval harness (boto3 tooling, NOT CDK). Runs on demand against deployed infra; cannot run offline. Retrieve-only formatter (chunking eval) + retrieve-and-generate formatter (answer quality, bring-your-own-inference). `capture_outputs.py` is a STUB until the bot is deployed. Separate `eval_config.yaml`.
 - `frontend/` - embeddable widget. `widget.js` is the ONLY file shipped (production-clean, no mock code); reads its endpoint from its `<script>` tag's `data-api-url`, POSTs a multi-turn `{messages: [...]}` array, renders `{answer, sources}`. `mock.js` (dev-only fetch stub) + `demo.html` (offline harness) + `test/widget.contract.test.js` (zero-dep Node tests) never ship; dependency direction is one-way (widget never references the mock).
 - `config.yaml` - declarative settings at repo root; embedding model, `vector_store` (S3 Vectors names, data_type, distance_metric, non-filterable keys), `scraper` seed URLs + schedule, `chunking`, `retrieval.number_of_results`, `generation.model_id`, `catalog` (enrichment model, S3 key, guard threshold, cache TTL), `primo` (the live-catalog knobs `timeout_seconds`, `number_of_results`, `availability_budget_seconds`, wired as `PRIMO_*` env; `search_course_reserves` reuses the same knobs), `library_links.data_file` (the bundled link-table filename; the stack feeds the SAME value to the Lambda asset include and the `LIBRARY_LINKS_FILE` env so they cannot drift), `cors.allow_origins` (the HTTP API browser allowlist), guardrail settings. CDK reads it at synth via `infra/config.py`. Edit values here, do not hardcode in the stack.
 - `docs/` - design docs (`architecture.md`, `build-plan.md`, architecture diagram).
+- `.github/workflows/ci.yml` - the GitHub Actions checks (see CI under Commands). Four hermetic jobs, one per test surface.
 
 ## Excluded (do not reintroduce)
 
