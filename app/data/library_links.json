@@ -4,165 +4,61 @@
       "key": "library_homepage",
       "url": "https://www.gavilan.edu/library/index.php",
       "label": "Gavilan College Library home page (OneSearch)",
-      "use_when": "The library's front door and the entry point for OneSearch / the library catalog. Use for a general 'where do I start with the library' pointer.",
-      "keywords": [
-        "library home page",
-        "library homepage",
-        "library website",
-        "library site",
-        "onesearch",
-        "one search",
-        "search the library",
-        "library main page"
-      ]
+      "use_when": "The library's front door and the entry point for OneSearch / the library catalog. Use for a general 'where do I start with the library' pointer."
     },
     {
       "key": "gavilan_college_website",
       "url": "https://www.gavilan.edu/index.php",
       "label": "Gavilan College website",
-      "use_when": "General Gavilan College information that is NOT a library matter - admissions, registration, counseling, financial aid, programs, the academic calendar.",
-      "keywords": [
-        "gavilan college website",
-        "college website",
-        "college home page",
-        "main college site",
-        "admissions",
-        "registration",
-        "financial aid",
-        "counseling",
-        "academic calendar"
-      ]
+      "use_when": "General Gavilan College information that is NOT a library matter - admissions, registration, counseling, financial aid, programs, the academic calendar."
     },
     {
       "key": "online_textbook_collections",
       "url": "https://caccl-gavilan.primo.exlibrisgroup.com/discovery/collectionDiscovery?vid=01CACCL_GAVILAN:GAVILAN&lang=en",
       "label": "Online textbook and e-book collections",
-      "use_when": "The library's online / electronic textbook and e-book collections, for a student who wants to read a textbook online rather than borrow a print copy.",
-      "keywords": [
-        "online textbook",
-        "online textbooks",
-        "e textbook",
-        "e textbooks",
-        "etextbook",
-        "etextbooks",
-        "digital textbook",
-        "digital textbooks",
-        "ebook",
-        "ebooks",
-        "e book",
-        "e books",
-        "online books",
-        "textbook collections",
-        "read a textbook online"
-      ]
+      "use_when": "The library's online / electronic textbook and e-book collections, for a student who wants to read a textbook online rather than borrow a print copy."
     },
     {
       "key": "research_guides",
       "url": "https://gavilan.libguides.com/",
       "label": "Subject research guides (LibGuides)",
-      "use_when": "Librarian-built starting points for a subject, course, or assignment. Good for 'how do I start researching X' pointers.",
-      "keywords": [
-        "research guide",
-        "research guides",
-        "libguide",
-        "libguides",
-        "subject guide",
-        "subject guides",
-        "course guide",
-        "course guides",
-        "how to start research"
-      ]
+      "use_when": "Librarian-built starting points for a subject, course, or assignment. Good for 'how do I start researching X' pointers."
     },
     {
       "key": "bookstore_course_materials",
       "url": "https://gavilan.bkstr.com/pages/courses-materials-results",
       "label": "Gavilan College Bookstore - course materials",
-      "use_when": "Buying or renting a course textbook. The library does not sell textbooks; the bookstore is where students purchase or rent them.",
-      "keywords": [
-        "bookstore",
-        "book store",
-        "buy a textbook",
-        "buy textbooks",
-        "purchase a textbook",
-        "rent a textbook",
-        "rent textbooks",
-        "course materials",
-        "where to buy books"
-      ]
+      "use_when": "Buying or renting a course textbook. The library does not sell textbooks; the bookstore is where students purchase or rent them."
     },
     {
       "key": "campus_map_main",
       "url": "https://www.gavilan.edu/about/maps/main_map.php",
       "label": "Gilroy campus map",
-      "use_when": "Finding a building, office, department, or the library itself on the main Gilroy campus.",
-      "keywords": [
-        "campus map",
-        "map",
-        "maps",
-        "map of campus",
-        "building location",
-        "office location",
-        "where is the library",
-        "find a building",
-        "get around campus"
-      ]
+      "use_when": "Finding a building, office, department, or the library itself on the main Gilroy campus."
     },
     {
       "key": "campus_map_interactive",
       "url": "https://www.gavilan.edu/about/maps/gilroy_interactive_map.php",
       "label": "Interactive Gilroy campus map",
-      "use_when": "A clickable, interactive version of the Gilroy campus map. Offer alongside the static map.",
-      "keywords": [
-        "interactive map",
-        "interactive campus map",
-        "clickable map"
-      ]
+      "use_when": "A clickable, interactive version of the Gilroy campus map. Offer alongside the static map."
     },
     {
       "key": "public_safety",
       "url": "https://www.gavilan.edu/public_safety/index.php",
       "label": "Gavilan College Public Safety",
-      "use_when": "Campus safety and security - safety escorts, parking, lost and found, reporting an incident, emergency information.",
-      "keywords": [
-        "public safety",
-        "campus safety",
-        "campus police",
-        "campus security",
-        "safety escort",
-        "lost and found",
-        "parking",
-        "emergency"
-      ]
+      "use_when": "Campus safety and security - safety escorts, parking, lost and found, reporting an incident, emergency information."
     },
     {
       "key": "interlibrary_loan",
       "url": "https://www.gavilan.edu/library/ill.php",
       "label": "Interlibrary Loan (ILL) requests",
-      "use_when": "Requesting a book or article Gavilan does not own, borrowed on the student's behalf from another library. The follow-up when the catalog shows an item is not held.",
-      "keywords": [
-        "interlibrary loan",
-        "inter library loan",
-        "ill",
-        "ill request",
-        "request a book we do not own",
-        "borrow from another college"
-      ]
+      "use_when": "Requesting a book or article Gavilan does not own, borrowed on the student's behalf from another library. The follow-up when the catalog shows an item is not held."
     },
     {
       "key": "laptop_request",
       "url": "https://caccl-gavilan.primo.exlibrisgroup.com/discovery/fulldisplay?context=L&vid=01CACCL_GAVILAN:GAVILAN&search_scope=MyInst_and_CI&tab=Everything&docid=alma991320845305313",
       "label": "Library laptop borrowing",
-      "use_when": "Requesting or borrowing a laptop from the library. This is the catalog record students place the request from.",
-      "keywords": [
-        "laptop",
-        "laptops",
-        "borrow a laptop",
-        "check out a laptop",
-        "laptop request",
-        "chromebook",
-        "computer loan",
-        "borrow a computer"
-      ]
+      "use_when": "Requesting or borrowing a laptop from the library. This is the catalog record students place the request from."
     }
   ]
 }

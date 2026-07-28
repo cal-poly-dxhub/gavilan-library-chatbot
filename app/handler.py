@@ -193,10 +193,14 @@ _CATALOG_SOURCE = {
 #
 # A small HAND-AUTHORED table of the library's and college's front-door URLs (library home page,
 # campus map, bookstore, research guides, ILL, laptop record, ...). It exists because NO other
-# path produces these links: the KB only knows the ~16 scraped seed pages, database_catalog cites
+# path produces these links: the KB only knows the scraped seed pages, database_catalog cites
 # the A-Z page, and the Primo tools cite per-query search URLs. Without it the model could only
 # surface such a link by writing a URL from memory - the exact hallucination the system prompt's
 # <citations> rules forbid.
+#
+# The tool hands the model the WHOLE table on every call and does no matching of its own - which
+# entry fits is the model's judgement, made from each row's `label` and `use_when`. Those two
+# fields are therefore load-bearing: they are the only steer on the choice.
 #
 # STATIC and bundled with the Lambda, like the database_catalog SEED: no scraper, no S3, no cache
 # TTL, nothing to refresh at runtime. Editing the JSON + redeploying is the whole update path.
@@ -541,47 +545,29 @@ def _tool_config():
                 "toolSpec": {
                     "name": LINKS_TOOL_NAME,
                     "description": (
-                        "Get the library's and the college's OFFICIAL web links, from a curated "
-                        "list of canonical Gavilan URLs. Use this ANY TIME your answer would send "
-                        "a student to a web page. The URLs it returns are real and verified - "
-                        "never write a Gavilan URL from memory, and never build one by guessing a "
-                        "path. If the link you want is not returned here and did not come from "
-                        "another tool's results, describe where to go in words instead of "
-                        "inventing a link. It covers: the library home page and OneSearch; the "
-                        "main Gavilan College website (for non-library college matters like "
-                        "admissions, registration, counseling, or financial aid); online textbook "
-                        "and e-book collections; subject research guides (LibGuides); the "
-                        "bookstore page for buying or renting course textbooks; the Gilroy campus "
-                        "map (static and interactive) for finding a building or office; campus "
-                        "public safety; Interlibrary Loan requests for items Gavilan does not own; "
-                        "and borrowing a library laptop. Call it with `topic` describing what you "
-                        "need a link for - e.g. 'campus map', 'bookstore', 'research guides', "
-                        "'interlibrary loan', 'laptop', 'online textbooks' - and it returns the "
-                        "matching entries with a label and a note on when each applies. `topic` is "
-                        "optional and a miss is safe: if nothing matches, or you omit it, you get "
-                        "the whole list to choose from, so calling this is never wasted. This tool "
-                        "is a LINK DIRECTORY only - it does not search page content (use "
+                        "Get the library's and the college's OFFICIAL web links. Takes no input "
+                        "and returns the COMPLETE curated table of canonical Gavilan URLs - every "
+                        "entry, every time - each with a label and a `use_when` note saying when "
+                        "it applies. Read them and pick the one that fits; the choice is yours. "
+                        "Call this ANY TIME your answer would send a student to a web page. The "
+                        "URLs it returns are real and verified - never write a Gavilan URL from "
+                        "memory, and never build one by guessing a path. If none of these is the "
+                        "right page and the link did not come from another tool's results, "
+                        "describe where to go in words instead of inventing a link. It covers: the "
+                        "library home page and OneSearch; the main Gavilan College website (for "
+                        "non-library college matters like admissions, registration, counseling, or "
+                        "financial aid); online textbook and e-book collections; subject research "
+                        "guides (LibGuides); the bookstore page for buying or renting course "
+                        "textbooks; the Gilroy campus map (static and interactive) for finding a "
+                        "building or office; campus public safety; Interlibrary Loan requests for "
+                        "items Gavilan does not own; and borrowing a library laptop. This tool is "
+                        "a LINK DIRECTORY only - it does not search page content (use "
                         "search_library_info), research databases (use database_catalog), the "
                         "book/media catalog (use search_book_catalog), or course reserves (use "
                         "search_course_reserves) - but it pairs well with them when the answer "
                         "needs a place to send the student next."
                     ),
-                    "inputSchema": {
-                        "json": {
-                            "type": "object",
-                            "properties": {
-                                "topic": {
-                                    "type": "string",
-                                    "description": (
-                                        "What you need a link for, e.g. 'campus map', "
-                                        "'bookstore', 'interlibrary loan', 'laptop', 'research "
-                                        "guides', 'online textbooks'. Optional - omit it to list "
-                                        "every available link."
-                                    ),
-                                }
-                            },
-                        }
-                    },
+                    "inputSchema": {"json": {"type": "object", "properties": {}}},
                 }
             },
         ]
@@ -690,30 +676,6 @@ def _run_catalog_tool(tool_input):
 # --- library_links tool implementation -----------------------------------------------------
 
 
-def _phrase_in(phrase, text):
-    """Whole-phrase containment over already-normalized text. Both sides are padded with spaces
-    so a phrase only matches on word boundaries: 'library' hits 'library home page' but NOT
-    'interlibrary loan', and 'map' hits 'campus map' but not 'mapping'."""
-    if not phrase or not text:
-        return False
-    return f" {phrase} " in f" {text} "
-
-
-def _link_matches(topic_norm, entry):
-    """Whether a normalized topic names this link entry. Checked against the entry's key (with
-    underscores read as spaces), its label, and its hand-authored keywords, matching in EITHER
-    direction so both a broad topic ('map') and a wordy one ('where is the campus map') hit."""
-    phrases = [(entry.get("key") or "").replace("_", " "), entry.get("label") or ""]
-    phrases.extend(entry.get("keywords") or [])
-    for phrase in phrases:
-        cand = _norm(phrase)
-        if not cand:
-            continue
-        if _phrase_in(cand, topic_norm) or _phrase_in(topic_norm, cand):
-            return True
-    return False
-
-
 def _link_entry(entry):
     """One curated row reduced to what the model needs: the key, the human label, the URL, and
     when the link applies. Defensive `.get`s so a malformed row degrades instead of throwing."""
@@ -726,49 +688,19 @@ def _link_entry(entry):
 
 
 def _run_links_tool(tool_input):
-    """Execute the library_links tool: look up canonical Gavilan URLs from the bundled table.
+    """Execute the library_links tool: return the bundled table of canonical Gavilan URLs.
 
-    INTERFACE (deliberately forgiving, since the table is ~10 entries and a wrong guess is cheap):
-    `topic` is OPTIONAL free text. A topic that matches one or more entries returns just those; NO
-    topic, or a topic that matches nothing, returns the WHOLE table with a note. A miss must never
-    leave the model empty-handed - that is precisely the state in which it would invent a URL.
+    INTERFACE: takes no input and returns EVERY entry, every call. There is deliberately no
+    server-side topic matching - selecting the right link is the model's job, made from each
+    entry's `label` and `use_when`. The table is ~10 rows (~650 tokens), so handing over all of
+    it costs less than half a KB retrieval, and a filter could only ever hide a row the model
+    needed. `tool_input` is accepted and ignored so a model that passes stray arguments still
+    gets a valid result rather than an error.
 
-    Returns (result_json, sources). A MATCHED lookup contributes one synthetic source per matched
-    link: unlike database_catalog (whose answer is data ABOUT a page) these entries ARE the
-    canonical pages, so each is a legitimate source. The whole-table listing is a browse aid rather
-    than an answer to a specific question, so it contributes NO source - keeping to the same rule
-    as the other tools that only a substantive lookup adds one, and keeping the response from
-    carrying the entire directory as citations."""
-    topic = ""
-    if isinstance(tool_input, dict):
-        raw = tool_input.get("topic")
-        topic = raw.strip() if isinstance(raw, str) else ""
-
-    matches = []
-    if topic:
-        topic_norm = _norm(topic)
-        matches = [e for e in _LIBRARY_LINKS if _link_matches(topic_norm, e)]
-
-    if matches:
-        links = [_link_entry(e) for e in matches]
-        sources = [
-            {"uri": link["url"], "excerpt": link["label"]} for link in links if link["url"]
-        ]
-        return {"topic": topic, "matched": True, "links": links}, sources
-
-    result = {
-        "topic": topic,
-        "matched": False,
-        "links": [_link_entry(e) for e in _LIBRARY_LINKS],
-        "note": (
-            "Nothing matched that topic, so every curated link is listed - pick one if it fits. "
-            "If none of these is the right page, describe where to go in words rather than "
-            "writing a URL that is not on this list."
-            if topic
-            else "All curated library and campus links."
-        ),
-    }
-    return result, []
+    Returns (result_json, sources). `sources` is always empty: the tool reports what links EXIST,
+    not which one the answer used, so attributing citations from it would cite pages the model
+    may never have mentioned. Links reach the student inline in the answer text instead."""
+    return {"links": [_link_entry(e) for e in _LIBRARY_LINKS]}, []
 
 
 # --- Primo book/media catalog tool implementation ------------------------------------------
@@ -1404,17 +1336,17 @@ def _log_guardrail_assessment(response):
 # produced it. Recorded from values run_agent already computed; it feeds nothing back into the
 # loop and never appears without the include_full_context flag.
 
-# The key each tool uses for its substantive payload, checked in order. `matched` comes first
-# because library_links returns the WHOLE table on a miss - a non-empty `links` list there means
-# "here is the directory", not "I found what you asked for".
-_RESULT_PAYLOAD_KEYS = ("matched", "passages", "results", "databases", "links")
+# The key each tool uses for its substantive payload, checked in order. `links` is a genuine
+# result: library_links always returns the whole table, so a non-empty list means the model was
+# handed the directory it asked for.
+_RESULT_PAYLOAD_KEYS = ("passages", "results", "databases", "links")
 
 
 def _returned_results(result_json):
     """Whether a tool call actually found what it was asked for.
 
     An error (including a Primo soft-fail) is never a result. Otherwise the first payload key
-    present decides: passages found, candidate records found, databases matched, links matched.
+    present decides: passages found, candidate records found, databases matched, links returned.
     A result with none of those keys is a database_catalog NAME lookup, whose answer IS the
     held/not-held verdict - authoritative either way, so it counts as a result."""
     if not isinstance(result_json, dict) or "error" in result_json:
@@ -1458,8 +1390,8 @@ def run_agent(messages):
 
     Returns {"answer", "blocked", "chunks", "catalog_sources", "tool_calls"}: `chunks` are the KB
     passages from search_library_info (drive `sources` + eval full_context); `catalog_sources` are
-    the synthetic source entries the non-KB tools contributed (the A-Z databases page, the
-    per-query Primo search pages, and each canonical URL a matched library_links lookup returned);
+    the synthetic source entries the non-KB tools contributed (the A-Z databases page and the
+    per-query Primo search pages; library_links contributes none - see _run_links_tool);
     `tool_calls` is the ordered observability trace of every tool the model invoked (see
     _tool_call_record). The trace is recorded from what the loop already computed - it never
     changes what is sent to the model."""
@@ -1553,9 +1485,9 @@ def run_agent(messages):
                 status = "error" if "error" in result_json else "success"
             elif name == LINKS_TOOL_NAME:
                 result_json, link_sources = _run_links_tool(tool_use.get("input"))
-                # Each MATCHED link is itself a canonical page, so every one is a source (deduped;
-                # the whole-table listing returns none). Purely a local table read - it cannot fail,
-                # so there is no error status to report.
+                # Contributes no sources by design: the table says which links EXIST, not which one
+                # the answer used, so citing from it would credit pages the model never mentioned.
+                # Purely a local table read - it cannot fail, so there is no error status to report.
                 for link_source in link_sources:
                     if link_source not in catalog_sources:
                         catalog_sources.append(link_source)
@@ -1828,8 +1760,8 @@ def _handle_query(event):
         return _error_response(stage, exc)
 
     # Sources: KB passages from search_library_info (deduped by uri) PLUS any synthetic sources
-    # the non-KB tools contributed (the A-Z page, the Primo search pages, matched library_links
-    # URLs). On an OUTPUT guardrail block the answer is the blocked message, so attach no sources
+    # the non-KB tools contributed (the A-Z page and the Primo search pages; library_links
+    # contributes none). On an OUTPUT guardrail block the answer is the blocked message, so attach no sources
     # at all. full_context stays KB-only (what the model semantically retrieved), so the synthetic
     # sources never pollute eval data.
     chunks = result["chunks"]
