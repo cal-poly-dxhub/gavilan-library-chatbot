@@ -12,6 +12,7 @@ import pytest
 from infra.config import (
     load_config,
     resolve_cors_allow_origins,
+    resolve_feedback,
     resolve_scraper_tiers,
     resolve_seed_urls,
 )
@@ -233,6 +234,8 @@ def test_warm_route_exists():
 
 
 def test_query_and_warm_are_the_only_routes_and_share_one_lambda_integration():
+    # With config.yaml as shipped - feedback enabled but with no destination address, so no
+    # /feedback route exists (see the feedback section below for both states).
     template = _template()
     routes = template.find_resources("AWS::ApiGatewayV2::Route")
     keys = {r["Properties"]["RouteKey"] for r in routes.values()}
@@ -1461,3 +1464,373 @@ def test_cost_model_reaches_the_page_for_a_fresh_install_in_another_account():
         pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
     ).read_text(encoding="utf-8")
     assert len(markers) == page.count("__API_URL__") + page.count("__WIDGET_SRC__")
+
+
+# --- Feedback endpoint: SNS topic + email subscription + POST /feedback ----------------------
+#
+# config.yaml ships `feedback.enabled: true` with an EMPTY notify_email, so the default template
+# (`_template()`) has NO feedback resources at all. Tests that need the provisioned shape build
+# their own config with an address, which is also the honest way to test it: the destination is a
+# handoff value, not something the repo can commit.
+
+# example.edu is reserved for documentation, so no real mailbox is referenced anywhere here.
+_FEEDBACK_EMAIL = "library-reference@example.edu"
+
+
+def _config_with_feedback(**overrides):
+    cfg = copy.deepcopy(CONFIG)
+    block = dict(cfg.get("feedback") or {})
+    block.update({"enabled": True, "notify_email": _FEEDBACK_EMAIL})
+    block.update(overrides)
+    cfg["feedback"] = block
+    return cfg
+
+
+def _config_feedback_off():
+    cfg = copy.deepcopy(CONFIG)
+    cfg["feedback"] = {"enabled": False}
+    return cfg
+
+
+def _feedback_template():
+    return _template_from(_config_with_feedback())
+
+
+def _feedback_function(template):
+    (fn,) = template.find_resources(
+        "AWS::Lambda::Function",
+        {"Properties": {"Handler": "feedback_handler.lambda_handler"}},
+    ).values()
+    return fn
+
+
+def _statements_for_role_of(template, handler_name):
+    """The IAM policy statements attached to the role of the function with this handler."""
+    (fn,) = template.find_resources(
+        "AWS::Lambda::Function", {"Properties": {"Handler": handler_name}}
+    ).values()
+    role_id = fn["Properties"]["Role"]["Fn::GetAtt"][0]
+    statements = []
+    for pol in template.find_resources("AWS::IAM::Policy").values():
+        if any(r.get("Ref") == role_id for r in pol["Properties"].get("Roles", [])):
+            statements.extend(pol["Properties"]["PolicyDocument"]["Statement"])
+    return statements
+
+
+def test_no_feedback_endpoint_exists_when_no_address_is_configured():
+    # The shipped config: enabled, but with nowhere to send. Nothing is created - no topic, no
+    # subscription, no Lambda, no route - because an endpoint that accepts reports it cannot
+    # deliver loses them silently, and the email is the only record there is.
+    template = _template()
+    template.resource_count_is("AWS::SNS::Topic", 0)
+    template.resource_count_is("AWS::SNS::Subscription", 0)
+    template.resource_count_is("AWS::SNS::TopicPolicy", 0)
+    assert not template.find_resources(
+        "AWS::Lambda::Function",
+        {"Properties": {"Handler": "feedback_handler.lambda_handler"}},
+    )
+    keys = {
+        r["Properties"]["RouteKey"]
+        for r in template.find_resources("AWS::ApiGatewayV2::Route").values()
+    }
+    assert "POST /feedback" not in keys, keys
+    assert "FeedbackApiUrl" not in template.find_outputs("*")
+
+    # ...but it is NOT silent about it. This case is a mistake rather than a choice, so the deploy
+    # output says why there is no endpoint instead of leaving it to be discovered by a lost report.
+    status = template.find_outputs("FeedbackStatus")["FeedbackStatus"]["Value"]
+    assert "notify_email" in status, status
+
+
+def test_feedback_disabled_creates_nothing_and_says_nothing():
+    # Deliberately off is different from misconfigured: no resources AND no status output.
+    template = _template_from(_config_feedback_off())
+    template.resource_count_is("AWS::SNS::Topic", 0)
+    template.resource_count_is("AWS::SNS::Subscription", 0)
+    outputs = template.find_outputs("*")
+    assert "FeedbackApiUrl" not in outputs
+    assert "FeedbackStatus" not in outputs
+
+
+def test_feedback_route_topic_and_subscription_are_created_when_configured():
+    template = _feedback_template()
+    template.has_resource_properties(
+        "AWS::ApiGatewayV2::Route", {"RouteKey": "POST /feedback"}
+    )
+    # ONE topic with ONE subscription: exactly one destination, from config, over email.
+    template.resource_count_is("AWS::SNS::Topic", 1)
+    template.resource_count_is("AWS::SNS::Subscription", 1)
+    template.has_resource_properties(
+        "AWS::SNS::Subscription",
+        {"Protocol": "email", "Endpoint": _FEEDBACK_EMAIL},
+    )
+    # The endpoint URL is handed back at deploy, with the confirmation step spelled out (SNS
+    # delivers nothing until the recipient clicks the link it mails them).
+    out = template.find_outputs("FeedbackApiUrl")["FeedbackApiUrl"]
+    assert "/feedback" in json.dumps(out["Value"]), out
+    assert "confirmation" in out["Description"].lower(), out
+
+
+def test_feedback_email_address_is_never_hardcoded_in_the_stack():
+    # The destination comes from config and only from config: a different address in config must
+    # be the ONLY address in the template.
+    other = "someone-else@example.edu"
+    template = _template_from(_config_with_feedback(notify_email=other))
+    (sub,) = template.find_resources("AWS::SNS::Subscription").values()
+    assert sub["Properties"]["Endpoint"] == other
+    assert _FEEDBACK_EMAIL not in json.dumps(template.to_json())
+
+
+def test_feedback_lambda_is_its_own_function_with_its_own_log_group():
+    template = _feedback_template()
+    fn = _feedback_function(template)["Properties"]
+    assert fn["Runtime"] == "python3.13"
+    # One validate + one publish: no retrieval, no generation, so it needs neither the query
+    # Lambda's 30s budget nor its memory.
+    assert fn["Timeout"] == 10
+    assert fn["MemorySize"] == 128
+
+    log_group_ref = fn["LoggingConfig"]["LogGroup"]["Ref"]
+    log_groups = template.find_resources("AWS::Logs::LogGroup")
+    assert log_group_ref in log_groups, log_group_ref
+    assert log_groups[log_group_ref]["Properties"]["RetentionInDays"] == 90
+    assert log_groups[log_group_ref].get("DeletionPolicy") == "Delete"
+    # Its OWN group, not the query Lambda's - the two paths' logs never mix.
+    query_fn = template.find_resources(
+        "AWS::Lambda::Function", {"Properties": {"Handler": "handler.lambda_handler"}}
+    )
+    query_group = next(iter(query_fn.values()))["Properties"]["LoggingConfig"]["LogGroup"]["Ref"]
+    assert log_group_ref != query_group
+
+
+def test_feedback_role_can_publish_to_the_topic_and_nothing_else():
+    # Least privilege, and the reason this is a separate function: publishing an email needs
+    # sns:Publish, while the query role can already invoke Bedrock and read the knowledge base.
+    template = _feedback_template()
+    statements = _statements_for_role_of(template, "feedback_handler.lambda_handler")
+    assert statements, "the feedback role should carry an inline policy"
+
+    (topic_id,) = template.find_resources("AWS::SNS::Topic").keys()
+    publish = [s for s in statements if "sns:Publish" in json.dumps(s.get("Action"))]
+    assert len(publish) == 1, statements
+    assert publish[0]["Effect"] == "Allow"
+    assert topic_id in json.dumps(publish[0]["Resource"]), publish[0]
+    assert "*" != publish[0]["Resource"]
+
+    # No Bedrock, no knowledge base, no S3, and no wildcard resource anywhere on this role.
+    actions = json.dumps([s.get("Action") for s in statements])
+    for forbidden in ("bedrock:", "s3:", "s3vectors:", "dynamodb:"):
+        assert forbidden not in actions, actions
+    assert '"Resource": "*"' not in json.dumps(statements)
+
+
+def test_feedback_caps_are_wired_from_config_to_the_lambda():
+    # Feedback text never reaches a model, so the guardrails do not screen it: these caps are the
+    # controls that exist, and a cap that stops at config.yaml is not a control.
+    cfg = _config_with_feedback(max_comment_chars=250, max_body_bytes=4096, max_sources=5)
+    template = _template_from(cfg)
+    env = _feedback_function(template)["Properties"]["Environment"]["Variables"]
+    assert env["FEEDBACK_MAX_COMMENT_CHARS"] == "250"
+    assert env["FEEDBACK_MAX_BODY_BYTES"] == "4096"
+    assert env["FEEDBACK_MAX_SOURCES"] == "5"
+    # The destination reaches it as the topic ARN, never as an address.
+    (topic_id,) = template.find_resources("AWS::SNS::Topic").keys()
+    assert topic_id in json.dumps(env["FEEDBACK_TOPIC_ARN"])
+    assert _FEEDBACK_EMAIL not in json.dumps(env)
+
+
+def test_feedback_and_query_lambdas_are_not_cross_wired():
+    # The feedback function has no business knowing about the KB, and the query function has no
+    # business holding a topic ARN it cannot publish to.
+    template = _feedback_template()
+    feedback_env = _feedback_function(template)["Properties"]["Environment"]["Variables"]
+    (query_fn,) = template.find_resources(
+        "AWS::Lambda::Function", {"Properties": {"Handler": "handler.lambda_handler"}}
+    ).values()
+    query_env = query_fn["Properties"]["Environment"]["Variables"]
+
+    for key in ("KNOWLEDGE_BASE_ID", "GENERATION_MODEL_ID", "CATALOG_BUCKET"):
+        assert key not in feedback_env, key
+    assert not [k for k in query_env if k.startswith("FEEDBACK_")], query_env
+
+
+def test_feedback_cors_comes_from_the_shared_config_allowlist():
+    # D-20260729-7: CORS is enforced at API Gateway only, from config.yaml, exact full-origin
+    # match. /feedback must use the SAME mechanism as /query rather than its own: cors_preflight
+    # is configured on the API, so being on that API IS the mechanism.
+    template = _feedback_template()
+    apis = template.find_resources("AWS::ApiGatewayV2::Api")
+    assert len(apis) == 1, list(apis)
+    (api_id, api) = next(iter(apis.items()))
+    cors = api["Properties"]["CorsConfiguration"]
+
+    literal_origins = [o for o in cors["AllowOrigins"] if isinstance(o, str)]
+    assert literal_origins == resolve_cors_allow_origins(CONFIG), cors
+    assert "*" not in cors["AllowOrigins"], cors
+
+    # The feedback route hangs off that same API, so it inherits that allowlist. Nothing in the
+    # feedback path declares an origin of its own.
+    (route,) = template.find_resources(
+        "AWS::ApiGatewayV2::Route", {"Properties": {"RouteKey": "POST /feedback"}}
+    ).values()
+    assert route["Properties"]["ApiId"] == {"Ref": api_id}, route
+
+
+def test_feedback_route_inherits_the_stage_throttle():
+    # Stage throttling is the volume control for the whole stage; a per-route override on
+    # /feedback would quietly exempt it.
+    template = _feedback_template()
+    (stage,) = template.find_resources("AWS::ApiGatewayV2::Stage").values()
+    props = stage["Properties"]
+    assert props["DefaultRouteSettings"] == {
+        "ThrottlingRateLimit": CONFIG["http_api"]["throttling_rate_limit"],
+        "ThrottlingBurstLimit": CONFIG["http_api"]["throttling_burst_limit"],
+    }
+    assert "RouteSettings" not in props, props
+
+
+def test_feedback_route_has_its_own_integration_on_the_shared_api():
+    template = _feedback_template()
+    routes = template.find_resources("AWS::ApiGatewayV2::Route")
+    keys = {r["Properties"]["RouteKey"] for r in routes.values()}
+    assert keys == {"POST /query", "GET /warm", "POST /feedback"}, keys
+    # Two integrations: /query + /warm share the query Lambda's, /feedback has its own.
+    integrations = template.find_resources("AWS::ApiGatewayV2::Integration")
+    assert len(integrations) == 2, list(integrations)
+    (feedback_route,) = template.find_resources(
+        "AWS::ApiGatewayV2::Route", {"Properties": {"RouteKey": "POST /feedback"}}
+    ).values()
+    fn_id = list(
+        template.find_resources(
+            "AWS::Lambda::Function",
+            {"Properties": {"Handler": "feedback_handler.lambda_handler"}},
+        )
+    )[0]
+    target = json.dumps(feedback_route["Properties"]["Target"])
+    integration_id = next(
+        i for i in integrations if i in target
+    )
+    assert fn_id in json.dumps(integrations[integration_id]["Properties"]["IntegrationUri"])
+
+
+def test_feedback_topic_denies_non_tls_publishes():
+    template = _feedback_template()
+    (policy,) = template.find_resources("AWS::SNS::TopicPolicy").values()
+    doc = json.dumps(policy["Properties"]["PolicyDocument"])
+    assert '"Deny"' in doc, doc
+    assert "SecureTransport" in doc, doc
+
+
+def test_feedback_introduces_no_store():
+    # Hard constraint: the email IS the record. No table, no queue, no bucket, no versioned
+    # object - nothing that accumulates student reports.
+    template = _feedback_template()
+    template.resource_count_is("AWS::DynamoDB::Table", 0)
+    template.resource_count_is("AWS::SQS::Queue", 0)
+    # Same bucket count as with feedback off: the feedback path adds no storage.
+    assert len(template.find_resources("AWS::S3::Bucket")) == len(
+        _template().find_resources("AWS::S3::Bucket")
+    )
+
+
+def test_feedback_does_not_change_the_query_path():
+    # The regression risk of adding a route to a shared API. The query Lambda, its role and its
+    # two routes must be identical whether or not feedback is provisioned.
+    with_feedback = _feedback_template()
+    without = _template()
+
+    def query_fn(template):
+        (fn,) = template.find_resources(
+            "AWS::Lambda::Function", {"Properties": {"Handler": "handler.lambda_handler"}}
+        ).values()
+        return fn["Properties"]
+
+    a, b = query_fn(with_feedback), query_fn(without)
+    for key in ("Environment", "Timeout", "MemorySize", "Runtime", "Handler"):
+        assert a.get(key) == b.get(key), key
+
+    def route_props(template):
+        return {
+            r["Properties"]["RouteKey"]: r["Properties"]["AuthorizationType"]
+            for r in template.find_resources("AWS::ApiGatewayV2::Route").values()
+            if r["Properties"]["RouteKey"] != "POST /feedback"
+        }
+
+    assert route_props(with_feedback) == route_props(without)
+    assert _query_role_statements(with_feedback) == _query_role_statements(without)
+    # ...and the paste-ready embed tag the library uses is untouched.
+    assert with_feedback.find_outputs("WidgetEmbedTag") == without.find_outputs(
+        "WidgetEmbedTag"
+    )
+
+
+# --- Feedback config validation (synth-time) --------------------------------------------------
+
+
+def test_feedback_config_resolves_the_three_states():
+    off = resolve_feedback(_config_feedback_off())
+    assert off["provision"] is False and off["status"] is None
+
+    # Enabled with no address: nothing provisioned, but a reason to show at deploy.
+    unconfigured = resolve_feedback(CONFIG)
+    assert unconfigured["provision"] is False
+    assert "notify_email" in unconfigured["status"]
+
+    on = resolve_feedback(_config_with_feedback())
+    assert on["provision"] is True
+    assert on["email"] == _FEEDBACK_EMAIL
+
+    # An absent block behaves as off, so a config predating this feature still synths.
+    assert resolve_feedback({})["provision"] is False
+
+
+def test_feedback_config_rejects_a_malformed_address():
+    # A typo must be loud: SNS would happily create a subscription that can never be confirmed,
+    # and every report after that is lost with no error anywhere.
+    for bad in (
+        "librarian",
+        "librarian@",
+        "@example.edu",
+        "librarian@example",
+        "librarian@example .edu",
+        "Librarian <librarian@example.edu>",
+        "a@example.edu, b@example.edu",
+        "x" * 250 + "@example.edu",
+    ):
+        with pytest.raises(ValueError, match=r"not a valid email address"):
+            resolve_feedback(_config_with_feedback(notify_email=bad))
+
+    with pytest.raises(ValueError, match=r"must be an email address string"):
+        resolve_feedback(_config_with_feedback(notify_email=42))
+
+
+def test_feedback_config_rejects_a_broken_cap():
+    # A cap of zero (or a string, or a bool) removes a control that exists precisely because
+    # feedback text is never screened by a guardrail. Never silently defaulted.
+    for key in ("max_comment_chars", "max_body_bytes", "max_sources"):
+        for bad in (0, -1, "1000", 12.5, True, None):
+            with pytest.raises(ValueError, match=rf"feedback\.{key}"):
+                resolve_feedback(_config_with_feedback(**{key: bad}))
+
+
+def test_feedback_caps_are_validated_even_while_disabled():
+    # Turning the feature on later must not be the moment a config error first appears.
+    cfg = copy.deepcopy(CONFIG)
+    cfg["feedback"] = {"enabled": False, "max_comment_chars": 0}
+    with pytest.raises(ValueError, match=r"max_comment_chars"):
+        resolve_feedback(cfg)
+
+
+def test_shipped_config_has_a_feedback_block_with_the_documented_knobs():
+    # The block is the contract with whoever does the handoff: an enable flag, the destination,
+    # and the caps. Shipped with an EMPTY address on purpose - see resolve_feedback.
+    block = CONFIG["feedback"]
+    assert set(block) == {
+        "enabled",
+        "notify_email",
+        "max_comment_chars",
+        "max_body_bytes",
+        "max_sources",
+    }, block
+    assert block["enabled"] is True
+    assert block["notify_email"] == ""
