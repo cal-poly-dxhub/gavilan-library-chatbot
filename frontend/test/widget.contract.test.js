@@ -502,6 +502,260 @@ test("renderMarkdown is injection-safe: no markup or scripts from message conten
   assert.ok(/evil/.test(text) && /data/.test(text), "unsafe link labels kept as text");
 });
 
+// --- bare-URL autolinking -----------------------------------------------
+//
+// The model writes URLs as prose ("visit: https://...") as often as it writes
+// [label](url); unlinked, they read as broken. These cases pin down where a
+// URL ENDS, which is the part naive detection gets wrong.
+
+// Render `md` and return { links: [{text, href, nested}], text }.
+function renderInfo(md) {
+  var doc = makeDoc();
+  var root = doc.createElement("div");
+  widget.renderMarkdown(root, md, doc);
+  var links = [];
+  (function walk(n) {
+    if (n.tagName === "a") {
+      links.push({
+        text: n.textContent,
+        href: n.href,
+        nested: collectByTag(n, "a").length
+      });
+    }
+    (n.children || []).forEach(walk);
+  })(root);
+  return { links: links, text: allText(root), root: root, doc: doc };
+}
+
+test("bare URLs become links with the same treatment as written links", () => {
+  var r = renderInfo("For more info visit: https://www.gavilan.edu/library/index.php");
+  assert.strictEqual(r.links.length, 1);
+  assert.strictEqual(r.links[0].href, "https://www.gavilan.edu/library/index.php");
+  assert.strictEqual(r.links[0].text, "https://www.gavilan.edu/library/index.php");
+  // Identical affordances to a [label](url) link: same class, new tab, same rel.
+  var a = collectByTag(r.root, "a")[0];
+  assert.strictEqual(a.className, "md-link");
+  assert.strictEqual(a.target, "_blank");
+  assert.strictEqual(a.rel, "noopener noreferrer nofollow");
+});
+
+test("bare URLs are autolinked inside list items (the shape the model actually emits)", () => {
+  var r = renderInfo(
+    "- Static map: https://www.gavilan.edu/about/maps/main_map.php\n" +
+    "- Interactive: https://www.gavilan.edu/about/maps/gilroy_interactive_map.php"
+  );
+  assert.strictEqual(r.links.length, 2);
+  // Underscores in a URL must not be eaten as italics - the URL wins the scan.
+  assert.strictEqual(
+    r.links[1].href,
+    "https://www.gavilan.edu/about/maps/gilroy_interactive_map.php"
+  );
+  assert.strictEqual(collectByTag(r.root, "em").length, 0, "no italics from URL underscores");
+});
+
+test("trailing sentence punctuation is not swallowed into the link", () => {
+  [
+    ["Visit https://www.gavilan.edu/library/.", "https://www.gavilan.edu/library/", "."],
+    ["Books: https://x.test/a, and more.", "https://x.test/a", ","],
+    ["Open now! https://x.test/faq!", "https://x.test/faq", "!"],
+    ["Which one? https://x.test/b?", "https://x.test/b", "?"],
+    ["Note: https://x.test/c; next", "https://x.test/c", ";"],
+    ["Quote \"https://x.test/q\"", "https://x.test/q", "\""]
+  ].forEach(function (row) {
+    var r = renderInfo(row[0]);
+    assert.strictEqual(r.links.length, 1, "one link for: " + row[0]);
+    assert.strictEqual(r.links[0].href, row[1], "href for: " + row[0]);
+    assert.strictEqual(r.links[0].text, row[1], "link text for: " + row[0]);
+    // The punctuation survives as visible text - it is moved out of the link, not dropped.
+    assert.ok(
+      r.text.indexOf(row[1] + row[2]) >= 0,
+      "punctuation kept as text for: " + row[0]
+    );
+  });
+});
+
+test("closing brackets go to the link only when the URL opened them", () => {
+  // Sentence-owned paren: dropped from the href, kept as text.
+  var wrapped = renderInfo("(see https://www.gavilan.edu/library/)");
+  assert.strictEqual(wrapped.links[0].href, "https://www.gavilan.edu/library/");
+  assert.strictEqual(wrapped.text, "(see https://www.gavilan.edu/library/)");
+
+  // URL-owned paren: kept, because the URL opened it.
+  var balanced = renderInfo("https://en.wikipedia.org/wiki/Library_(disambiguation)");
+  assert.strictEqual(
+    balanced.links[0].href,
+    "https://en.wikipedia.org/wiki/Library_(disambiguation)"
+  );
+
+  // Both at once: keep the balanced paren, drop the sentence's period.
+  var both = renderInfo("See https://en.wikipedia.org/wiki/Library_(disambiguation).");
+  assert.strictEqual(
+    both.links[0].href,
+    "https://en.wikipedia.org/wiki/Library_(disambiguation)"
+  );
+  assert.ok(/\(disambiguation\)\.$/.test(both.text), "period stays as text");
+
+  // Brackets and braces follow the same rule.
+  assert.strictEqual(renderInfo("[x] {https://x.test/z}").links[0].href, "https://x.test/z");
+});
+
+test("trimUrlEnd unwinds a mixed punctuation tail", () => {
+  assert.strictEqual(widget.trimUrlEnd("https://x.test/a"), "https://x.test/a");
+  assert.strictEqual(widget.trimUrlEnd("https://x.test/a)."), "https://x.test/a");
+  assert.strictEqual(widget.trimUrlEnd("https://x.test/a_(b)."), "https://x.test/a_(b)");
+  assert.strictEqual(widget.trimUrlEnd("https://x.test/a!!!"), "https://x.test/a");
+});
+
+test("nothing is double-linked: an existing link is never re-linked", () => {
+  // A URL inside [label](url) is consumed by the link rule, not autolinked.
+  var written = renderInfo("Ask [the library](https://www.gavilan.edu/library/) today.");
+  assert.strictEqual(written.links.length, 1);
+  assert.strictEqual(written.links[0].text, "the library");
+  assert.strictEqual(written.links[0].href, "https://www.gavilan.edu/library/");
+
+  // A URL used as its OWN label must produce exactly one <a>, never a nested one.
+  var selfLabelled = renderInfo("[https://a.test/x](https://b.test/y)");
+  assert.strictEqual(selfLabelled.links.length, 1, "exactly one anchor");
+  assert.strictEqual(selfLabelled.links[0].nested, 0, "no nested <a>");
+  assert.strictEqual(selfLabelled.links[0].href, "https://b.test/y");
+  assert.strictEqual(selfLabelled.links[0].text, "https://a.test/x");
+
+  // Bold inside a link label keeps the no-autolink rule as it recurses.
+  var bolded = renderInfo("[see **https://a.test**](https://b.test)");
+  assert.strictEqual(bolded.links.length, 1);
+  assert.strictEqual(bolded.links[0].nested, 0, "no nested <a> under <strong>");
+});
+
+test("autolinking respects the URL sanitizer and code spans", () => {
+  // Dangerous / non-http schemes are never autolinked.
+  var unsafe = renderInfo("Bad: javascript:alert(1) ftp://x.test/f mailto:a@b.test");
+  assert.strictEqual(unsafe.links.length, 0);
+
+  // A URL inside inline code stays literal - code is matched first and never re-parsed.
+  var code = renderInfo("Run `https://x.test/incode` now.");
+  assert.strictEqual(code.links.length, 0, "no link inside a code span");
+  assert.strictEqual(collectByTag(code.root, "code")[0].textContent, "https://x.test/incode");
+
+  // A schemeless www. host is linked over https, displayed as written.
+  var www = renderInfo("Go to www.gavilan.edu/library now.");
+  assert.strictEqual(www.links[0].href, "https://www.gavilan.edu/library");
+  assert.strictEqual(www.links[0].text, "www.gavilan.edu/library");
+});
+
+// --- pipe tables ---------------------------------------------------------
+//
+// The model answers the hours question - the most-asked one - with a table,
+// so this is the most-read answer in the product.
+
+test("a markdown table renders as a real table with header and body rows", () => {
+  var doc = makeDoc();
+  var root = doc.createElement("div");
+  // Verbatim from a live /query answer to "Show me the library hours for the whole week".
+  widget.renderMarkdown(
+    root,
+    "**Gilroy Library - Summer 2026**\n\n" +
+    "| Day | Hours |\n" +
+    "|---|---|\n" +
+    "| Monday - Thursday | 9:00 AM - 3:00 PM |\n" +
+    "| Friday | Closed |\n",
+    doc
+  );
+  var tables = collectByTag(root, "table");
+  assert.strictEqual(tables.length, 1);
+  assert.strictEqual(tables[0].className, "md-table");
+
+  var th = collectByTag(tables[0], "th");
+  assert.deepStrictEqual(th.map(function (c) { return c.textContent; }), ["Day", "Hours"]);
+
+  var rows = collectByTag(collectByTag(tables[0], "tbody")[0], "tr");
+  assert.strictEqual(rows.length, 2);
+  assert.deepStrictEqual(
+    collectByTag(rows[0], "td").map(function (c) { return c.textContent; }),
+    ["Monday - Thursday", "9:00 AM - 3:00 PM"]
+  );
+  assert.deepStrictEqual(
+    collectByTag(rows[1], "td").map(function (c) { return c.textContent; }),
+    ["Friday", "Closed"]
+  );
+});
+
+test("a table is wrapped in a scroll container so a wide one cannot burst the bubble", () => {
+  var r = renderInfo("| A | B |\n|---|---|\n| 1 | 2 |");
+  var wrap = findByClass(r.root, "md-table-wrap");
+  assert.ok(wrap, "table has a .md-table-wrap parent");
+  assert.strictEqual(wrap.children[0].tagName, "table");
+  // The wrapper is what scrolls; the CSS must actually say so.
+  assert.ok(
+    /\.md-table-wrap \{[^}]*overflow-x: auto/.test(SOURCE),
+    ".md-table-wrap scrolls horizontally"
+  );
+  // Cells need a width floor, and must NOT inherit the bubble's `anywhere`
+  // breaking, which would let the browser squash columns to one character.
+  assert.ok(/\.md-table th, \.md-table td \{[^}]*min-width:/.test(SOURCE), "cells have a min-width floor");
+  assert.ok(
+    /\.md-table th, \.md-table td \{[^}]*overflow-wrap: break-word/.test(SOURCE),
+    "cells override the bubble's overflow-wrap: anywhere"
+  );
+});
+
+test("table cells render inline markdown, including bare URLs", () => {
+  var r = renderInfo(
+    "| Day | Where |\n|---|---|\n| **Mon** | https://x.test/a |\n| Tue | [site](https://y.test/b) |"
+  );
+  assert.strictEqual(collectByTag(r.root, "strong")[0].textContent, "Mon");
+  assert.deepStrictEqual(
+    r.links.map(function (l) { return l.href; }),
+    ["https://x.test/a", "https://y.test/b"]
+  );
+});
+
+test("table parsing handles optional outer pipes, alignment, ragged rows, and escaped pipes", () => {
+  // No outer pipes.
+  var bare = renderInfo("Day | Hours\n--- | ---\nMon | 9-3");
+  assert.strictEqual(collectByTag(bare.root, "table").length, 1);
+  assert.deepStrictEqual(
+    collectByTag(bare.root, "th").map(function (c) { return c.textContent; }),
+    ["Day", "Hours"]
+  );
+
+  // Alignment markers become classes (never inline style).
+  var aligned = renderInfo("| A | B | C |\n|:--|:-:|--:|\n| 1 | 2 | 3 |");
+  assert.deepStrictEqual(
+    collectByTag(aligned.root, "th").map(function (c) { return c.className; }),
+    ["md-cell--left", "md-cell--center", "md-cell--right"]
+  );
+
+  // Ragged rows pad and truncate to the header width, so the grid stays square.
+  var ragged = renderInfo("| A | B | C |\n|---|---|---|\n| 1 |\n| 1 | 2 | 3 | 4 |");
+  collectByTag(collectByTag(ragged.root, "tbody")[0], "tr").forEach(function (tr) {
+    assert.strictEqual(collectByTag(tr, "td").length, 3);
+  });
+
+  // An escaped pipe is cell content, not a boundary.
+  assert.deepStrictEqual(widget.splitTableRow("| x \\| y | z |"), ["x | y", "z"]);
+});
+
+test("prose containing a pipe is NOT turned into a table", () => {
+  // The delimiter row - not the pipe - is what makes a table.
+  var r = renderInfo("Use the pipe | character here.\nIt is just prose.");
+  assert.strictEqual(collectByTag(r.root, "table").length, 0);
+  assert.strictEqual(collectByTag(r.root, "p").length, 1);
+
+  // A table immediately after prose (no blank line) still starts a table.
+  var tight = renderInfo("Here are hours:\n| Day | Hours |\n|---|---|\n| Mon | 9-3 |");
+  assert.strictEqual(collectByTag(tight.root, "table").length, 1);
+  assert.strictEqual(collectByTag(tight.root, "p")[0].textContent, "Here are hours:");
+});
+
+test("table content is injection-safe: cells are text nodes, never markup", () => {
+  var r = renderInfo(
+    "| A | B |\n|---|---|\n| <script>alert(1)</script> | [x](javascript:alert(1)) |"
+  );
+  assert.strictEqual(collectByTag(r.root, "script").length, 0);
+  assert.strictEqual(collectByTag(r.root, "a").length, 0, "javascript: never linkified in a cell");
+  assert.ok(/<script>alert\(1\)<\/script>/.test(r.text), "angle brackets stay literal text");
+});
+
 // --- double-append fix: a retry must not duplicate the user turn --------
 test("a failed send followed by retry does NOT duplicate the user turn in the transcript", async () => {
   var restore = withNetwork(function () {

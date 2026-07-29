@@ -222,30 +222,107 @@
   // ---- minimal, safe markdown renderer ------------------------------------
   //
   // Renders a small, well-defined markdown subset (bold, italic, inline code,
-  // links, bullet/numbered lists, headings, paragraphs with soft breaks) into
-  // real DOM nodes. It builds every node with createElement + createTextNode
-  // ONLY - never innerHTML - so message content can never inject markup or run
-  // scripts, and link targets are passed through safeHttpUrl (javascript:/data:/
-  // relative URLs degrade to plain text). Anything unrecognized renders as literal
-  // text. The model's answers are the only input; user messages stay plain text.
+  // links, bare URLs, bullet/numbered lists, headings, pipe tables, paragraphs
+  // with soft breaks) into real DOM nodes. It builds every node with
+  // createElement + createTextNode ONLY - never innerHTML - so message content
+  // can never inject markup or run scripts, and every link target (written or
+  // autolinked) is passed through safeHttpUrl (javascript:/data:/relative URLs
+  // degrade to plain text). Anything unrecognized renders as literal text. The
+  // model's answers are the only input; user messages stay plain text.
+
+  // ---- bare-URL autolinking -----------------------------------------------
+  //
+  // The model regularly writes a URL as prose ("visit: https://...") rather
+  // than as [label](url), and an unlinked URL is worse than none - it looks
+  // clickable, so a student reads it as broken. The whole difficulty is
+  // deciding where the URL ENDS, because prose butts punctuation straight up
+  // against it and a link that swallows the sentence's period points at a 404.
+
+  // Candidate span: a scheme, or a bare `www.` host, run out to the first
+  // whitespace or angle bracket. Deliberately greedy - trimUrlEnd picks the
+  // real boundary, since that decision needs the whole candidate in hand.
+  var MD_AUTOLINK = /(?:https?:\/\/|www\.)[^\s<>]+/i;
+
+  // Punctuation that ends a sentence, never a URL.
+  var URL_TAIL_PUNCT = /[.,;:!?'"]+$/;
+
+  // Closing brackets, mapped to the opener that would justify keeping one.
+  var URL_CLOSERS = { ")": "(", "]": "[", "}": "{" };
+
+  function countChar(s, ch) {
+    var n = 0;
+    for (var i = 0; i < s.length; i++) if (s.charAt(i) === ch) n++;
+    return n;
+  }
+
+  /**
+   * Given a greedy bare-URL candidate, return only the URL part; whatever
+   * punctuation trailed it is left behind for the caller to render as text.
+   * Two rules, applied until neither fires:
+   *   - trailing sentence punctuation (. , ; : ! ? ' ") is never part of a URL;
+   *   - a trailing bracket belongs to the URL only if the URL itself opened it,
+   *     so `/wiki/Library_(disambiguation)` keeps its paren while the paren in
+   *     `(see https://x.test/a)` goes back to the sentence.
+   * Applied in a loop so a mixed tail like `...(a).` unwinds fully.
+   */
+  function trimUrlEnd(candidate) {
+    var url = String(candidate == null ? "" : candidate);
+    for (var guard = 0; guard <= url.length; guard++) {
+      var before = url;
+      url = url.replace(URL_TAIL_PUNCT, "");
+      var last = url.charAt(url.length - 1);
+      var opener = URL_CLOSERS[last];
+      if (opener && countChar(url, opener) < countChar(url, last)) {
+        url = url.slice(0, -1);
+      }
+      if (url === before) break;
+    }
+    return url;
+  }
+
+  /** Resolve a bare-URL candidate to a safe href, or null. `www.` implies https. */
+  function autoLinkHref(url) {
+    return safeHttpUrl(/^www\./i.test(url) ? "https://" + url : url);
+  }
 
   // Inline rules, in scan-precedence order: code first (its contents are never
-  // re-parsed), then links, then bold, then italic.
+  // re-parsed), then links, then bare URLs, then bold, then italic. The scan
+  // below picks the EARLIEST match, so an explicit [label](url) - which always
+  // starts at the `[` before its URL - beats the autolink rule and the URL is
+  // never linked twice.
   var MD_INLINE = [
     { re: /`([^`]+)`/, kind: "code" },
     { re: /\[([^\]]+)\]\(([^)\s]+)\)/, kind: "link" },
+    { re: MD_AUTOLINK, kind: "autolink" },
     { re: /\*\*([^*]+)\*\*/, kind: "strong" },
     { re: /__([^_]+)__/, kind: "strong" },
     { re: /\*([^*]+)\*/, kind: "em" },
     { re: /_([^_]+)_/, kind: "em" }
   ];
 
-  /** Render inline markdown in `text` as child nodes appended to `parent`. */
-  function renderInline(parent, text, doc) {
+  /** Build an anchor with the widget's standard link treatment + safety attrs. */
+  function makeLink(doc, href) {
+    var a = doc.createElement("a");
+    a.className = "md-link";
+    a.href = href;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer nofollow";
+    return a;
+  }
+
+  /**
+   * Render inline markdown in `text` as child nodes appended to `parent`.
+   * `inLink` is true while rendering the label of an existing link; it
+   * suppresses autolinking so a URL used as its own label ([https://a](https://b))
+   * cannot produce a nested <a>. It propagates through bold/italic, which can
+   * legally sit inside a link.
+   */
+  function renderInline(parent, text, doc, inLink) {
     var remaining = String(text == null ? "" : text);
     while (remaining) {
       var best = null;
       for (var i = 0; i < MD_INLINE.length; i++) {
+        if (inLink && MD_INLINE[i].kind === "autolink") continue;
         var m = MD_INLINE[i].re.exec(remaining);
         if (m && (best === null || m.index < best.match.index)) {
           best = { spec: MD_INLINE[i], match: m };
@@ -260,20 +337,31 @@
         parent.appendChild(doc.createTextNode(remaining.slice(0, match.index)));
       }
       var kind = best.spec.kind;
+      var consumed = match[0].length;
       if (kind === "link") {
         var href = safeHttpUrl(match[2]);
         if (href) {
-          var a = doc.createElement("a");
-          a.className = "md-link";
-          a.href = href;
-          a.target = "_blank";
-          a.rel = "noopener noreferrer nofollow";
-          renderInline(a, match[1], doc);
+          var a = makeLink(doc, href);
+          renderInline(a, match[1], doc, true);
           parent.appendChild(a);
         } else {
           // Unsafe/relative URL: never linkify; keep the label as plain text.
           parent.appendChild(doc.createTextNode(match[1]));
         }
+      } else if (kind === "autolink") {
+        // Consume only the URL, never the punctuation the sentence put after it.
+        var bare = trimUrlEnd(match[0]);
+        var bareHref = bare ? autoLinkHref(bare) : null;
+        if (bareHref) {
+          var auto = makeLink(doc, bareHref);
+          auto.textContent = bare; // shown exactly as the model wrote it
+          parent.appendChild(auto);
+        } else {
+          parent.appendChild(doc.createTextNode(bare || match[0]));
+        }
+        // `bare` is non-empty for every match this regex can produce, but fall
+        // back to the full match rather than risk a zero-length loop step.
+        consumed = bare ? bare.length : match[0].length;
       } else if (kind === "code") {
         var code = doc.createElement("code");
         code.className = "md-code";
@@ -281,10 +369,10 @@
         parent.appendChild(code);
       } else {
         var el = doc.createElement(kind === "strong" ? "strong" : "em");
-        renderInline(el, match[1], doc);
+        renderInline(el, match[1], doc, inLink);
         parent.appendChild(el);
       }
-      remaining = remaining.slice(match.index + match[0].length);
+      remaining = remaining.slice(match.index + consumed);
     }
   }
 
@@ -292,12 +380,117 @@
   var MD_ORDERED = /^\s*\d+[.)]\s+(.*)$/;
   var MD_HEADING = /^\s*#{1,6}\s+(.*)$/;
 
+  // ---- pipe tables ---------------------------------------------------------
+  //
+  // GFM pipe tables. The model answers "what are the hours" with one, which
+  // makes this the most-read answer in the product; unrendered it is a wall of
+  // pipes and dashes. A table is a header row plus a delimiter row of matching
+  // cell count - the delimiter row is what distinguishes a table from a
+  // paragraph that happens to contain a pipe.
+
+  var MD_TABLE_DELIM_CELL = /^:?-+:?$/;
+
+  /**
+   * Split one pipe-table row into trimmed cells. Outer pipes are optional (both
+   * `| a | b |` and `a | b` are valid GFM) and `\|` is an escaped literal pipe,
+   * not a cell boundary.
+   */
+  function splitTableRow(line) {
+    var s = String(line == null ? "" : line).trim();
+    var cells = [];
+    var buf = "";
+    var i = s.charAt(0) === "|" ? 1 : 0;
+    for (; i < s.length; i++) {
+      var ch = s.charAt(i);
+      if (ch === "\\" && s.charAt(i + 1) === "|") { buf += "|"; i++; continue; }
+      if (ch === "|") { cells.push(buf.trim()); buf = ""; continue; }
+      buf += ch;
+    }
+    // A closing pipe leaves an empty tail: that is the row's end, not a cell.
+    if (buf.trim() !== "" || cells.length === 0) cells.push(buf.trim());
+    return cells;
+  }
+
+  /**
+   * Read a delimiter row's cells as per-column alignments, or null if this is
+   * not a delimiter row. `""` means "no explicit alignment".
+   */
+  function tableAlignments(cells) {
+    var aligns = [];
+    for (var i = 0; i < cells.length; i++) {
+      var c = cells[i];
+      if (!MD_TABLE_DELIM_CELL.test(c)) return null;
+      var left = c.charAt(0) === ":";
+      var right = c.charAt(c.length - 1) === ":";
+      aligns.push(left && right ? "center" : right ? "right" : left ? "left" : "");
+    }
+    return aligns;
+  }
+
+  /**
+   * If `lines[i]` starts a pipe table, return its header cells + column
+   * alignments; otherwise null. A table needs a header row AND a delimiter row
+   * of the same width - that pairing, not the mere presence of a pipe, is the
+   * signal, so prose containing a `|` stays a paragraph.
+   */
+  function tableHeaderAt(lines, i) {
+    if (i + 1 >= lines.length || lines[i].indexOf("|") < 0) return null;
+    var headCells = splitTableRow(lines[i]);
+    if (headCells.length < 2) return null;
+    var aligns = tableAlignments(splitTableRow(lines[i + 1]));
+    if (!aligns || aligns.length !== headCells.length) return null;
+    return { cells: headCells, aligns: aligns };
+  }
+
+  /** Append one row of cells (`th` or `td`), padded/truncated to the header width. */
+  function appendTableRow(parent, cells, aligns, tag, doc) {
+    var tr = doc.createElement("tr");
+    for (var c = 0; c < aligns.length; c++) {
+      var cell = doc.createElement(tag);
+      if (aligns[c]) cell.className = "md-cell--" + aligns[c];
+      renderInline(cell, c < cells.length ? cells[c] : "", doc);
+      tr.appendChild(cell);
+    }
+    parent.appendChild(tr);
+  }
+
   /** Render block-level markdown from `md` as child nodes appended to `parent`. */
   function renderMarkdown(parent, md, doc) {
     var lines = String(md == null ? "" : md).replace(/\r\n?/g, "\n").split("\n");
     var i = 0;
     while (i < lines.length) {
       if (/^\s*$/.test(lines[i])) { i++; continue; } // skip blank lines between blocks
+
+      // Table: a header row + a delimiter row of the same width. Checked first
+      // because it is the only block needing lookahead, and it is unambiguous.
+      var head = tableHeaderAt(lines, i);
+      if (head) {
+        var table = doc.createElement("table");
+        table.className = "md-table";
+        var thead = doc.createElement("thead");
+        appendTableRow(thead, head.cells, head.aligns, "th", doc);
+        table.appendChild(thead);
+
+        var tbody = doc.createElement("tbody");
+        i += 2;
+        while (
+          i < lines.length &&
+          !/^\s*$/.test(lines[i]) &&
+          lines[i].indexOf("|") >= 0
+        ) {
+          appendTableRow(tbody, splitTableRow(lines[i]), head.aligns, "td", doc);
+          i++;
+        }
+        table.appendChild(tbody);
+
+        // Scroll container: a table too wide for the bubble scrolls inside this
+        // wrapper instead of bursting the bubble or squashing its columns.
+        var tableWrap = doc.createElement("div");
+        tableWrap.className = "md-table-wrap";
+        tableWrap.appendChild(table);
+        parent.appendChild(tableWrap);
+        continue;
+      }
 
       var ordered = MD_ORDERED.test(lines[i]);
       var bullet = MD_BULLET.test(lines[i]);
@@ -335,7 +528,8 @@
         !/^\s*$/.test(lines[i]) &&
         !MD_BULLET.test(lines[i]) &&
         !MD_ORDERED.test(lines[i]) &&
-        !MD_HEADING.test(lines[i])
+        !MD_HEADING.test(lines[i]) &&
+        !tableHeaderAt(lines, i) // a table right after prose still starts a table
       ) {
         para.push(lines[i]);
         i++;
@@ -565,6 +759,28 @@
     "  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;",
     "  font-size: 0.9em; background: rgba(0,0,0,0.06); padding: 1px 4px; border-radius: 4px;",
     "}",
+    // Tables. The bubble is ~220px wide on a phone, so the goal is "wrap, don't
+    // squash, and scroll only as a last resort". Three pieces do that:
+    //   - min-width floors a column so it can never squash to one letter a line;
+    //   - overflow-wrap:break-word OVERRIDES the bubble's `anywhere`, which would
+    //     otherwise let the browser compute a 1-character min-content width and
+    //     shred every column to fit;
+    //   - the wrapper scrolls horizontally when those floors genuinely exceed the
+    //     bubble (wide tables), so the table never bursts out of the bubble.
+    ".md-table-wrap { margin: 0 0 8px; max-width: 100%; overflow-x: auto; }",
+    ".md-table {",
+    "  border-collapse: collapse; width: 100%;",
+    "  font-size: 0.92em; line-height: 1.35;",
+    "}",
+    ".md-table th, .md-table td {",
+    "  border: 1px solid #dfe3e8; padding: 4px 7px;",
+    "  text-align: left; vertical-align: top;",
+    "  overflow-wrap: break-word; word-break: normal; min-width: 5.5em;",
+    "}",
+    ".md-table th { background: rgba(0,0,0,0.045); font-weight: 700; }",
+    ".md-cell--left { text-align: left; }",
+    ".md-cell--center { text-align: center; }",
+    ".md-cell--right { text-align: right; }",
     ".md-link { color: var(--accent); font-weight: 600; text-decoration: underline; word-break: break-word; }",
     ".md-link:hover { text-decoration: none; }",
     ".md-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }",
@@ -1135,6 +1351,8 @@
       safeHttpUrl: safeHttpUrl,
       displayUrl: displayUrl,
       renderMarkdown: renderMarkdown,
+      trimUrlEnd: trimUrlEnd,
+      splitTableRow: splitTableRow,
       CONFIG: CONFIG,
       HOST_ID: HOST_ID
     };
