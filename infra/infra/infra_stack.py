@@ -65,6 +65,11 @@ _FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 _DEMO_PAGE_FILE = "demo-site.html"
 _DEMO_API_URL_TOKEN = "__API_URL__"
 _DEMO_WIDGET_SRC_TOKEN = "__WIDGET_SRC__"
+# The demo page's cost meter/estimator reads its rates and measured constants from
+# config.yaml's cost_model block, stamped in here as a JSON literal. Unlike the two URLs
+# above this is a SYNTH-time value (no CDK token), but it goes through the same placeholder
+# mechanism so there is one way the page gets its deploy-time data, not two.
+_DEMO_COST_MODEL_TOKEN = "__COST_MODEL__"
 
 # Repo-root scraper/ directory: the scraper Lambda's source (scraper.py + lambda_function.py)
 # and its requirements.txt (the deps built into the Lambda layer below).
@@ -1084,7 +1089,11 @@ class GavilanChatbotStack(Stack):
             demo_html = (_FRONTEND_DIR / _DEMO_PAGE_FILE).read_text(encoding="utf-8")
             missing = [
                 token
-                for token in (_DEMO_API_URL_TOKEN, _DEMO_WIDGET_SRC_TOKEN)
+                for token in (
+                    _DEMO_API_URL_TOKEN,
+                    _DEMO_WIDGET_SRC_TOKEN,
+                    _DEMO_COST_MODEL_TOKEN,
+                )
                 if token not in demo_html
             ]
             if missing:
@@ -1096,6 +1105,15 @@ class GavilanChatbotStack(Stack):
                     "strings; renaming them here without updating infra_stack.py would deploy "
                     "a demo page that cannot reach the backend."
                 )
+            # The cost model goes in first: it is a JSON literal that legitimately contains
+            # dollar-sign-free numbers only, but substituting it last would risk a rate value
+            # ever containing one of the other placeholders' text. json.dumps with sorted keys
+            # keeps the stamped page byte-stable across synths, so an unchanged config does not
+            # produce a spurious asset diff.
+            demo_html = demo_html.replace(
+                _DEMO_COST_MODEL_TOKEN,
+                json.dumps(config.get("cost_model", {}), sort_keys=True),
+            )
             demo_html = demo_html.replace(_DEMO_WIDGET_SRC_TOKEN, widget_src).replace(
                 _DEMO_API_URL_TOKEN, query_url
             )

@@ -905,14 +905,25 @@ def test_demo_page_embeds_the_production_widget_rather_than_a_copy():
     page = (
         pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
     ).read_text(encoding="utf-8")
-    scripts = re.findall(r"<script\b[^>]*>", page)
-    assert len(scripts) == 1, scripts
-    assert 'src="__WIDGET_SRC__"' in scripts[0], scripts
-    assert 'data-api-url="__API_URL__"' in scripts[0], scripts
+    # EXACTLY ONE script with a src: the widget, from the deploy-stamped CDN URL. That is the
+    # invariant - one external dependency, fetched over the production delivery path.
+    external = re.findall(r"<script\b[^>]*\bsrc\s*=[^>]*>", page)
+    assert len(external) == 1, external
+    assert 'src="__WIDGET_SRC__"' in external[0], external
+    assert 'data-api-url="__API_URL__"' in external[0], external
     # The dev-only offline mock must never be loaded here (demo.html is where that lives).
     assert not re.search(r'src\s*=\s*"[^"]*mock\.js"', page), "the demo must not load the mock"
-    # One script tag total, so there is no inline JS carrying a second copy of anything.
-    assert page.count("<script") == 1 and page.count("</script>") == 1
+
+    # Inline script is allowed for the page's OWN behavior (the cost panel), but it must not
+    # be a second copy of the widget. The original single-script rule was a proxy for that;
+    # this asserts the thing it was protecting directly, so the demo cannot grow a forked
+    # renderer, a canned-answer table, or its own call to /query.
+    inline = "\n".join(re.findall(r"<script(?![^>]*\bsrc\b)[^>]*>(.*?)</script>", page, re.S))
+    for forbidden in ("mount(", "normalizeResponse", "attachShadow", "trigger error"):
+        assert forbidden not in inline, f"inline script must not reimplement the widget: {forbidden}"
+    # The page must never talk to the backend itself; only the widget does.
+    assert "fetch(" not in inline, "the demo page must not call the API directly"
+    assert "__API_URL__" not in inline, "only the widget tag carries the endpoint"
 
 
 def test_demo_site_can_be_turned_off_in_config():
@@ -1197,3 +1208,99 @@ def test_query_role_can_read_catalog_object():
         and "CatalogBucket" in json.dumps(s.get("Resource"))
         for s in stmts
     )
+
+
+# --- demo-site cost model (rates + measured usage, stamped from config) ---------------------
+
+
+def _staged_demo_page(tmp_path):
+    """The demo page AS STAGED FOR DEPLOYMENT: synth to a temp cloud assembly and read the
+    index.html that Source.data wrote. This is the only place the substituted content is
+    observable - the CloudFormation template carries markers, not the file body."""
+    app = core.App(
+        outdir=str(tmp_path), context={"aws:cdk:bundling-stacks": []}
+    )
+    GavilanChatbotStack(app, "GavilanChatbotStack", config=CONFIG)
+    app.synth()
+    pages = [p for p in pathlib.Path(tmp_path).rglob("index.html")]
+    assert pages, "no staged demo page found in the cloud assembly"
+    # One demo page; if a second ever appears the assertion below would be ambiguous.
+    assert len(pages) == 1, pages
+    return pages[0].read_text(encoding="utf-8")
+
+
+def test_cost_model_is_stamped_into_the_page_at_synth_not_hardcoded(tmp_path):
+    # The page must never carry rates or measured constants of its own: config.yaml is the
+    # single source of truth, exactly as it is for every other knob. This asserts the JSON
+    # actually lands in the STAGED page and that the raw placeholder is gone.
+    staged = _staged_demo_page(tmp_path)
+    assert "__COST_MODEL__" not in staged, "the cost-model placeholder must be substituted"
+    # Values that can only have come from config.yaml's cost_model block.
+    rates = CONFIG["cost_model"]["rates"]
+    assert '"generation_input_per_1m": %s' % rates["generation_input_per_1m"] in staged
+    assert '"context_tokens_per_call_base"' in staged
+    assert '"sample_questions": %d' % CONFIG["cost_model"]["measured"]["sample_questions"] in staged
+    # The URL placeholders stay as deploy-time markers at this stage (resolved by the
+    # deployment custom resource, not by synth), so they must still be unresolved here.
+    assert "<<marker:" in staged, "URL placeholders must remain deploy-time markers"
+
+
+def test_demo_page_carries_no_hardcoded_rates_or_measured_constants():
+    # The page's own source must contain the placeholder and nothing that looks like a rate.
+    page = (
+        pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
+    ).read_text(encoding="utf-8")
+    assert "__COST_MODEL__" in page, "the page must read its cost model from the placeholder"
+    # The measured constants and rates live in config; none of them may be spelled here.
+    for leaked in ("10666", "generation_input_per_1m: 3", "3.00 / 1M", "$0.15 /"):
+        assert leaked not in page, f"rate/constant leaked into the page: {leaked}"
+
+
+def test_cost_panel_is_hidden_by_default_and_grouped_with_the_demo_banner():
+    # Requirement: the default experience says nothing about money anywhere, and the one
+    # control reads as demo scaffolding rather than something the college would ship.
+    page = (
+        pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
+    ).read_text(encoding="utf-8")
+    # The panel ships hidden.
+    assert re.search(r'<section class="costpanel" id="cost-panel" hidden', page), page[:200]
+    # The toggle lives INSIDE the demo banner, not in the library masthead/nav/footer.
+    banner = page.split('<div class="demo-banner"', 1)[1].split("</div>\n  </div>", 1)[0]
+    assert 'id="cost-toggle"' in banner, "the cost control must sit in the demo banner"
+    # ...and nowhere else.
+    assert page.count('id="cost-toggle"') == 1
+
+    # No cost wording in the library chrome: masthead, nav, search band, cards, footer.
+    library_chrome = page.split("</section>", 1)[1] if "</section>" in page else page
+    for chrome_tag in ("<header class=\"masthead\"", "<nav class=\"nav\"", "<footer>"):
+        assert chrome_tag in page
+    # The words only appear inside the demo banner + cost panel, never in the sample content.
+    main = page.split("<main>", 1)[1].split("</main>", 1)[0]
+    for word in ("cost", "$", "price", "pricing", "billing"):
+        assert word.lower() not in main.lower(), f"library content must not mention {word!r}"
+
+
+def test_demo_embed_opts_into_usage_events_and_production_embed_does_not():
+    # The demo page opts in explicitly; the tag the CDK output hands the library does not,
+    # so a production embed never asks for the debug payload.
+    page = (
+        pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
+    ).read_text(encoding="utf-8")
+    assert 'data-usage-events="true"' in page
+
+    template = _template()
+    embed = template.find_outputs("WidgetEmbedTag")["WidgetEmbedTag"]["Value"]
+    assert "data-usage-events" not in json.dumps(embed), embed
+
+
+def test_cost_model_reaches_the_page_for_a_fresh_install_in_another_account():
+    # The cost model is synth-time config, so unlike the URLs it must NOT become a marker.
+    # Markers still number exactly the URL placeholders; a regression that turned the JSON
+    # into a marker would break deployment substitution.
+    template = _template()
+    props = _demo_deployment(template)["Properties"]
+    (markers,) = props["SourceMarkers"]
+    page = (
+        pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
+    ).read_text(encoding="utf-8")
+    assert len(markers) == page.count("__API_URL__") + page.count("__WIDGET_SRC__")

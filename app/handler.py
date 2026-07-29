@@ -51,6 +51,12 @@ Wiring comes from env vars set by the CDK stack.
         curated link reads as ungrounded to the eval judge.
     The widget never sets the flag, so its responses are exactly the `{answer, sources}`
     shape above. Nothing here changes what is sent to the model.
+  - When the request sets `include_usage: true`, the response also carries a `usage`
+    object: the BILLABLE units this one question consumed, summed across the whole agent
+    loop (every Converse call, the input guardrail screen, the output backstop on each
+    turn, and each KB retrieval). See _new_usage() for the shape and why each field is
+    there. The demo page's cost meter is the only client that asks for it; the widget
+    never does, so a student's response is byte-identical to what it was before.
 """
 
 import base64
@@ -601,14 +607,20 @@ def _tool_config():
     }
 
 
-def _run_search_tool(tool_input):
+def _run_search_tool(tool_input, usage=None):
     """Execute the search_library_info tool: run KB `Retrieve` on the model's query. Returns
-    (chunks, result_json) where result_json is the toolResult payload handed back to the model."""
+    (chunks, result_json) where result_json is the toolResult payload handed back to the model.
+
+    `usage` is the optional billable-usage tally (see _new_usage); a retrieval that actually
+    runs is counted there. A blank query short-circuits before Retrieve and is not counted,
+    because nothing was billed."""
     query = ""
     if isinstance(tool_input, dict):
         query = (tool_input.get("query") or "").strip()
     if not query:
         return [], {"passages": [], "note": "No search query was provided."}
+    if usage is not None:
+        usage["retrievals"] += 1
     chunks = retrieve(query)
     passages = [{"text": c["text"], "source": c.get("source")} for c in chunks]
     if not passages:
@@ -1307,8 +1319,12 @@ def _log_input_guardrail(response, decision):
     )
 
 
-def _apply_input_guardrail(query):
+def _apply_input_guardrail(query, usage=None):
     """Screen the bare user query BEFORE retrieval via ApplyGuardrail (source=INPUT).
+
+    `usage` is the optional billable-usage tally (see _new_usage). ApplyGuardrail reports the
+    text units it charged in its own response, so the screen's cost is recorded here even when
+    it blocks and the request never reaches Converse.
 
     Returns a (decision, text) pair:
       ("proceed", <query>)          - clean, or PII masked; run retrieval/generation on <query>
@@ -1330,6 +1346,9 @@ def _apply_input_guardrail(query):
     )
     decision = _classify_input_assessment(response)
     _log_input_guardrail(response, decision)
+    if usage is not None:
+        usage["guardrail_calls"] += 1
+        _add_guardrail_units(usage, response.get("usage"))
 
     if decision == "block":
         return "block", _guardrail_output_text(response) or _FALLBACK_BLOCK_MESSAGE
@@ -1418,6 +1437,132 @@ def _tool_call_record(name, tool_input, status, result_json):
     }
 
 
+# --- Billable-usage accounting (opt-in debug payload only) ---------------------------------
+#
+# WHY THIS EXISTS. "What will this cost us" is the question right after "does it work", and
+# nothing in the response could answer it. The hard part is not the arithmetic, it is that one
+# student question is NOT one model call: this is an agentic Converse loop, so a question can
+# be several invocations, and each one resends the whole accumulated conversation (history +
+# system prompt + link table + every tool result so far). Retrieved KB passages ride in those
+# input tokens, and the guardrails bill per text unit on EVERY turn, not once per question.
+# None of that is guessable from the outside - it has to be measured, per request, from what
+# Bedrock itself reports.
+#
+# Everything below is recorded from values the loop already receives in its API responses. It
+# feeds nothing back into the model, changes no request, and is attached to the response only
+# behind the include_usage flag.
+
+
+def _camel_to_snake(name):
+    """`sensitiveInformationPolicyUnits` -> `sensitive_information_policy_units`. Used so an
+    unrecognized guardrail usage field AWS adds later still surfaces, under a readable key,
+    instead of being silently dropped by a hardcoded field list."""
+    out = []
+    for ch in str(name):
+        if ch.isupper():
+            out.append("_")
+            out.append(ch.lower())
+        else:
+            out.append(ch)
+    return "".join(out).lstrip("_")
+
+
+def _new_usage():
+    """A zeroed usage tally for one /query request.
+
+    Fields, and what each is for:
+      model_calls   - Converse invocations in this request's loop. This is the number the
+                      cost model cannot guess: the loop runs until end_turn, so a question
+                      that triggers two tool rounds bills three model calls, each resending
+                      everything before it.
+      input_tokens  - summed Converse inputTokens. Dominated by the resent conversation plus
+                      the retrieved passages, NOT by the student's sentence.
+      output_tokens - summed Converse outputTokens (capped per turn by GENERATION_MAX_TOKENS).
+      cache_*       - prompt-cache reads/writes if the model reports them; kept separate
+                      because they are priced differently from plain input tokens.
+      guardrail_calls / guardrail_units - the input screen plus the output backstop attached
+                      to every Converse turn. Guardrails bill per TEXT UNIT, per policy, so
+                      units are kept per policy name rather than as one number.
+      retrievals    - KB Retrieve calls (the priming one plus any the model made). Each
+                      embeds the query and queries the vector index.
+      tool_calls    - every tool the loop ran, including the non-billable Primo ones. Context
+                      for reading the numbers above, not a billed quantity itself.
+    """
+    return {
+        "model_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "guardrail_calls": 0,
+        "guardrail_units": {},
+        "retrievals": 0,
+        "tool_calls": 0,
+    }
+
+
+# Converse `usage` keys -> our snake_case fields. Only these four are summed; totalTokens is
+# derivable and is deliberately not stored twice.
+_CONVERSE_USAGE_FIELDS = {
+    "inputTokens": "input_tokens",
+    "outputTokens": "output_tokens",
+    "cacheReadInputTokens": "cache_read_input_tokens",
+    "cacheWriteInputTokens": "cache_write_input_tokens",
+}
+
+
+def _add_model_usage(usage, response):
+    """Fold one Converse response's token usage into the running tally. Defensive: a response
+    with no `usage` block still counts as a model call, because the call was still billed."""
+    if usage is None:
+        return
+    usage["model_calls"] += 1
+    reported = response.get("usage") if isinstance(response, dict) else None
+    if not isinstance(reported, dict):
+        return
+    for api_key, field in _CONVERSE_USAGE_FIELDS.items():
+        value = reported.get(api_key)
+        if isinstance(value, int):
+            usage[field] += value
+
+
+def _add_guardrail_units(usage, reported):
+    """Fold one guardrail's per-policy text-unit counts into the running tally.
+
+    `reported` is a Bedrock GuardrailUsage map (contentPolicyUnits, topicPolicyUnits,
+    sensitiveInformationPolicyUnits, sensitiveInformationPolicyFreeUnits, ...). Every integer
+    field is summed under its snake_case name rather than a fixed allowlist, so the policies
+    this deployment does not use simply stay absent and a newly added one still shows up.
+    Guardrail pricing is per policy, so these must not be collapsed into a single number."""
+    if usage is None or not isinstance(reported, dict):
+        return
+    for key, value in reported.items():
+        if isinstance(value, int):
+            field = _camel_to_snake(key)
+            usage["guardrail_units"][field] = usage["guardrail_units"].get(field, 0) + value
+
+
+def _add_converse_guardrail_usage(usage, response):
+    """Pull the OUTPUT backstop's text-unit usage out of a Converse response trace.
+
+    The units live on each assessment's `invocationMetrics.usage`, in the same trace this
+    handler already reads for its PII-safe guardrail logging - so this needs no extra call and
+    no extra permission. It requires guardrail trace to be enabled (config: guardrail.trace);
+    with the trace off there is simply nothing to count and the field stays at zero rather
+    than the request failing."""
+    if usage is None:
+        return
+    counted = False
+    for assessment in _converse_trace_assessments(response.get("trace")):
+        metrics = assessment.get("invocationMetrics")
+        if not isinstance(metrics, dict):
+            continue
+        _add_guardrail_units(usage, metrics.get("usage"))
+        counted = True
+    if counted:
+        usage["guardrail_calls"] += 1
+
+
 # --- Priming retrieval: the KB is the floor of every turn, not a choice --------------------
 #
 # WHY THIS IS MECHANICAL AND NOT A PROMPT RULE. <tools> already says "you do need one before
@@ -1457,7 +1602,7 @@ def _priming_query(messages):
     return query[:_PRIMING_QUERY_MAX_CHARS].strip()
 
 
-def _prime_loop(messages, tool_calls):
+def _prime_loop(messages, tool_calls, usage=None):
     """Retrieve once up front and append the call to `messages` as if the model had made it.
 
     Mutates `messages` (appends the assistant toolUse + user toolResult pair, preserving the
@@ -1471,7 +1616,7 @@ def _prime_loop(messages, tool_calls):
     if not query:
         return []
     try:
-        chunks, result_json = _run_search_tool({"query": query})
+        chunks, result_json = _run_search_tool({"query": query}, usage=usage)
     except Exception as exc:  # noqa: BLE001 - priming is best-effort, never fatal
         print(
             json.dumps(
@@ -1515,10 +1660,12 @@ def _prime_loop(messages, tool_calls):
     tool_calls.append(
         _tool_call_record(SEARCH_TOOL_NAME, {"query": query}, "success", result_json)
     )
+    if usage is not None:
+        usage["tool_calls"] += 1
     return chunks
 
 
-def run_agent(messages):
+def run_agent(messages, usage=None):
     """Agentic Bedrock Converse tool-use loop over four tools (KB search, database catalog,
     live Primo book/media catalog, live Primo course reserves).
 
@@ -1542,7 +1689,11 @@ def run_agent(messages):
     per-query Primo search pages; the curated link block contributes none - see _links_block);
     `tool_calls` is the ordered observability trace of every tool the model invoked (see
     _tool_call_record). The trace is recorded from what the loop already computed - it never
-    changes what is sent to the model."""
+    changes what is sent to the model.
+
+    `usage` is the optional billable-usage tally (see _new_usage), mutated in place as the loop
+    runs. It is the only way to see that ONE question can be several billed model calls, each
+    resending everything before it. Pass None (the default) to skip the accounting entirely."""
     collected_chunks = []
     catalog_sources = []
     tool_calls = []
@@ -1551,7 +1702,7 @@ def run_agent(messages):
     guardrail = _output_guardrail_config()
 
     # Seed the loop with a retrieval the model did not have to decide to make (see _prime_loop).
-    collected_chunks.extend(_prime_loop(messages, tool_calls))
+    collected_chunks.extend(_prime_loop(messages, tool_calls, usage=usage))
 
     for _ in range(MAX_AGENT_ITERATIONS):
         kwargs = {
@@ -1572,6 +1723,10 @@ def run_agent(messages):
 
         response = _bedrock_client().converse(**kwargs)
         _log_guardrail_assessment(response)
+        # Count this turn BEFORE any early return: a turn the output guardrail blocked was
+        # still generated and still billed, and a cost meter that skipped it would understate.
+        _add_model_usage(usage, response)
+        _add_converse_guardrail_usage(usage, response)
 
         if response.get("stopReason") == _GUARDRAIL_STOP_REASON:
             # The OUTPUT guardrail blocked this turn: return its message, drop all sources.
@@ -1610,7 +1765,7 @@ def run_agent(messages):
                 continue
             name = tool_use.get("name")
             if name == SEARCH_TOOL_NAME:
-                chunks, result_json = _run_search_tool(tool_use.get("input"))
+                chunks, result_json = _run_search_tool(tool_use.get("input"), usage=usage)
                 collected_chunks.extend(chunks)
                 status = "success"
             elif name == CATALOG_TOOL_NAME:
@@ -1642,6 +1797,8 @@ def run_agent(messages):
             # Observability only: record what this call was and what it handed back, from the
             # values already computed above. Nothing below is read by the loop.
             tool_calls.append(_tool_call_record(name, tool_use.get("input"), status, result_json))
+            if usage is not None:
+                usage["tool_calls"] += 1
             tool_results.append(
                 {
                     "toolResult": {
@@ -1794,6 +1951,13 @@ def _seed_messages(conversation):
 # actually saw). The answer-quality eval sets it; the widget never does.
 _FULL_CONTEXT_FLAG = "include_full_context"
 
+# Optional request flag: when true, /query additionally returns `usage` - the billable units
+# this one question consumed across the whole loop (see _new_usage). SEPARATE from the flag
+# above on purpose: `full_context` ships every retrieved passage, tens of KB of text nobody
+# needs to price a request, while the cost meter wants ~10 integers. A caller that asks for
+# the full debug payload gets `usage` too, since the loop already tallied it.
+_USAGE_FLAG = "include_usage"
+
 
 def _full_context(chunks):
     """The retrieved passages exactly as they were fed into the model's <context>: full text
@@ -1878,6 +2042,10 @@ def _handle_query(event):
     # Opt-in eval payload: the full retrieved passages, added to the response only when the
     # request explicitly asks (the widget never does, so its responses are unchanged).
     include_full_context = bool(data and data.get(_FULL_CONTEXT_FLAG))
+    # Opt-in cost payload, gated the same way. The tally is only built when someone asked for
+    # it, so a student's request does not even allocate the dict, let alone return it.
+    include_usage = include_full_context or bool(data and data.get(_USAGE_FLAG))
+    usage = _new_usage() if include_usage else None
 
     # Everything past validation touches AWS; wrap it so any fault surfaces as a clean, staged
     # JSON error instead of an opaque 500. `stage` names the step that failed. No retry logic.
@@ -1887,9 +2055,13 @@ def _handle_query(event):
         # blocked here and returns immediately - no retrieval, no generation, no Bedrock spend.
         # PII is masked and we proceed silently on the masked text; the retrieved passages the
         # tool returns are never input-screened, so contact facts survive.
-        decision, screened_query = _apply_input_guardrail(query)
+        decision, screened_query = _apply_input_guardrail(query, usage=usage)
         if decision == "block":
-            return _response(200, {"answer": screened_query, "sources": []})
+            # A blocked query still paid for the guardrail screen, so the meter still reports.
+            blocked = {"answer": screened_query, "sources": []}
+            if include_usage:
+                blocked["usage"] = usage
+            return _response(200, blocked)
         # Replace the newest user turn with the screened text (masked, if the guardrail
         # anonymized PII) before seeding, so the agent runs on the screened question.
         conversation[-1]["text"] = screened_query
@@ -1897,7 +2069,7 @@ def _handle_query(event):
         # generation, and the output-guardrail backstop all happen inside; on any fault this
         # whole step reports as the "agent" stage. Seed it with the trimmed conversation history.
         stage = "agent"
-        result = run_agent(_seed_messages(conversation))
+        result = run_agent(_seed_messages(conversation), usage=usage)
     except Exception as exc:  # noqa: BLE001 - deliberately broad: any AWS/runtime fault
         return _error_response(stage, exc)
 
@@ -1927,6 +2099,8 @@ def _handle_query(event):
         # no supporting evidence anywhere in the payload and marks a correct, curated link as
         # ungrounded - a silent scoring regression that would read as a quality drop.
         payload["library_links"] = [_link_entry(e) for e in _LIBRARY_LINKS]
+    if include_usage:
+        payload["usage"] = usage
     return _response(200, payload)
 
 
