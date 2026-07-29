@@ -1132,16 +1132,45 @@ test("the title uses the Bitter font, loaded from Google Fonts", () => {
   assert.ok(/ensureTitleFont\(/.test(SOURCE), "font link is injected at mount");
 });
 
-// --- softened focus ring on the composer --------------------------------
-test("the text box focus ring is a softened tint of the brand, not full-strength", () => {
+// --- two-tone focus ring ------------------------------------------------
+//
+// REPLACES the test that pinned the composer's softened brand-tinted OUTLINE. That tint
+// measured 2.09:1 against the page behind it and failed WCAG 1.4.11, which wants 3:1 -
+// and no single flat colour clears 3:1 on every surface this ring lands on, because the
+// widget cannot know its host page's background and the launcher's own fill is a dark
+// maroon. So the outline is now a dark ink ring PLUS a light halo filling the
+// outline-offset gap: whichever background it lands on, one of the two carries the
+// contrast. The composer keeps its brand-tinted BORDER, which already measured 3.09:1
+// and is what makes a focused field still look like this widget rather than the browser.
+test("focus rings are two-tone (dark ring + light halo) so they hold 3:1 on any background", () => {
+  var flat = SOURCE.replace(/\n/g, " ");
   assert.ok(
-    /\.composer__input:focus-visible\s*\{[\s\S]*color-mix\(in srgb, var\(--brand\)/.test(SOURCE),
-    "composer focus outline uses a translucent color-mix of --brand"
+    /--focus-ring:\s*#[0-9a-fA-F]{6};\s*--focus-halo:\s*#[0-9a-fA-F]{6};/.test(SOURCE),
+    "the ring's two colours are defined as tokens"
   );
-  // It must NOT be the old full-strength solid accent outline.
+
+  // Every control whose ring the audit measured below 3:1 now uses both halves.
+  ["\\.launcher", "\\.composer__send", "\\.composer__input", "\\.suggestion", "\\.retry"].forEach(
+    function (sel) {
+      var rule = new RegExp(sel + ":focus-visible \\{[^}]*\\}").exec(flat);
+      assert.ok(rule, sel + " has a :focus-visible rule");
+      assert.ok(/outline: \dpx solid var\(--focus-ring\)/.test(rule[0]), sel + " outlines with --focus-ring");
+      assert.ok(/box-shadow: 0 0 0 \dpx var\(--focus-halo\)/.test(rule[0]), sel + " draws the halo");
+    }
+  );
+
+  // The pale blue that failed at 1.77:1 is gone from the file entirely.
+  assert.ok(!/#9ec5ff/i.test(SOURCE), "the old pale-blue ring colour is removed");
+  // The launcher's drop shadow has to be re-declared alongside its halo, or focusing it
+  // would silently delete the shadow (one box-shadow declaration replaces the other).
   assert.ok(
-    !/\.composer__input:focus-visible\s*\{\s*outline:\s*2px solid var\(--accent\)/.test(SOURCE),
-    "no full-strength solid accent outline remains"
+    /\.launcher:focus-visible \{[^}]*box-shadow: 0 0 0 2px var\(--focus-halo\), 0 6px 20px/.test(flat),
+    "the launcher keeps its drop shadow while focused"
+  );
+  // The composer's brand-tinted border survives the change.
+  assert.ok(
+    /\.composer__input:focus-visible \{[^}]*border-color: color-mix\(in srgb, var\(--brand\)/.test(flat),
+    "the focused text box still tints its border with the brand"
   );
 });
 
@@ -1198,6 +1227,445 @@ test("suggestions disappear after a typed message and do not come back", async (
   } finally {
     restore();
   }
+});
+
+// =========================================================================
+// ===  accessibility: WCAG 2.1 AA remediation (docs/accessibility-audit.md) ==
+// =========================================================================
+//
+// One test per audit finding that changed behaviour, so a later edit that undoes one
+// fails by name. Announcement itself is NOT asserted anywhere here - no screen reader
+// runs in CI - so these pin the STRUCTURE the audit found missing: a speaker label in
+// the tree, text inside the status region, focus that cannot leave an open panel.
+
+// The shared DOM fake predates these behaviours: focus containment needs
+// querySelectorAll + closest, the document-level Escape needs addEventListener on the
+// document, and the first-launch description needs removeAttribute. This augments a
+// fake doc for the tests below rather than changing the fake the rest of the file uses.
+function matchesFocusable(el, sel) {
+  var tag = String(el.tagName || "").toLowerCase();
+  var m = /^([a-z]+):not\(\[disabled\]\)$/.exec(sel);
+  if (m) return tag === m[1] && !el.disabled && el.getAttribute("disabled") === null;
+  if (sel === "a[href]") return tag === "a" && !!el.href;
+  if (sel === '[tabindex]:not([tabindex="-1"])') {
+    var t = el.getAttribute("tabindex");
+    return t !== null && t !== "-1";
+  }
+  throw new Error("the fake selector matcher does not understand: " + sel);
+}
+
+function augmentEl(el, doc) {
+  el.removeAttribute = function (k) { delete el.attrs[k]; };
+  el.focus = function () { doc.focused = el; };
+  el.querySelectorAll = function (selector) {
+    var parts = selector.split(",").map(function (s) { return s.trim(); });
+    var out = [];
+    (function walk(n) {
+      (n.children || []).forEach(function (c) {
+        if (c.nodeType !== 1) return;
+        var hit = parts.some(function (p) { return matchesFocusable(c, p); });
+        if (hit) out.push(c);   // pre-order, so the result is in DOM order
+        walk(c);
+      });
+    })(el);
+    return out;
+  };
+  el.closest = function (selector) {
+    if (selector !== "[hidden]") throw new Error("fake closest only handles [hidden]");
+    var n = el;
+    while (n && n.nodeType === 1) {
+      if (n.hidden === true) return n;
+      n = n.parentNode;
+    }
+    return null;
+  };
+  return el;
+}
+
+function makeFocusDoc() {
+  var doc = makeDoc();
+  var docListeners = {};
+  doc.focused = null;
+  doc.addEventListener = function (t, fn) { (docListeners[t] = docListeners[t] || []).push(fn); };
+  doc.fire = function (t, ev) {
+    ev = ev || {};
+    ev.preventDefault = ev.preventDefault || function () { ev.prevented = true; };
+    ev.stopPropagation = ev.stopPropagation || function () { ev.propagationStopped = true; };
+    (docListeners[t] || []).slice().forEach(function (fn) { fn(ev); });
+    return ev;
+  };
+  var create = doc.createElement;
+  doc.createElement = function (tag) { return augmentEl(create(tag), doc); };
+  var createNS = doc.createElementNS;
+  doc.createElementNS = function (ns, tag) { return augmentEl(createNS(ns, tag), doc); };
+  return doc;
+}
+
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+function findTypingBubble(shadow) {
+  var msgs = findAll(shadow, "msg");
+  for (var i = 0; i < msgs.length; i++) {
+    if (msgs[i].getAttribute("data-typing") === "1") return findByClass(msgs[i], "bubble");
+  }
+  return null;
+}
+
+// --- F1: speaker attribution (1.3.1) ------------------------------------
+test("every message turn carries a visually-hidden speaker label", async () => {
+  var restore = withNetwork(okJson({ answer: "Open 9-5.", sources: [] }));
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    handle.submit("hours?");
+    await flush();
+
+    var msgs = findAll(handle.shadow, "msg");
+    assert.strictEqual(msgs.length, 3, "greeting, the question, the answer");
+    msgs.forEach(function (m) {
+      var label = findByClass(m, "sr-only");
+      assert.ok(label, "each turn has an .sr-only label: " + m.className);
+      // It has to be FIRST, so it is read before the message it introduces.
+      assert.strictEqual(m.children[0], label, "the label leads the turn");
+      var expected = /msg--user/.test(m.className) ? "You said:" : "Library assistant said:";
+      assert.strictEqual(label.textContent, expected);
+    });
+
+    // The bubble itself is untouched: the label is a sibling, not a prefix on the text.
+    var userBubble = findByClass(findAll(handle.shadow, "msg--user")[0], "bubble");
+    assert.strictEqual(userBubble.textContent, "hours?");
+
+    // ...and .sr-only really is visually hidden, not just named that.
+    assert.ok(/\.sr-only \{[^}]*position: absolute;[^}]*clip: rect\(0 0 0 0\)/.test(SOURCE.replace(/\n/g, " ")),
+      ".sr-only is clipped out of the visual layout");
+  } finally {
+    restore();
+  }
+});
+
+// --- F2: the pending state's live region (4.1.3) ------------------------
+test("the pending state's status region carries text, and the slow note is INSERTED into it", async () => {
+  var restore = withNetwork(function () { return new Promise(function () {}); }); // never settles
+  var priorDelay = widget.CONFIG.wakingHintDelayMs;
+  widget.CONFIG.wakingHintDelayMs = 10; // 6s is the shipped value; too slow for a test
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    handle.submit("hold this open");
+
+    var bubble = findTypingBubble(handle.shadow);
+    assert.ok(bubble, "a pending indicator is rendered");
+    // The message is CONTENT, not an aria-label on an element whose only children are
+    // aria-hidden dots - that was the failure: a live region with nothing to announce.
+    assert.strictEqual(bubble.getAttribute("role"), "status");
+    assert.strictEqual(bubble.getAttribute("aria-label"), null, "no aria-label to override the content");
+    assert.ok(bubble.textContent.indexOf("Assistant is typing") >= 0, "the region has text");
+    assert.ok(bubble.textContent.length > 0);
+    findAll(bubble, "dot").forEach(function (d) {
+      assert.strictEqual(d.getAttribute("aria-hidden"), "true", "the dots stay decorative");
+    });
+    assert.strictEqual(findByClass(bubble, "typing__hint"), null, "the slow note does not pre-exist");
+
+    await sleep(40);
+    var hint = findByClass(bubble, "typing__hint");
+    assert.ok(hint, "the slow note is created and appended INSIDE the status region");
+    assert.strictEqual(hint.hidden, false, "it is a fresh node, not an un-hidden one");
+    assert.ok(bubble.textContent.indexOf("Working…") >= 0, "the region's text changed");
+  } finally {
+    widget.CONFIG.wakingHintDelayMs = priorDelay;
+    restore();
+  }
+});
+
+test("the thread's live region is untouched: polite log, additions only, aria-atomic unset", () => {
+  var doc = makeDoc();
+  var handle = widget.mount(doc);
+  var thread = findByClass(handle.shadow, "thread");
+  assert.strictEqual(thread.getAttribute("role"), "log");
+  assert.strictEqual(thread.getAttribute("aria-live"), "polite");
+  assert.strictEqual(thread.getAttribute("aria-relevant"), "additions");
+  // If this is ever set, every update re-reads the whole conversation.
+  assert.strictEqual(thread.getAttribute("aria-atomic"), null, "aria-atomic must stay unset");
+});
+
+// --- F4: focus containment and Escape (2.4.3) ---------------------------
+test("Escape closes the panel from OUTSIDE it, and from inside still stops at the widget", () => {
+  var doc = makeFocusDoc();
+  var handle = widget.mount(doc);
+  var panel = findByClass(handle.shadow, "panel");
+  var launcher = findByClass(handle.shadow, "launcher");
+  assert.strictEqual(panel.getAttribute("aria-modal"), "true", "the panel declares itself modal");
+
+  // Closed: the document listener must not fire on a stray Escape.
+  doc.focused = null;
+  doc.fire("keydown", { key: "Escape" });
+  assert.strictEqual(doc.focused, null, "Escape does nothing while the panel is closed");
+
+  // Open, with focus on a host-page control: the panel's own handler never sees the key,
+  // which is exactly the case that used to leave the panel stuck open.
+  handle.open();
+  assert.strictEqual(panel.hidden, false);
+  var outside = doc.fire("keydown", { key: "Escape" });
+  assert.strictEqual(panel.hidden, true, "Escape from outside the panel closes it");
+  assert.strictEqual(doc.focused, launcher, "closing returns focus to the launcher");
+  assert.ok(!outside.propagationStopped, "a host-page Escape is not swallowed by the widget");
+
+  // From inside, the panel's own handler closes it AND keeps the key off the host page.
+  handle.open();
+  var stopped = 0;
+  panel.fire("keydown", { key: "Escape", stopPropagation: function () { stopped++; } });
+  assert.strictEqual(panel.hidden, true, "Escape from inside still closes");
+  assert.strictEqual(stopped, 1, "Escape typed in the panel does not reach host-page handlers");
+});
+
+test("Tab and Shift+Tab wrap at the open panel's edges instead of walking into the host page", async () => {
+  var restore = withNetwork(okJson({ answer: "A", sources: [{ uri: "https://gav.edu/x", excerpt: "e" }] }));
+  try {
+    var doc = makeFocusDoc();
+    var handle = widget.mount(doc);
+    var panel = findByClass(handle.shadow, "panel");
+    var expand = findByClass(handle.shadow, "header__expand");
+    var send = findByClass(handle.shadow, "composer__send");
+    var input = findByClass(handle.shadow, "composer__input");
+    handle.open();
+
+    // The shared fake's default preventDefault is a no-op, so bring a spy.
+    function tab(shift) {
+      var ev = { key: "Tab", shiftKey: !!shift, preventDefault: function () { ev.prevented = true; } };
+      panel.fire("keydown", ev);
+      return ev;
+    }
+
+    // At the last control, Tab wraps to the first instead of leaving the panel.
+    handle.shadow.activeElement = send;
+    doc.focused = null;
+    assert.ok(tab().prevented, "Tab at the last control is intercepted");
+    assert.strictEqual(doc.focused, expand, "...and wraps to the first control");
+
+    // At the first control, Shift+Tab wraps to the last.
+    handle.shadow.activeElement = expand;
+    doc.focused = null;
+    assert.ok(tab(true).prevented, "Shift+Tab at the first control is intercepted");
+    assert.strictEqual(doc.focused, send, "...and wraps to the last control");
+
+    // Away from an edge, the browser's own focus order is left alone.
+    handle.shadow.activeElement = input;
+    doc.focused = null;
+    assert.ok(!tab().prevented, "a mid-panel Tab is not intercepted");
+    assert.strictEqual(doc.focused, null);
+
+    // The edges are recomputed per keypress, not cached: an answer arrives with a
+    // collapsed sources list (full of links that are NOT tabbable while hidden), and
+    // Send disables itself while the next request is pending, which moves the last edge.
+    handle.submit("hours?");
+    await flush();
+    handle.shadow.activeElement = send;
+    doc.focused = null;
+    tab();
+    assert.strictEqual(doc.focused, expand, "a collapsed disclosure's links are not panel edges");
+
+    var pending = withNetwork(function () { return new Promise(function () {}); });
+    try {
+      handle.submit("now hold");
+      assert.strictEqual(send.disabled, true, "Send is disabled while pending");
+      handle.shadow.activeElement = input; // the textarea is the last enabled control now
+      doc.focused = null;
+      assert.ok(tab().prevented, "the last edge followed the disabled Send");
+      assert.strictEqual(doc.focused, expand);
+    } finally {
+      pending();
+    }
+  } finally {
+    restore();
+  }
+});
+
+// --- F14: label in name (2.5.3) -----------------------------------------
+test("the launcher's accessible name contains its visible label", () => {
+  var doc = makeDoc();
+  var handle = widget.mount(doc);
+  var launcher = findByClass(handle.shadow, "launcher");
+  // No aria-label: the button's own text IS the name, so "click Ask the Library" works.
+  assert.strictEqual(launcher.getAttribute("aria-label"), null, "no aria-label overriding the text");
+  assert.ok(
+    launcher.textContent.indexOf(widget.CONFIG.launcherLabel) >= 0,
+    "the visible label is the accessible name"
+  );
+  assert.ok(!/Open the library chat/.test(SOURCE), "the overriding label string is gone");
+  // What that label used to hint at is now carried by a standard attribute instead.
+  assert.strictEqual(launcher.getAttribute("aria-haspopup"), "dialog");
+});
+
+// --- F7: the error bubble's palette actually applies --------------------
+test("the error bubble's styling wins the specificity fight it used to lose", async () => {
+  var flat = SOURCE.replace(/\n/g, " ");
+  // `.msg--bot .bubble` is (0,2,0); a bare `.bubble--error` is (0,1,0) and lost every time.
+  assert.ok(
+    /\.msg--bot \.bubble\.bubble--error \{[^}]*background: var\(--error-bg\)[^}]*color: var\(--error-ink\)/.test(flat),
+    "the error rule is scoped two classes deep so it outranks .msg--bot .bubble"
+  );
+  assert.ok(
+    !/(^|[^.\w])\.bubble--error \{/.test(flat),
+    "no single-class .bubble--error rule remains to be silently overridden"
+  );
+
+  var restore = withNetwork(function () { return Promise.reject(new Error("network down")); });
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    handle.submit("hours?");
+    await flush();
+    var bubble = findByClass(handle.shadow, "bubble--error");
+    assert.ok(bubble, "a failed send renders an error bubble");
+    assert.ok(/\bbubble\b/.test(bubble.className) && /bubble--error/.test(bubble.className),
+      "it carries both classes the selector needs");
+  } finally {
+    restore();
+  }
+});
+
+// --- F16: the retry button is where focus goes ---------------------------
+test("a failed send moves focus to Try again, which sits BEHIND the composer in tab order", async () => {
+  var restore = withNetwork(function () { return Promise.reject(new Error("network down")); });
+  try {
+    var doc = makeFocusDoc();
+    var handle = widget.mount(doc);
+    handle.open();
+    handle.submit("hours?");
+    await flush();
+    var retry = findByClass(handle.shadow, "retry");
+    assert.ok(retry, "a retry button is rendered");
+    assert.strictEqual(doc.focused, retry, "focus lands on retry, not back in the composer");
+  } finally {
+    restore();
+  }
+});
+
+// --- F9 / F10: heading and table semantics (1.3.1) ----------------------
+test("markdown headings render as real h3-h6 elements, sized like body text", () => {
+  var r = renderInfo("# One\n\n## Two\n\n### Three\n\n#### Four\n\n##### Five");
+  var tags = [];
+  (function walk(n) {
+    if (/^h[1-6]$/.test(String(n.tagName))) tags.push(n.tagName + ":" + n.textContent);
+    (n.children || []).forEach(walk);
+  })(r.root);
+  // Offset by two: the host page owns h1/h2. Deeper levels clamp at h6.
+  assert.deepStrictEqual(tags, ["h3:One", "h4:Two", "h5:Three", "h6:Four", "h6:Five"]);
+  assert.strictEqual(collectByTag(r.root, "p").length, 0, "no heading renders as a paragraph");
+  // The class stays, and the rule pins font-size so a real h5/h6 does not shrink.
+  assert.ok(/\.md-heading \{[^}]*font-size: 1em/.test(SOURCE.replace(/\n/g, " ")),
+    "heading font-size is pinned to the body size");
+});
+
+test("table header cells declare scope=col", () => {
+  var r = renderInfo("| Day | Hours |\n|---|---|\n| Mon | 9-5 |");
+  var th = collectByTag(r.root, "th");
+  assert.deepStrictEqual(th.map(function (c) { return c.getAttribute("scope"); }), ["col", "col"]);
+  collectByTag(r.root, "td").forEach(function (c) {
+    assert.strictEqual(c.getAttribute("scope"), null, "data cells get no scope");
+  });
+});
+
+// --- F3: the greeting is offered on first launch ------------------------
+test("the greeting describes the composer on first launch, and stops after the first message", async () => {
+  var restore = withNetwork(okJson({ answer: "A", sources: [] }));
+  try {
+    var doc = makeFocusDoc();
+    var handle = widget.mount(doc);
+    var input = findByClass(handle.shadow, "composer__input");
+    var id = input.getAttribute("aria-describedby");
+    assert.ok(id, "the composer is described on first launch");
+    // Both ends of the reference are inside the shadow root, which is the only way an
+    // id-based ARIA reference resolves here.
+    var greeting = findAll(handle.shadow, "bubble").filter(function (b) { return b.id === id; })[0];
+    assert.ok(greeting, "the reference resolves inside the same shadow root");
+    assert.ok(greeting.textContent.indexOf("Gavilan College Library assistant") >= 0);
+
+    handle.submit("hours?");
+    await flush();
+    assert.strictEqual(
+      input.getAttribute("aria-describedby"), null,
+      "a fixed description would be re-read on every refocus, so it is dropped"
+    );
+  } finally {
+    restore();
+  }
+});
+
+// --- F8: the widget declares its own language ---------------------------
+test("the widget declares its own language rather than inheriting the host page's", () => {
+  var doc = makeDoc();
+  var handle = widget.mount(doc);
+  assert.strictEqual(findByClass(handle.shadow, "root").lang, "en");
+});
+
+// --- 1.4.11 / 1.4.3: the numbers, computed from the shipped values ------
+//
+// The browser measurement lives in the audit doc; this recomputes the same WCAG
+// arithmetic from the colour values actually in the file, so a later "just darken it a
+// bit" edit that drops one below its floor fails here instead of in an external audit.
+function relLum(hex) {
+  var h = hex.replace("#", "");
+  var ch = [0, 2, 4].map(function (i) {
+    var v = parseInt(h.slice(i, i + 2), 16) / 255;
+    return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  });
+  return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2];
+}
+function contrast(a, b) {
+  var la = relLum(a), lb = relLum(b);
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+function token(name) {
+  var m = new RegExp("--" + name + ":\\s*(#[0-9a-fA-F]{6})").exec(SOURCE);
+  assert.ok(m, "--" + name + " is defined in the stylesheet");
+  return m[1].toLowerCase();
+}
+
+test("the focus ring clears 3:1 on every background it can land on (1.4.11)", () => {
+  var ring = token("focus-ring");
+  var halo = token("focus-halo");
+  var brand = token("brand");
+  // White host page, the demo page, and the widget's own thread: the dark half carries it.
+  ["#ffffff", "#f6f4f2", "#fafbfc"].forEach(function (bg) {
+    assert.ok(contrast(ring, bg) >= 3, "ring vs " + bg + " = " + contrast(ring, bg).toFixed(2) + ":1");
+  });
+  // Against the maroon launcher/Send fill the dark half cannot, so the halo does.
+  assert.ok(contrast(ring, brand) < 3, "the dark half alone does NOT clear the maroon fill");
+  assert.ok(contrast(halo, brand) >= 3, "halo vs the brand fill = " + contrast(halo, brand).toFixed(2) + ":1");
+  // The two halves contrast with each other, which is what makes this robust on a host
+  // page whose background the widget cannot know (including a dark one).
+  assert.ok(contrast(ring, halo) >= 3, "the ring contrasts with its own halo");
+});
+
+test("control boundaries and the typing dots clear 3:1 (1.4.11)", () => {
+  var line = token("line");
+  [
+    ["#ffffff", "composer strip"],
+    ["#fafbfc", "thread behind a suggestion chip"],
+    ["#f1f3f6", "bot bubble behind the typing dots"]
+  ].forEach(function (row) {
+    assert.ok(
+      contrast(line, row[0]) >= 3,
+      "--line vs " + row[1] + " = " + contrast(line, row[0]).toFixed(2) + ":1"
+    );
+  });
+  // The old values that failed are gone from the file.
+  assert.ok(!/#9aa4b0/i.test(SOURCE), "the 2.27:1 typing-dot grey is removed");
+  assert.ok(!/#c8cfd8/i.test(SOURCE), "the 1.57:1 composer border grey is removed");
+  // ...and the three controls that needed it actually use the token.
+  var flat = SOURCE.replace(/\n/g, " ");
+  assert.ok(/\.typing \.dot \{[^}]*background: var\(--line\)/.test(flat), "typing dots use --line");
+  assert.ok(/\.composer__input \{[^}]*border: 1px solid var\(--line\)/.test(flat), "composer border uses --line");
+  assert.ok(/\.suggestion \{[^}]*border: 1px solid var\(--line\)/.test(flat), "suggestion chips use --line");
+});
+
+test("the error palette that now renders still passes 4.5:1 (1.4.3)", () => {
+  var bg = token("error-bg");
+  var ink = token("error-ink");
+  assert.ok(contrast(ink, bg) >= 4.5, "error text = " + contrast(ink, bg).toFixed(2) + ":1");
+  // The retry button borrows the same ink for its text and border.
+  assert.ok(/\.retry \{[^}]*color: var\(--error-ink\)/.test(SOURCE.replace(/\n/g, " ")));
 });
 
 run();

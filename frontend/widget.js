@@ -444,7 +444,12 @@
 
   var MD_BULLET = /^\s*[-*+]\s+(.*)$/;
   var MD_ORDERED = /^\s*\d+[.)]\s+(.*)$/;
-  var MD_HEADING = /^\s*#{1,6}\s+(.*)$/;
+  // The `#` run is captured so a markdown heading can become a real h3-h6 element
+  // rather than a bold paragraph: a user who navigates by heading gets nothing from
+  // a <p>. Offset by two because the widget is embedded in a host page that owns the
+  // h1/h2 levels, and clamped at h6.
+  var MD_HEADING = /^\s*(#{1,6})\s+(.*)$/;
+  var MD_HEADING_BASE_LEVEL = 2;
 
   // ---- pipe tables ---------------------------------------------------------
   //
@@ -513,6 +518,9 @@
     var tr = doc.createElement("tr");
     for (var c = 0; c < aligns.length; c++) {
       var cell = doc.createElement(tag);
+      // A single header row inside <thead> is usually inferred correctly, but saying
+      // it costs one attribute and removes the guess (1.3.1).
+      if (tag === "th") cell.setAttribute("scope", "col");
       if (aligns[c]) cell.className = "md-cell--" + aligns[c];
       renderInline(cell, c < cells.length ? cells[c] : "", doc);
       tr.appendChild(cell);
@@ -578,9 +586,10 @@
 
       var hm = MD_HEADING.exec(lines[i]);
       if (hm) {
-        var heading = doc.createElement("p");
+        var level = Math.min(6, hm[1].length + MD_HEADING_BASE_LEVEL);
+        var heading = doc.createElement("h" + level);
         heading.className = "md-heading";
-        renderInline(heading, hm[1], doc);
+        renderInline(heading, hm[2], doc);
         parent.appendChild(heading);
         i++;
         continue;
@@ -715,6 +724,18 @@
     "  --user-bg: var(--brand); --user-ink: #ffffff;",
     "  --bot-bg: #f1f3f6; --bot-ink: #1a1d21;",
     "  --muted: #5b6570; --error-bg: #fdecea; --error-ink: #8a1c12;",
+    // Two-tone focus ring (WCAG 1.4.11). No single flat colour reaches 3:1 against
+    // every surface the ring can land on - a white host page, the thread, and the
+    // maroon launcher/Send fill pull in opposite directions - so the ring is a dark
+    // outline PLUS a light halo filling the outline-offset gap. Whichever background
+    // it lands on, one of the two carries the 3:1 contrast, and the pair contrasts
+    // with itself (16.9:1), so it also survives a dark host page.
+    "  --focus-ring: #1a1d21; --focus-halo: #ffffff;",
+    // Boundary/indicator grey that clears the 1.4.11 3:1 floor on all three light
+    // surfaces it is drawn on (white composer, #fafbfc thread, #f1f3f6 bot bubble).
+    // The decorative --panel-border stays light: container edges and table rules are
+    // exempt, and the panel's drop shadow does its separating work.
+    "  --line: #7d8894;",
     "  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;",
     "  font-size: 15px; line-height: 1.45; color: var(--bot-ink);",
     // Inherited properties (text-transform, letter-spacing) cross the shadow
@@ -733,7 +754,12 @@
     "  box-shadow: 0 6px 20px rgba(0,0,0,0.22);",
     "}",
     ".launcher:hover { filter: brightness(1.07); }",
-    ".launcher:focus-visible { outline: 3px solid #9ec5ff; outline-offset: 2px; }",
+    // The halo is a box-shadow ring, so the launcher's drop shadow is re-declared
+    // here (a second box-shadow declaration would replace it, not add to it).
+    ".launcher:focus-visible {",
+    "  outline: 3px solid var(--focus-ring); outline-offset: 2px;",
+    "  box-shadow: 0 0 0 2px var(--focus-halo), 0 6px 20px rgba(0,0,0,0.22);",
+    "}",
     ".launcher__icon { display: inline-flex; font-size: 18px; line-height: 1; }",
     // SVG icons: size to 1em of their control, inherit color via currentColor.
     ".launcher__icon svg, .header__expand svg, .sources__caret svg { display: block; width: 1em; height: 1em; }",
@@ -792,7 +818,10 @@
     "}",
     ".msg--user .bubble { background: var(--user-bg); color: var(--user-ink); border-bottom-right-radius: 4px; }",
     ".msg--bot .bubble { background: var(--bot-bg); color: var(--bot-ink); border-bottom-left-radius: 4px; }",
-    ".bubble--error { background: var(--error-bg); color: var(--error-ink); }",
+    // Two classes deep on purpose: `.msg--bot .bubble` (0,2,0) beat a bare
+    // `.bubble--error` (0,1,0) regardless of source order, so the error palette
+    // never rendered and a failed send looked exactly like an answer.
+    ".msg--bot .bubble.bubble--error { background: var(--error-bg); color: var(--error-ink); }",
     // sources - per message, collapsed behind a disclosure toggle
     ".sources { margin-top: 8px; padding-top: 8px; border-top: 1px solid #dfe3e8; }",
     ".sources__toggle {",
@@ -818,7 +847,10 @@
     ".md > :first-child { margin-top: 0; }",
     ".md > :last-child { margin-bottom: 0; }",
     ".md-p { margin: 0 0 8px; }",
-    ".md-heading { margin: 0 0 8px; font-weight: 700; }",
+    // Real h3-h6 elements now (1.3.1), so font-size is pinned to the body size:
+    // otherwise the user-agent's heading sizes would make an h5/h6 SMALLER than
+    // the surrounding text. Visual result is byte-identical to the old <p>.
+    ".md-heading { margin: 0 0 8px; font-size: 1em; font-weight: 700; }",
     ".md-list { margin: 0 0 8px; padding-left: 20px; }",
     ".md-list li { margin: 2px 0; }",
     ".md-code {",
@@ -852,14 +884,13 @@
     ".md-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }",
     // typing indicator
     ".typing { display: inline-flex; gap: 4px; align-items: center; padding: 4px 2px; }",
-    ".typing .dot { width: 7px; height: 7px; border-radius: 50%; background: #9aa4b0; animation: gv-blink 1.2s infinite ease-in-out; }",
+    ".typing .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--line); animation: gv-blink 1.2s infinite ease-in-out; }",
     ".typing .dot:nth-child(2) { animation-delay: .2s; }",
     ".typing .dot:nth-child(3) { animation-delay: .4s; }",
     "@keyframes gv-blink { 0%, 80%, 100% { opacity: .3; } 40% { opacity: 1; } }",
     "@media (prefers-reduced-motion: reduce) { .typing .dot { animation: none; } }",
     // honest slow-start hint (shown only after a delay under the typing dots)
     ".typing__hint { margin-top: 6px; font-size: 12.5px; color: var(--muted); }",
-    ".typing__hint[hidden] { display: none; }",
     // retry
     ".retry {",
     "  margin-top: 8px; appearance: none; border: 1px solid currentColor;",
@@ -867,6 +898,12 @@
     "  font-size: 13px; font-weight: 600; padding: 4px 10px; border-radius: 8px;",
     "}",
     ".retry:hover { background: rgba(138,28,18,0.08); }",
+    // Retry was the one control with no widget-defined ring, so it fell back to
+    // whatever the browser ships. Same two-tone treatment as every other control.
+    ".retry:focus-visible {",
+    "  outline: 2px solid var(--focus-ring); outline-offset: 2px;",
+    "  box-shadow: 0 0 0 2px var(--focus-halo);",
+    "}",
     // composer
     ".composer {",
     "  display: flex; gap: 8px; align-items: flex-end;",
@@ -874,15 +911,17 @@
     "}",
     ".composer__input {",
     "  flex: 1 1 auto; resize: none; max-height: 120px; min-height: 40px;",
-    "  padding: 9px 11px; border: 1px solid #c8cfd8; border-radius: 10px;",
+    "  padding: 9px 11px; border: 1px solid var(--line); border-radius: 10px;",
     "  font: inherit; color: inherit; background: #fff;",
     "}",
-    // Soft focus ring: a translucent tint of --brand instead of the full-strength red, so the
-    // text box highlight on focus reads gently rather than harsh/bold. Derived from --brand so
-    // it still tracks the single color token.
+    // Two-tone ring, thinner than the buttons' so the text box still reads gently. The
+    // brand-tinted border-color is kept from the old softened treatment: at 3.09:1 it
+    // already cleared 1.4.11 on its own, and it is what makes a focused field look like
+    // this widget rather than like the browser default.
     ".composer__input:focus-visible {",
-    "  outline: 2px solid color-mix(in srgb, var(--brand) 38%, transparent);",
-    "  outline-offset: 0;",
+    "  outline: 2px solid var(--focus-ring);",
+    "  outline-offset: 1px;",
+    "  box-shadow: 0 0 0 1px var(--focus-halo);",
     "  border-color: color-mix(in srgb, var(--brand) 55%, transparent);",
     "}",
     ".composer__send {",
@@ -892,18 +931,24 @@
     "}",
     ".composer__send:hover:not(:disabled) { filter: brightness(1.07); }",
     ".composer__send:disabled { opacity: .5; cursor: default; }",
-    ".composer__send:focus-visible { outline: 3px solid #9ec5ff; outline-offset: 2px; }",
+    ".composer__send:focus-visible {",
+    "  outline: 3px solid var(--focus-ring); outline-offset: 2px;",
+    "  box-shadow: 0 0 0 2px var(--focus-halo);",
+    "}",
     // first-launch example questions (removed after the first message)
     ".suggestions { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; margin: 2px 0 2px; }",
     ".suggestions__label { font-size: 12px; color: var(--muted); margin-bottom: 2px; }",
     ".suggestion {",
     "  appearance: none; cursor: pointer; text-align: left; max-width: 100%;",
-    "  background: #fff; border: 1px solid var(--panel-border); color: var(--accent);",
+    "  background: #fff; border: 1px solid var(--line); color: var(--accent);",
     "  font: inherit; font-size: 13px; font-weight: 600; line-height: 1.3;",
     "  padding: 8px 12px; border-radius: 12px;",
     "}",
     ".suggestion:hover { border-color: var(--accent); background: color-mix(in srgb, var(--brand) 6%, #fff); }",
-    ".suggestion:focus-visible { outline: 2px solid color-mix(in srgb, var(--brand) 45%, transparent); outline-offset: 2px; }",
+    ".suggestion:focus-visible {",
+    "  outline: 2px solid var(--focus-ring); outline-offset: 2px;",
+    "  box-shadow: 0 0 0 2px var(--focus-halo);",
+    "}",
     // visually-hidden (for a11y live region labels)
     ".sr-only {",
     "  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;",
@@ -914,6 +959,21 @@
   // ---- widget construction ------------------------------------------------
 
   var HOST_ID = "gavilan-chatbot-widget-host";
+  // Only has to be unique inside the widget's own shadow root, which is also the only
+  // place an ARIA id reference can resolve from - one pointing at the host document
+  // would fail silently.
+  var GREETING_ID = "gavilan-chatbot-greeting";
+
+  // Everything that can hold focus inside the panel, in DOM order. `:not([disabled])`
+  // matters for Send, which disables itself while a request is pending.
+  var FOCUSABLE_SELECTOR = [
+    "button:not([disabled])",
+    "a[href]",
+    "textarea:not([disabled])",
+    "input:not([disabled])",
+    "select:not([disabled])",
+    '[tabindex]:not([tabindex="-1"])'
+  ].join(", ");
 
   /**
    * Build and wire the widget into `doc` (defaults to the global document).
@@ -937,6 +997,11 @@
 
     var root = doc.createElement("div");
     root.className = "root";
+    // Declare the chrome's own language instead of inheriting whatever the host page
+    // says (3.1.2). Every string the widget itself renders is English; the ANSWERS are
+    // not covered by this - the widget is not told what language the model replied in,
+    // so a per-bubble `lang` needs a field on the /query response contract first.
+    root.lang = "en";
     shadow.appendChild(root);
 
     // in-memory session state (no storage)
@@ -946,7 +1011,11 @@
     var launcher = doc.createElement("button");
     launcher.type = "button";
     launcher.className = "launcher";
-    launcher.setAttribute("aria-label", "Open the library chat");
+    // NO aria-label. The old one named opening the chat, which OVERRODE the visible
+    // "Ask the Library" as the accessible name and left a speech-input user unable to
+    // activate the button by the words on screen (2.5.3). The button's own text is the
+    // name now; aria-haspopup carries what that label used to hint at - it opens a dialog.
+    launcher.setAttribute("aria-haspopup", "dialog");
     var lIcon = doc.createElement("span");
     lIcon.className = "launcher__icon";
     lIcon.setAttribute("aria-hidden", "true");
@@ -961,6 +1030,11 @@
     var panel = doc.createElement("section");
     panel.className = "panel";
     panel.setAttribute("role", "dialog");
+    // The panel already behaves like a modal - fixed overlay covering page content,
+    // launcher hidden while it is open - so it declares itself one and contains focus
+    // (see the Tab handling below). Previously it declared modal=false to assistive
+    // technology while visually acting modal, and let Tab wander invisibly behind it.
+    panel.setAttribute("aria-modal", "true");
     panel.setAttribute("aria-label", "Gavilan College Library chat");
     panel.hidden = true;
 
@@ -1023,6 +1097,20 @@
       thread.scrollTop = thread.scrollHeight;
     }
 
+    /**
+     * A visually-hidden speaker label for one turn. Who said what was carried only by
+     * the `msg--user` / `msg--bot` class - alignment and bubble colour for a sighted
+     * user, nothing at all in the accessibility tree (1.3.1). It goes FIRST in the
+     * wrapper so it is read before the message it introduces, and it is out of flow
+     * (`.sr-only` is absolutely positioned), so the flex layout is untouched.
+     */
+    function speakerLabel(who) {
+      var label = doc.createElement("span");
+      label.className = "sr-only";
+      label.textContent = who;
+      return label;
+    }
+
     function appendUserMessage(text) {
       state.messages.push({ role: "user", text: text });
       var wrap = doc.createElement("div");
@@ -1030,6 +1118,7 @@
       var bubble = doc.createElement("div");
       bubble.className = "bubble";
       bubble.textContent = text; // text node only — never innerHTML
+      wrap.appendChild(speakerLabel("You said:"));
       wrap.appendChild(bubble);
       thread.appendChild(wrap);
       scrollToBottom();
@@ -1103,6 +1192,7 @@
       return container;
     }
 
+    /** Append one assistant turn; returns its bubble so the caller can reference it. */
     function appendBotMessage(answer, sources) {
       state.messages.push({ role: "bot", text: answer, sources: sources });
       var wrap = doc.createElement("div");
@@ -1124,9 +1214,11 @@
       if (sources && sources.length) {
         bubble.appendChild(buildSources(sources));
       }
+      wrap.appendChild(speakerLabel("Library assistant said:"));
       wrap.appendChild(bubble);
       thread.appendChild(wrap);
       scrollToBottom();
+      return bubble;
     }
 
     function showTyping() {
@@ -1135,10 +1227,19 @@
       wrap.setAttribute("data-typing", "1");
       var bubble = doc.createElement("div");
       bubble.className = "bubble";
+      // The BUBBLE is the status region, not the dots row, for two reasons (4.1.3):
+      // a live region announces its CONTENT, and the dots are decorative and
+      // aria-hidden, so the old role="status" element had literally nothing to say -
+      // its message sat in an aria-label. And the region has to be the same one the
+      // slow-response note is appended to below, so that note is a change INSIDE a
+      // status region rather than a sibling of it.
+      bubble.setAttribute("role", "status");
+      var statusText = doc.createElement("span");
+      statusText.className = "sr-only";
+      statusText.textContent = "Assistant is typing";
+      bubble.appendChild(statusText);
       var typing = doc.createElement("div");
       typing.className = "typing";
-      typing.setAttribute("aria-label", "Assistant is typing");
-      typing.setAttribute("role", "status");
       for (var i = 0; i < 3; i++) {
         var dot = doc.createElement("span");
         dot.className = "dot";
@@ -1147,22 +1248,22 @@
       }
       bubble.appendChild(typing);
 
-      // Honest slow-response note: a query occasionally takes long enough (a big generation,
-      // a cold Lambda) that a bare typing indicator looks frozen. After a short delay, reveal a
-      // plain "Working…" line - no fake progress bar. Short, neutral wording on purpose: this can
-      // fire on any slow turn, so it must not imply the assistant is starting up each time.
-      var hint = doc.createElement("div");
-      hint.className = "typing__hint";
-      hint.hidden = true;
-      hint.textContent = "Working…";
-      bubble.appendChild(hint);
-
       wrap.appendChild(bubble);
       thread.appendChild(wrap);
       scrollToBottom();
 
+      // Honest slow-response note: a query occasionally takes long enough (a big generation,
+      // a cold Lambda) that a bare typing indicator looks frozen. After a short delay, add a
+      // plain "Working…" line - no fake progress bar. Short, neutral wording on purpose: this can
+      // fire on any slow turn, so it must not imply the assistant is starting up each time.
+      // CREATED HERE, not pre-inserted hidden and revealed: un-hiding an existing node is
+      // neither an insertion (which is all the thread's aria-relevant="additions" reports)
+      // nor a text change, so the old version changed nothing any live region was watching.
       var hintTimer = setTimeout(function () {
-        hint.hidden = false;
+        var hint = doc.createElement("div");
+        hint.className = "typing__hint";
+        hint.textContent = "Working…";
+        bubble.appendChild(hint);
         scrollToBottom();
       }, CONFIG.wakingHintDelayMs);
 
@@ -1176,6 +1277,7 @@
       };
     }
 
+    /** Append the failure bubble; returns its retry button, or null if there is none. */
     function appendError(question) {
       var wrap = doc.createElement("div");
       wrap.className = "msg msg--bot";
@@ -1186,8 +1288,9 @@
         "Sorry, I couldn't reach the library assistant just now. " +
         "Please try again in a moment.";
       bubble.appendChild(msg);
+      var retry = null;
       if (question) {
-        var retry = doc.createElement("button");
+        retry = doc.createElement("button");
         retry.type = "button";
         retry.className = "retry";
         retry.textContent = "Try again";
@@ -1198,9 +1301,11 @@
         });
         bubble.appendChild(retry);
       }
+      wrap.appendChild(speakerLabel("Library assistant said:"));
       wrap.appendChild(bubble);
       thread.appendChild(wrap);
       scrollToBottom();
+      return retry;
     }
 
     function setPending(pending) {
@@ -1261,6 +1366,13 @@
         suggestionsWrap.parentNode.removeChild(suggestionsWrap);
       }
       suggestionsWrap = null;
+      // The greeting stops describing the composer at the same moment the starter
+      // questions disappear: from here on it is the newest answer that matters, and a
+      // fixed description would be re-read every time focus returns to the text box.
+      // Guarded like the focus() calls: this must never throw on a partial DOM.
+      if (typeof input.removeAttribute === "function") {
+        input.removeAttribute("aria-describedby");
+      }
     }
 
     function submitQuestion(question) {
@@ -1291,9 +1403,16 @@
         },
         function (err) {
           typing.done();
-          appendError(question);
+          var retry = appendError(question);
           setPending(false);
-          focusInput();
+          // Focus the retry button rather than the composer: the button lives in the
+          // thread, which is EARLIER in DOM order than the composer, so from the
+          // composer it was unreachable by Tab and only findable by Shift+Tab (2.4.3).
+          if (retry && typeof retry.focus === "function") {
+            try { retry.focus(); } catch (e) { focusInput(); }
+          } else {
+            focusInput();
+          }
           if (typeof console !== "undefined" && console.error) {
             console.error("[gavilan-widget] query failed:", err);
           }
@@ -1310,6 +1429,25 @@
       if (typeof input.focus === "function") {
         try { input.focus(); } catch (e) { /* ignore */ }
       }
+    }
+
+    /**
+     * The panel's focusable controls, in DOM order, skipping any that sit in a hidden
+     * subtree - a collapsed sources list is still full of links, and they are not
+     * tabbable while its <ul> carries `hidden`. `closest()` stops at the shadow root,
+     * so this never looks at the host page.
+     */
+    function focusablesInPanel() {
+      if (typeof panel.querySelectorAll !== "function") return [];
+      var found = panel.querySelectorAll(FOCUSABLE_SELECTOR);
+      var out = [];
+      for (var i = 0; i < found.length; i++) {
+        var el = found[i];
+        if (el.hidden) continue;
+        if (typeof el.closest === "function" && el.closest("[hidden]")) continue;
+        out.push(el);
+      }
+      return out;
     }
 
     function openPanel() {
@@ -1375,12 +1513,51 @@
       if (e.key === "Escape") {
         e.stopPropagation();
         closePanel();
+        return;
+      }
+      if (e.key !== "Tab") return;
+      // Focus containment. Recomputed on every Tab rather than cached at open, because
+      // the panel's focusable set changes as the conversation runs: the starter chips
+      // go away, a sources disclosure or a retry button arrives, Send disables itself
+      // while a request is pending.
+      var items = focusablesInPanel();
+      if (!items.length) return;
+      var first = items[0];
+      var last = items[items.length - 1];
+      // shadow.activeElement, not document.activeElement: from outside the shadow tree
+      // the focused control reads as the host element, so the edge test would never hit.
+      var active = shadow.activeElement;
+      if (e.shiftKey ? active === first : active === last) {
+        e.preventDefault();
+        (e.shiftKey ? last : first).focus();
       }
     });
 
+    // Escape from ANYWHERE while the panel is open, not just from inside it: the panel
+    // covers host-page content that is still tabbable by mouse-click, and a user who
+    // got out there had no way back and no way to dismiss the overlay. Capture phase, so
+    // a host page that stops keydown propagation on its own controls cannot trap the
+    // panel open. The panel's own handler above still stops propagation for the
+    // focus-is-inside case, so Escape typed in the composer stays out of the host page.
+    if (typeof doc.addEventListener === "function") {
+      doc.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && state.open) closePanel();
+      }, true);
+    }
+
     // seed the greeting + first-launch example questions so they're present when the panel opens
-    appendBotMessage(CONFIG.greeting, []);
+    var greetingBubble = appendBotMessage(CONFIG.greeting, []);
     renderSuggestions();
+    // On first launch, focus lands in the composer with the greeting and the starter
+    // questions behind it in the tab order, so a screen-reader user met an empty text
+    // box. Describing the composer with the greeting offers that content instead. It is
+    // dropped with the suggestions on the first message, so later turns are not prefixed
+    // by a stale description every time focus returns here. Both ends of the reference
+    // are inside this shadow root, which is the only way an id reference resolves here.
+    if (greetingBubble) {
+      greetingBubble.id = GREETING_ID;
+      input.setAttribute("aria-describedby", GREETING_ID);
+    }
 
     return {
       host: host,
