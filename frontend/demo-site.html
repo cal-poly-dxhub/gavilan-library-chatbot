@@ -687,7 +687,11 @@
 
       // What exists at zero traffic. Every line is rate x measured quantity.
       function fixedMonthly() {
-        var ingests = B.scrapes_per_month + B.deploys_per_month;
+        // Two different counts, because the scraper runs far more often than it changes
+        // anything. Every run costs a little Lambda time; only a run that finds new content
+        // uploads, re-ingests, and pays for embeddings + vector writes.
+        var runs = B.scrapes_per_month + B.deploys_per_month;
+        var ingests = B.reindexes_per_month + B.deploys_per_month;
         // S3 Vectors bills a 128 KB minimum per PUT, so a small index costs more
         // to rewrite than its byte count suggests.
         var putBytes = B.vector_count * Math.max(131072, B.vector_bytes_each);
@@ -695,12 +699,12 @@
                       (B.vector_count * B.vector_bytes_each / 1e9) * R.vector_storage_per_gb_month;
         var reindex = ingests * ((B.ingest_embedded_tokens / 1e6) * R.embedding_per_1m +
                                  (putBytes / 1e9) * R.vector_put_per_gb);
-        var scraper = ingests * (B.scraper_seconds_per_run * B.scraper_memory_gb *
-                                 R.lambda_per_gb_second + R.lambda_per_1m_requests / 1e6);
+        var scraper = runs * (B.scraper_seconds_per_run * B.scraper_memory_gb *
+                              R.lambda_per_gb_second + R.lambda_per_1m_requests / 1e6);
         var logs = B.log_gb_per_month * R.logs_ingest_per_gb;
         return {
           storage: storage, reindex: reindex, scraper: scraper, logs: logs,
-          ingests: ingests, total: storage + reindex + scraper + logs
+          runs: runs, ingests: ingests, total: storage + reindex + scraper + logs
         };
       }
 
@@ -803,11 +807,14 @@
         $("f-scraper").textContent = smallMoney(fixed.scraper);
         $("f-logs").textContent = smallMoney(fixed.logs);
         $("floor-note").innerHTML =
-          "The floor is what runs whether or not anyone asks anything: stored bytes, the " +
-          "weekly re-scrape, and " + B.deploys_per_month + " assumed deploys a month (each " +
-          "one re-runs the scraper and re-indexes) &mdash; <strong>" +
-          fixed.ingests.toFixed(2) + " re-indexes a month</strong> in total. CloudFront, " +
-          "API Gateway and Lambda bill per use, so they contribute nothing at zero traffic.";
+          "The floor is what runs whether or not anyone asks anything: stored bytes, and " +
+          "<strong>" + fixed.runs.toFixed(1) + " scraper runs a month</strong> (hours pages " +
+          "daily, everything else every five days, plus " + B.deploys_per_month + " assumed " +
+          "deploys). Re-scraping is nearly free because a run whose pages have not changed " +
+          "uploads nothing and re-indexes nothing &mdash; only about <strong>" +
+          fixed.ingests.toFixed(1) + " re-indexes a month</strong> are assumed to actually " +
+          "happen. CloudFront, API Gateway and Lambda bill per use, so they contribute " +
+          "nothing at zero traffic.";
       }
 
       function renderRates() {

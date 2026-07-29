@@ -49,7 +49,11 @@ from aws_cdk import (
 )
 from constructs import Construct
 
-from infra.config import resolve_cors_allow_origins
+from infra.config import (
+    resolve_cors_allow_origins,
+    resolve_scraper_tiers,
+    resolve_seed_urls,
+)
 
 # Repo-root app/ directory holding the Lambda handler source (app/handler.py).
 # infra_stack.py is <repo>/infra/infra/infra_stack.py, so parents[2] is the repo root.
@@ -131,6 +135,24 @@ class GavilanChatbotStack(Stack):
         vs_cfg = config["vector_store"]
         chunking_cfg = config["chunking"]
         scraper_cfg = config["scraper"]
+        # Scraper freshness tiers: {tier: {"schedule_cron": ..., "urls": [...]}}. Validated in
+        # infra/config.py (every tier has a cron and URLs, no URL in two tiers), so a malformed
+        # tier block fails at synth instead of deploying a schedule that scrapes nothing.
+        scraper_tiers = resolve_scraper_tiers(config)
+        # Every configured URL across all tiers - what a full run fetches and what the prune keeps.
+        seed_urls = resolve_seed_urls(config)
+        # A KB-excluded URL that is not actually seeded is a silent no-op that reads like a
+        # working exclusion, and for databases.php it would freeze the database catalog at its
+        # last-good copy with nothing in the logs to say so. Cheap to catch at synth.
+        _orphan_exclusions = [
+            url for url in (scraper_cfg.get("kb_exclude_urls") or []) if url not in seed_urls
+        ]
+        if _orphan_exclusions:
+            raise ValueError(
+                f"scraper.kb_exclude_urls names URLs that no tier scrapes: {_orphan_exclusions}. "
+                "An exclusion only means 'fetch this but do not index it', so the URL has to be "
+                "listed under one of the scraper.tiers as well."
+            )
         http_api_cfg = config["http_api"]
         # Browser origin allowlist for the HTTP API. Resolved (and wildcard-rejected) in
         # infra/config.py so the "never *" rule is enforced at synth, not just by convention.
@@ -426,8 +448,19 @@ class GavilanChatbotStack(Stack):
                 resources=[source_bucket.arn_for_objects("*")],
             )
         )
+        # READ the source objects, which is what change gating runs on: the scraper HEADs each
+        # markdown object to read back the `content-sha256` it stamped there last time, and
+        # uploads only when the fresh content hashes differently. HeadObject is authorized as
+        # s3:GetObject, so this grant is what makes an unchanged page cost nothing.
+        scraper_lambda_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:GetObject"],
+                resources=[source_bucket.arn_for_objects("*")],
+            )
+        )
         # ListBucket is granted on the BUCKET arn, not the object arn - the prune has to enumerate
-        # what is actually there before it can tell what is stale.
+        # what is actually there before it can tell what is stale, and the ingestion decision reads
+        # the same listing's LastModified times.
         scraper_lambda_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["s3:ListBucket"],
@@ -435,10 +468,14 @@ class GavilanChatbotStack(Stack):
             )
         )
         # Trigger ingestion of the fresh content on the specific KB (StartIngestionJob is scoped
-        # to the knowledge-base ARN; it covers that KB's data sources).
+        # to the knowledge-base ARN; it covers that KB's data sources). ListIngestionJobs comes
+        # with it because the scraper checks the job history before starting: Bedrock allows one
+        # job per data source at a time, so an overlap between the two schedules has to be
+        # detected and skipped, and the last job's start time is how a skipped change is found
+        # again on the next run without storing anything.
         scraper_lambda_role.add_to_policy(
             iam.PolicyStatement(
-                actions=["bedrock:StartIngestionJob"],
+                actions=["bedrock:StartIngestionJob", "bedrock:ListIngestionJobs"],
                 resources=[knowledge_base.attr_knowledge_base_arn],
             )
         )
@@ -512,7 +549,11 @@ class GavilanChatbotStack(Stack):
             memory_size=512,
             log_group=scraper_log_group,
             environment={
-                "SEED_URLS": json.dumps(scraper_cfg["seed_urls"]),
+                # The WHOLE tier map, not just one tier's URLs: each EventBridge rule below names
+                # a tier in its event payload, and the Lambda looks it up here. Handing over the
+                # full map also lets the stale-object prune key off every configured URL, which is
+                # what stops a three-page fast run from deleting the rest of the corpus.
+                "SCRAPER_TIERS": json.dumps(scraper_tiers),
                 # Seed URLs fetched for their side effects but kept OUT of the knowledge base
                 # (databases.php: regenerate_catalog needs its HTML, the KB does not need its text).
                 "KB_EXCLUDE_URLS": json.dumps(scraper_cfg.get("kb_exclude_urls", [])),
@@ -531,15 +572,32 @@ class GavilanChatbotStack(Stack):
         # Needs the KB + data source (it calls StartIngestionJob on them at runtime).
         scraper_lambda.node.add_dependency(s3_data_source)
 
-        # Weekly re-scrape on a maintenance-window schedule (cron from config.yaml, UTC). Keeps
-        # the KB fresh as the library site changes. EventBridge adds the invoke permission.
-        events.Rule(
-            self,
-            "ScraperSchedule",
-            description="Scheduled re-scrape of the Gavilan library site to refresh KB content.",
-            schedule=events.Schedule.expression(scraper_cfg["schedule_cron"]),
-            targets=[events_targets.LambdaFunction(scraper_lambda)],
-        )
+        # ONE SCHEDULE PER FRESHNESS TIER, built by iterating the tier map - so adding a tier,
+        # retiming one, or moving a page between them is a config.yaml edit and nothing else.
+        # Each rule passes its tier name as the event payload; the Lambda resolves that to the
+        # URLs it should fetch. EventBridge adds the invoke permission per rule.
+        #
+        # The tiers exist to answer "we changed our hours, when does the bot know?": the fast tier
+        # carries the pages that hold hours, closures and dated announcements and runs daily, while
+        # everything else rides the slower full sweep. Scraping more often is affordable because
+        # the Lambda gates on content hashes - an unchanged page uploads nothing, starts no
+        # ingestion job, and never reaches the catalog enrichment model call.
+        for tier_name, tier in scraper_tiers.items():
+            events.Rule(
+                self,
+                f"ScraperSchedule{tier_name.capitalize()}",
+                description=(
+                    f"Scheduled '{tier_name}' re-scrape of the Gavilan library site "
+                    f"({len(tier['urls'])} URL(s) declared) to refresh KB content."
+                ),
+                schedule=events.Schedule.expression(tier["schedule_cron"]),
+                targets=[
+                    events_targets.LambdaFunction(
+                        scraper_lambda,
+                        event=events.RuleTargetInput.from_object({"tier": tier_name}),
+                    )
+                ],
+            )
 
         # One-click install: invoke the (existing) scraper ONCE during `cdk deploy` so the KB is
         # populated the moment the stack comes up - no manual invoke, no waiting for the weekly
@@ -555,6 +613,19 @@ class GavilanChatbotStack(Stack):
         #   - execute_on_handler_change (default True): fires on install (create) and whenever the
         #     scraper changes; a no-op redeploy does not re-fire (KB already populated; the schedule
         #     refreshes). Re-firing is harmless anyway - it overwrites the same S3 keys.
+        #
+        # WHAT "WHENEVER THE SCRAPER CHANGES" ACTUALLY MEANS, since it is easy to assume every
+        # deploy re-scrapes and it does not. execute_on_handler_change ties this trigger to the
+        # function's currentVersion, so the synthesized HandlerArn is a Ref to a
+        # `ScraperFunctionCurrentVersion<hash>` resource whose LOGICAL ID hashes the function's
+        # code asset plus its configuration (env vars, layers, memory, timeout, role). Deploy
+        # something that leaves all of those alone - a widget tweak, a demo-page edit, a query
+        # Lambda change - and the logical id is identical, this custom resource's properties are
+        # unchanged, CloudFormation does not re-run it, and NO SCRAPE HAPPENS. That is why recent
+        # deploys did not appear to fire one. Deliberately left as-is.
+        #
+        # The invocation carries no tier, which scraper._requested_tier maps to the complete
+        # sweep - the right behaviour for an install, and unchanged by the tiering work.
         # The Trigger grants its invoker lambda:InvokeFunction on this function automatically.
         triggers.Trigger(
             self,

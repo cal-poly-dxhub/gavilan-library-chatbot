@@ -14,8 +14,10 @@ sys.modules.setdefault("boto3", types.ModuleType("boto3"))
 import lambda_function as lf  # noqa: E402
 from scraper import ScrapeResult  # noqa: E402
 
+# One implicit tier holding both URLs: the handler resolves an invocation with no tier to the
+# complete sweep, so this reproduces the pre-tiering behaviour every test below was written against.
 BASE_ENV = {
-    "SEED_URLS": json.dumps(["https://x/a", "https://x/b"]),
+    "SCRAPER_TIERS": json.dumps({"full": {"urls": ["https://x/a", "https://x/b"]}}),
     "SCRAPE_TIMEOUT_SECONDS": "15",
     "SCRAPER_USER_AGENT": "TestAgent/1.0",
     "SOURCE_BUCKET": "kb-bucket",
@@ -44,9 +46,14 @@ def _wire(monkeypatch, results):
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(lf, "scrape_urls", lambda urls, **kw: results)
     s3, bedrock_agent = MagicMock(), MagicMock()
+    # Empty head = no stored fingerprint = every page reads as changed, which is the state of a
+    # fresh bucket. Tests that exercise the gating set a fingerprint explicitly.
+    s3.head_object.return_value = {}
     bedrock_agent.start_ingestion_job.return_value = {
         "ingestionJob": {"ingestionJobId": "job-1", "status": "STARTING"}
     }
+    # No job history by default: nothing running to defer behind, nothing already ingested.
+    bedrock_agent.list_ingestion_jobs.return_value = {"ingestionJobSummaries": []}
     monkeypatch.setattr(lf, "_s3_client", lambda: s3)
     monkeypatch.setattr(lf, "_bedrock_agent_client", lambda: bedrock_agent)
     return s3, bedrock_agent
@@ -332,3 +339,411 @@ def test_ingestion_runs_for_a_prune_only_change(monkeypatch):
     lf.handler({}, None)
 
     bedrock_agent.start_ingestion_job.assert_called_once()
+
+
+# --- Tiering: which URLs a run fetches, and what it is allowed to prune ------------------------
+
+_TIER_ENV = json.dumps({
+    "fast": {"schedule_cron": "cron(30 11 * * ? *)", "urls": ["https://x/hours"]},
+    "full": {"schedule_cron": "cron(0 10 1,6,11,16,21,26 * ? *)", "urls": ["https://x/a", "https://x/b"]},
+})
+
+
+def _wire_tiers(monkeypatch, results):
+    s3, bedrock_agent = _wire(monkeypatch, results)
+    monkeypatch.setenv("SCRAPER_TIERS", _TIER_ENV)
+    return s3, bedrock_agent
+
+
+def _captured_scrape_list(monkeypatch, results):
+    """Run the handler and return the URL list it actually handed to scrape_urls."""
+    captured = {}
+
+    def fake_scrape(urls, **kw):
+        captured["urls"] = list(urls)
+        return results
+
+    monkeypatch.setattr(lf, "scrape_urls", fake_scrape)
+    return captured
+
+
+def test_fast_tier_scrapes_only_its_own_urls(monkeypatch):
+    _wire_tiers(monkeypatch, [])
+    captured = _captured_scrape_list(monkeypatch, [])
+    lf.handler({"tier": "fast"}, None)
+    assert captured["urls"] == ["https://x/hours"]
+
+
+def test_full_tier_scrapes_every_configured_url(monkeypatch):
+    _wire_tiers(monkeypatch, [])
+    captured = _captured_scrape_list(monkeypatch, [])
+    lf.handler({"tier": "full"}, None)
+    assert captured["urls"] == ["https://x/hours", "https://x/a", "https://x/b"]
+
+
+def test_deploy_trigger_event_without_a_tier_does_the_full_sweep(monkeypatch):
+    # The one-shot install Trigger invokes with no tier. It must populate the WHOLE knowledge base.
+    _wire_tiers(monkeypatch, [])
+    captured = _captured_scrape_list(monkeypatch, [])
+    lf.handler({}, None)
+    assert captured["urls"] == ["https://x/hours", "https://x/a", "https://x/b"]
+
+
+def test_a_fast_run_never_prunes_the_pages_it_did_not_fetch(monkeypatch):
+    # THE tiering hazard. The prune deletes whatever configuration no longer calls for; if it
+    # keyed off the three URLs a fast run fetched, the daily schedule would delete the rest of the
+    # corpus from the knowledge base every single night.
+    s3, _ = _wire_tiers(monkeypatch, [])
+    a_slug, b_slug = lf.slugify_url("https://x/a"), lf.slugify_url("https://x/b")
+    s3.get_paginator.return_value = _paginated([f"{a_slug}.md", f"{b_slug}.md", "genuinely-stale.md"])
+
+    out = lf.handler({"tier": "fast"}, None)
+
+    assert out["pruned"] == ["genuinely-stale.md"]
+    assert {c.kwargs["Key"] for c in s3.delete_object.call_args_list} == {"genuinely-stale.md"}
+
+
+def test_fast_tier_never_touches_the_catalog_enrichment(monkeypatch):
+    # databases.php is a full-tier page, so a fast run cannot reach the model call at all. Pinned
+    # by asserting the bedrock-runtime client is never even constructed.
+    s3, _ = _wire_tiers(monkeypatch, [_ok()])
+
+    def explode():
+        raise AssertionError("fast tier must not reach the catalog enrichment model")
+
+    monkeypatch.setattr(lf, "_bedrock_runtime_client", explode)
+
+    out = lf.handler({"tier": "fast"}, None)
+
+    assert out["catalog"] == "skipped (databases.php not in this tier)"
+    assert out["summary"]["enrichment"] == {"ran": False, "reason": "not attempted"}
+
+
+# --- Gate 1: upload only what changed ---------------------------------------------------------
+
+
+def test_content_fingerprint_ignores_the_scrape_timestamp():
+    # Verified against the live site: two consecutive scrapes produce byte-identical markdown and
+    # differ ONLY in scrape_timestamp. If the fingerprint covered it, every page would look
+    # changed on every run and the whole gate would be an expensive no-op.
+    md = "# Page\n\nbody"
+    base = {"source_url": "https://x/a", "title": "Page", "scrape_timestamp": "2026-07-07T00:00:00Z"}
+    later = dict(base, scrape_timestamp="2026-07-29T21:16:07Z")
+    assert lf.content_fingerprint(md, base) == lf.content_fingerprint(md, later)
+
+
+def test_content_fingerprint_moves_on_body_or_title_change():
+    md = "# Page\n\nbody"
+    meta = {"source_url": "https://x/a", "title": "Page"}
+    baseline = lf.content_fingerprint(md, meta)
+    assert lf.content_fingerprint(md + " more", meta) != baseline
+    assert lf.content_fingerprint(md, dict(meta, title="Renamed")) != baseline
+    assert lf.content_fingerprint(md, dict(meta, source_url="https://x/moved")) != baseline
+
+
+def test_changed_page_is_uploaded_and_stamped_with_its_fingerprint(monkeypatch):
+    s3, bedrock_agent = _wire(monkeypatch, [_ok()])
+    out = lf.handler({}, None)
+
+    md_put = next(c.kwargs for c in s3.put_object.call_args_list if c.kwargs["Key"] == "x-a-hash.md")
+    expected = lf.content_fingerprint(_ok().markdown, _ok().metadata)
+    assert md_put["Metadata"] == {lf.CONTENT_HASH_METADATA_KEY: expected}
+    assert out["uploaded"] == 1 and out["unchanged"] == 0
+    bedrock_agent.start_ingestion_job.assert_called_once()
+
+
+def test_unchanged_page_uploads_nothing_and_starts_no_ingestion(monkeypatch):
+    s3, bedrock_agent = _wire(monkeypatch, [_ok()])
+    stored = lf.content_fingerprint(_ok().markdown, _ok().metadata)
+    s3.head_object.return_value = {"Metadata": {lf.CONTENT_HASH_METADATA_KEY: stored}}
+
+    out = lf.handler({}, None)
+
+    s3.put_object.assert_not_called()
+    bedrock_agent.start_ingestion_job.assert_not_called()
+    assert out["uploaded"] == 0
+    assert out["unchanged"] == 1
+    assert out["summary"]["pages_changed"] == 0
+    assert out["ingestion"].startswith("skipped")
+
+
+def test_a_second_consecutive_run_over_unchanged_content_reports_zero_changes(monkeypatch):
+    # The acceptance property, end to end: run once against an empty bucket, feed run one's own
+    # stamped fingerprint back as what S3 now holds, and run again.
+    s3, bedrock_agent = _wire(monkeypatch, [_ok()])
+
+    first = lf.handler({}, None)
+    assert first["uploaded"] == 1
+
+    md_put = next(c.kwargs for c in s3.put_object.call_args_list if c.kwargs["Key"] == "x-a-hash.md")
+    s3.reset_mock()
+    s3.head_object.return_value = {"Metadata": dict(md_put["Metadata"])}
+    s3.get_paginator.return_value = _paginated(["x-a-hash.md", "x-a-hash.md.metadata.json"])
+    bedrock_agent.reset_mock()
+    bedrock_agent.list_ingestion_jobs.return_value = {"ingestionJobSummaries": []}
+
+    second = lf.handler({}, None)
+
+    assert second["summary"]["pages_changed"] == 0
+    assert second["summary"]["pages_unchanged"] == 1
+    assert second["pruned"] == []
+    s3.put_object.assert_not_called()
+    bedrock_agent.start_ingestion_job.assert_not_called()
+
+
+def test_a_missing_fingerprint_is_treated_as_changed(monkeypatch):
+    # Objects written before change gating existed carry no fingerprint; so does an object S3
+    # refuses to HEAD. Both must re-upload (and thereby stamp themselves), never silently skip.
+    s3, _ = _wire(monkeypatch, [_ok()])
+    s3.head_object.side_effect = RuntimeError("AccessDenied")
+
+    out = lf.handler({}, None)
+    assert out["uploaded"] == 1
+
+
+def test_an_unchanged_page_is_never_pruned_as_stale(monkeypatch):
+    # The regression change gating introduces if you are not careful. The prune's belt-and-braces
+    # union used to cover every live page for free, because every successful page was re-uploaded
+    # on every run. Once unchanged pages stop uploading, a page can be live, correct, and absent
+    # from that union - and a slug-derivation mismatch would then delete it. Pages found unchanged
+    # must count as live.
+    s3, _ = _wire(monkeypatch, [_ok()])
+    stored = lf.content_fingerprint(_ok().markdown, _ok().metadata)
+    s3.head_object.return_value = {"Metadata": {lf.CONTENT_HASH_METADATA_KEY: stored}}
+    s3.get_paginator.return_value = _paginated(
+        ["x-a-hash.md", "x-a-hash.md.metadata.json", "really-stale.md"]
+    )
+
+    out = lf.handler({}, None)
+
+    assert out["unchanged"] == 1
+    assert out["pruned"] == ["really-stale.md"]
+
+
+# --- Gate 3: the catalog enrichment, the only model call in this path -------------------------
+
+
+def _parsed_two():
+    return _scraper.extract_database_catalog(_TWO_DB_TABLE)
+
+
+def test_catalog_source_fingerprint_is_stable_and_row_sensitive():
+    assert lf.catalog_source_fingerprint(_parsed_two()) == lf.catalog_source_fingerprint(_parsed_two())
+    changed = _parsed_two()
+    changed[0]["description"] = "rewritten"
+    assert lf.catalog_source_fingerprint(changed) != lf.catalog_source_fingerprint(_parsed_two())
+
+
+def _previous_catalog(s3, body):
+    s3.get_object.return_value = {"Body": MagicMock(read=lambda: json.dumps(body).encode())}
+
+
+def test_unchanged_databases_page_skips_the_model_and_the_write(monkeypatch):
+    # The cost gate. Same parsed rows as last time -> no Sonnet call, no S3 write, catalog left
+    # exactly as it is.
+    _catalog_env(monkeypatch)
+    s3 = MagicMock()
+    _previous_catalog(s3, {
+        "held": [{"name": "Alpha DB", "description": "alpha stuff", "subjects": ["alpha"], "aliases": []}],
+        "source_sha256": lf.catalog_source_fingerprint(_parsed_two()),
+    })
+
+    def explode():
+        raise AssertionError("enrichment must not run when the databases page is unchanged")
+
+    monkeypatch.setattr(lf, "_bedrock_runtime_client", explode)
+
+    status = lf.regenerate_catalog([_db_result(_TWO_DB_TABLE)], s3)
+
+    assert status["catalog"] == "unchanged; enrichment skipped"
+    assert status["enrichment"] == {"ran": False, "reason": "databases page unchanged"}
+    s3.put_object.assert_not_called()
+
+
+def test_changed_databases_page_reenriches_and_stores_the_new_fingerprint(monkeypatch):
+    _catalog_env(monkeypatch)
+    reply = json.dumps([{"name": "Beta Health Index", "subjects": ["health"], "aliases": ["BHI"]}])
+    monkeypatch.setattr(lf, "_bedrock_runtime_client", lambda: _mock_bedrock(reply))
+    s3 = MagicMock()
+    # A stale fingerprint from some earlier version of the page.
+    _previous_catalog(s3, {
+        "held": [{"name": "Alpha DB", "description": "alpha stuff", "subjects": ["alpha"], "aliases": []}],
+        "source_sha256": "stale-fingerprint",
+    })
+
+    status = lf.regenerate_catalog([_db_result(_TWO_DB_TABLE)], s3)
+
+    assert status["catalog"] == "written"
+    body = json.loads(s3.put_object.call_args.kwargs["Body"])
+    assert body["source_sha256"] == lf.catalog_source_fingerprint(_parsed_two())
+
+
+def test_first_ever_run_enriches_even_though_there_is_no_fingerprint(monkeypatch):
+    _catalog_env(monkeypatch)
+    reply = json.dumps([
+        {"name": "Alpha DB", "subjects": ["general"], "aliases": []},
+        {"name": "Beta Health Index", "subjects": ["health"], "aliases": []},
+    ])
+    monkeypatch.setattr(lf, "_bedrock_runtime_client", lambda: _mock_bedrock(reply))
+    s3 = MagicMock()
+    s3.get_object.side_effect = Exception("NoSuchKey")
+
+    status = lf.regenerate_catalog([_db_result(_TWO_DB_TABLE)], s3)
+    assert status["catalog"] == "written"
+    s3.put_object.assert_called_once()
+
+
+def test_guard_failure_does_not_record_a_fingerprint(monkeypatch):
+    # Ordering matters: guard BEFORE fingerprint. If a broken page could record its fingerprint,
+    # the next run would compare equal, skip, and freeze the catalog on the broken parse forever.
+    _catalog_env(monkeypatch, CATALOG_MIN_DATABASES="30")
+    monkeypatch.setattr(lf, "_bedrock_runtime_client", lambda: _mock_bedrock("[]"))
+    s3 = MagicMock()
+    _previous_catalog(s3, {"held": [{"name": "Alpha DB", "description": "d", "subjects": ["a"]}],
+                          "source_sha256": "prior"})
+
+    status = lf.regenerate_catalog([_db_result(_TWO_DB_TABLE)], s3)
+
+    assert "guard failed" in status["catalog"]
+    s3.put_object.assert_not_called()
+
+
+# --- Measuring the enrichment call ------------------------------------------------------------
+
+
+def test_enrichment_records_the_real_token_counts():
+    # The cost of this call was previously an estimate. It is now whatever Bedrock reported.
+    bedrock = _mock_bedrock(json.dumps([{"name": "Alpha DB", "subjects": ["x"], "aliases": []}]))
+    bedrock.converse.return_value["usage"] = {
+        "inputTokens": 1234, "outputTokens": 567, "totalTokens": 1801
+    }
+    usage = {}
+    lf.enrich_held([{"name": "Alpha DB", "description": "d"}], bedrock, "model-x", usage=usage)
+
+    assert usage["ran"] is True
+    assert usage["input_tokens"] == 1234
+    assert usage["output_tokens"] == 567
+    assert usage["total_tokens"] == 1801
+    assert usage["model_id"] == "model-x"
+    assert usage["databases_enriched"] == 1
+    assert usage["at"].endswith("Z")
+
+
+def test_enrichment_usage_survives_a_response_with_no_usage_block():
+    # A metrics detail must never be able to break the catalog.
+    bedrock = _mock_bedrock(json.dumps([{"name": "Alpha DB", "subjects": ["x"], "aliases": []}]))
+    usage = {}
+    out = lf.enrich_held([{"name": "Alpha DB", "description": "d"}], bedrock, "m", usage=usage)
+    assert out  # enrichment still worked
+    assert usage["input_tokens"] == 0 and usage["output_tokens"] == 0
+
+
+def test_a_run_with_nothing_new_to_enrich_reports_that_it_did_not_call_the_model(monkeypatch):
+    _catalog_env(monkeypatch)
+    bedrock = _mock_bedrock("[]")
+    monkeypatch.setattr(lf, "_bedrock_runtime_client", lambda: bedrock)
+    s3 = MagicMock()
+    # Both databases already enriched, but the page content moved (different fingerprint), so the
+    # catalog IS rewritten - without any model call, because nothing needs enriching.
+    _previous_catalog(s3, {
+        "held": [
+            {"name": "Alpha DB", "description": "alpha stuff", "subjects": ["alpha"], "aliases": []},
+            {"name": "Beta Health Index", "description": "b", "subjects": ["health"], "aliases": []},
+        ],
+        "source_sha256": "different",
+    })
+
+    status = lf.regenerate_catalog([_db_result(_TWO_DB_TABLE)], s3)
+
+    assert status["catalog"] == "written"
+    bedrock.converse.assert_not_called()
+    assert status["enrichment"] == {"ran": False, "reason": "no new databases to enrich"}
+
+
+# --- Gate 2 + concurrency: one ingestion job at a time, and never lose a change ----------------
+
+
+def _job(job_id, status, started_at):
+    return {"ingestionJobId": job_id, "status": status, "startedAt": started_at}
+
+
+def test_overlapping_run_defers_instead_of_failing(monkeypatch):
+    # Bedrock allows one ingestion job per data source. An overlap must skip cleanly.
+    s3, bedrock_agent = _wire(monkeypatch, [_ok()])
+    bedrock_agent.list_ingestion_jobs.return_value = {
+        "ingestionJobSummaries": [_job("running-job", "IN_PROGRESS", 100)]
+    }
+
+    out = lf.handler({}, None)
+
+    bedrock_agent.start_ingestion_job.assert_not_called()
+    assert out["ingestionJobId"] is None
+    assert out["ingestion"] == "deferred (job running-job in progress)"
+    # The upload still happened - only the indexing was deferred.
+    assert out["uploaded"] == 1
+
+
+def test_a_deferred_change_is_picked_up_by_the_next_run(monkeypatch):
+    # THE reason deferring is safe. This run changes nothing, so "did I upload?" says no ingestion
+    # is needed - but the bucket holds an object newer than the last job, which is exactly what a
+    # previously deferred run leaves behind. Without this the deferred change would sit unindexed
+    # forever, because no later run would ever see it as changed either.
+    s3, bedrock_agent = _wire(monkeypatch, [_ok()])
+    stored = lf.content_fingerprint(_ok().markdown, _ok().metadata)
+    s3.head_object.return_value = {"Metadata": {lf.CONTENT_HASH_METADATA_KEY: stored}}
+    s3.get_paginator.return_value.paginate.return_value = [
+        {"Contents": [{"Key": "x-a-hash.md", "LastModified": 200}]}
+    ]
+    bedrock_agent.list_ingestion_jobs.return_value = {
+        "ingestionJobSummaries": [_job("older-job", "COMPLETE", 100)]
+    }
+
+    out = lf.handler({}, None)
+
+    assert out["uploaded"] == 0
+    bedrock_agent.start_ingestion_job.assert_called_once()
+    assert "newer than the last ingestion job" in out["ingestion"]
+
+
+def test_a_fully_indexed_unchanged_bucket_starts_nothing(monkeypatch):
+    s3, bedrock_agent = _wire(monkeypatch, [_ok()])
+    stored = lf.content_fingerprint(_ok().markdown, _ok().metadata)
+    s3.head_object.return_value = {"Metadata": {lf.CONTENT_HASH_METADATA_KEY: stored}}
+    s3.get_paginator.return_value.paginate.return_value = [
+        {"Contents": [{"Key": "x-a-hash.md", "LastModified": 100}]}
+    ]
+    bedrock_agent.list_ingestion_jobs.return_value = {
+        "ingestionJobSummaries": [_job("recent-job", "COMPLETE", 200)]
+    }
+
+    out = lf.handler({}, None)
+    bedrock_agent.start_ingestion_job.assert_not_called()
+    assert out["ingestion"] == "skipped (nothing changed)"
+
+
+def test_a_race_on_start_ingestion_defers_rather_than_raising(monkeypatch):
+    # Another run can win between our list and our start, and StartIngestionJob is rate-limited to
+    # one per ten seconds. Either way the scrape has already succeeded and must not fail.
+    s3, bedrock_agent = _wire(monkeypatch, [_ok()])
+
+    class ConflictException(Exception):
+        pass
+
+    bedrock_agent.start_ingestion_job.side_effect = ConflictException("ongoing ingestion job")
+
+    out = lf.handler({}, None)
+
+    assert out["ingestionJobId"] is None
+    assert out["ingestion"] == "deferred (ConflictException)"
+    assert out["uploaded"] == 1  # the upload is still reported as done
+
+
+def test_losing_job_history_falls_back_to_the_old_rule(monkeypatch):
+    # If ListIngestionJobs is denied or throttled, we must still ingest what we just changed.
+    s3, bedrock_agent = _wire(monkeypatch, [_ok()])
+    bedrock_agent.list_ingestion_jobs.side_effect = RuntimeError("AccessDenied")
+
+    out = lf.handler({}, None)
+
+    bedrock_agent.start_ingestion_job.assert_called_once()
+    assert out["ingestion"] == "started (content changed this run)"

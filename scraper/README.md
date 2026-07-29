@@ -18,11 +18,13 @@ python -m pip install -r requirements.txt pytest
 
 ## Run
 
-Uses the `scraper:` block in the repo-root `config.yaml` (`seed_urls`, `output_dir`, `timeout_seconds`,
-`user_agent`):
+Uses the `scraper:` block in the repo-root `config.yaml` (`tiers`, `output_dir`, `timeout_seconds`,
+`user_agent`). URLs are grouped into freshness tiers, each with its own schedule; `--tier` picks
+one, and the default `full` means every URL in every tier:
 
 ```bash
-python scraper.py                                   # scrape config seed_urls -> output_dir
+python scraper.py                                   # every configured URL -> output_dir
+python scraper.py --tier fast                       # just the hours/closures pages
 python scraper.py https://www.gavilan.edu/library/  # or pass explicit URLs (override config)
 python scraper.py --output-dir /tmp/out URL1 URL2
 ```
