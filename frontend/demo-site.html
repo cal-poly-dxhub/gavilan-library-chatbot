@@ -1,0 +1,419 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Never index this page. It is a styled stand-in for the library's site, and a search
+       result pointing here instead of gavilan.edu would be actively harmful. The CDN in
+       front of it also sends X-Robots-Tag: noindex, nofollow (see infra_stack.py), so the
+       instruction survives even for a crawler that only reads headers. -->
+  <meta name="robots" content="noindex, nofollow, noarchive" />
+  <title>DEMO - Gavilan College Library chat assistant</title>
+  <!--
+    ==========================================================================
+    SHIPPED DEMO PAGE. This is the one HTML file the CDK stack deploys to its
+    own S3 + CloudFront distribution, so `cdk deploy` hands back a public URL
+    that shows the chat widget in something resembling its real setting.
+
+    TWO DEPLOY-TIME PLACEHOLDERS are stamped into this file by the stack
+    (infra/infra/infra_stack.py, "Demo site" sections) via s3deploy.Source.data,
+    which resolves CDK tokens during deployment:
+
+      the widget-src placeholder -> https://<widget CloudFront domain>/widget.js
+      the api-url placeholder    -> https://<api id>.execute-api.<region>.amazonaws.com/query
+
+    Their exact spellings are _DEMO_WIDGET_SRC_TOKEN / _DEMO_API_URL_TOKEN in
+    infra_stack.py; they are not written out here because every literal
+    occurrence in this file gets substituted, comments included. Nothing here
+    is hardcoded to an account or region, so a fresh install in a different AWS
+    account produces a correct page with no hand-editing. The stack ASSERTS both
+    placeholders are present at synth - renaming one here without updating the
+    stack fails the build instead of shipping a dead page.
+
+    The script tag at the bottom is the real production embed: the SAME
+    widget.js the library would paste onto their own site, served from the SAME
+    CloudFront distribution, over the SAME cross-origin POST to /query. Nothing
+    about the widget is forked or inlined here, and nothing is mocked.
+
+    LOCAL PREVIEW (to iterate on this page's own styling):
+      cd frontend && python3 -m http.server 8000
+      then open http://localhost:8000/demo-site.html
+    The placeholders are not stamped locally, so the widget will not load. To
+    exercise it locally, hand-edit YOUR COPY the way frontend/demo-live.html
+    documents - set src="widget.js" (the sibling file) and data-api-url to the
+    deployed ChatbotApiUrl - and leave the placeholders intact in the committed
+    file. http://localhost:8000 is already in cors.allow_origins for this.
+    ==========================================================================
+  -->
+  <style>
+    /* ---------------------------------------------------------------------
+       All styling is local and hand-authored. NOTHING is fetched from
+       gavilan.edu - no stylesheets, no logos, no images. Hotlinking their
+       assets would break the moment they redesign and would read as a scrape.
+       The palette is built around the same maroon the widget uses for its
+       brand token (--brand: #8a1c30), so the widget sits in the page instead
+       of on top of it.
+       --------------------------------------------------------------------- */
+    :root {
+      --maroon: #8a1c30;
+      --maroon-dark: #6b1425;
+      --maroon-ink: #ffffff;
+      --gold: #c9a227;
+      --ink: #1a1d21;
+      --muted: #5b6570;
+      --page: #f6f4f2;
+      --card: #ffffff;
+      --line: #e3e0db;
+      --demo: #7c2d12;
+      --demo-bg: #fef3c7;
+      --demo-line: #b45309;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { -webkit-text-size-adjust: 100%; }
+
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.55;
+    }
+
+    h1, h2, h3 {
+      font-family: Georgia, "Times New Roman", serif;
+      line-height: 1.2;
+      margin: 0;
+    }
+
+    a { color: var(--maroon); }
+    a:hover { text-decoration: none; }
+
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+
+    /* --- demo banner: the first thing on the page, and impossible to miss --- */
+    .demo-banner {
+      background: var(--demo-bg);
+      border-bottom: 3px solid var(--demo-line);
+      color: var(--demo);
+      font-size: 14px;
+      padding: 10px 20px;
+    }
+    .demo-banner__inner {
+      max-width: 1080px;
+      margin: 0 auto;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 4px 10px;
+    }
+    .demo-banner__tag {
+      background: var(--demo-line);
+      color: #fff;
+      font-weight: 700;
+      font-size: 12px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      padding: 3px 8px;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+    .demo-banner a { color: var(--demo); font-weight: 600; }
+
+    /* --- utility strip + masthead --- */
+    .utility {
+      background: var(--maroon-dark);
+      color: rgba(255,255,255,.85);
+      font-size: 13px;
+    }
+    .utility__inner {
+      max-width: 1080px; margin: 0 auto; padding: 6px 20px;
+      display: flex; flex-wrap: wrap; gap: 18px; justify-content: flex-end;
+    }
+    .utility a { color: rgba(255,255,255,.85); text-decoration: none; }
+    .utility a:hover { color: #fff; text-decoration: underline; }
+
+    .masthead { background: var(--maroon); color: var(--maroon-ink); }
+    .masthead__inner {
+      max-width: 1080px; margin: 0 auto; padding: 18px 20px;
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    }
+    .mark { flex: 0 0 auto; display: block; width: 42px; height: 42px; }
+    .wordmark { display: flex; flex-direction: column; }
+    .wordmark__college {
+      font-size: 12px; letter-spacing: .22em; text-transform: uppercase;
+      color: rgba(255,255,255,.82);
+    }
+    .wordmark__site {
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 27px; font-weight: 700; letter-spacing: .01em;
+    }
+    .masthead__spacer { flex: 1 1 auto; }
+    .masthead__note {
+      font-size: 13px; color: rgba(255,255,255,.8);
+      border-left: 2px solid var(--gold); padding-left: 12px;
+    }
+
+    /* --- primary nav --- */
+    .nav { background: #fff; border-bottom: 3px solid var(--gold); }
+    .nav__inner {
+      max-width: 1080px; margin: 0 auto; padding: 0 20px;
+      display: flex; flex-wrap: wrap;
+    }
+    .nav a {
+      display: block; padding: 13px 15px;
+      color: var(--ink); text-decoration: none;
+      font-size: 14px; font-weight: 600; letter-spacing: .01em;
+      border-bottom: 3px solid transparent; margin-bottom: -3px;
+    }
+    .nav a:hover { color: var(--maroon); border-bottom-color: var(--maroon); }
+    .nav a[aria-current="page"] { color: var(--maroon); border-bottom-color: var(--maroon); }
+
+    /* --- search band (visual context only; see the disabled note) --- */
+    .searchband { background: #ece8e4; border-bottom: 1px solid var(--line); }
+    .searchband__inner { max-width: 1080px; margin: 0 auto; padding: 26px 20px; }
+    .searchband h1 { font-size: 30px; margin-bottom: 6px; }
+    .searchband p { margin: 0 0 16px; color: var(--muted); }
+    .searchform { display: flex; gap: 8px; flex-wrap: wrap; max-width: 640px; }
+    .searchform input {
+      flex: 1 1 260px; min-width: 0;
+      padding: 11px 14px; font: inherit; font-size: 15px;
+      border: 1px solid #c8c3bc; border-radius: 6px; background: #fff; color: var(--ink);
+    }
+    .searchform input:disabled { background: #f4f2f0; color: #8b8681; cursor: not-allowed; }
+    .searchform button {
+      flex: 0 0 auto; padding: 11px 22px; font: inherit; font-weight: 600; font-size: 15px;
+      border: none; border-radius: 6px; background: var(--maroon); color: #fff;
+    }
+    .searchform button:disabled { opacity: .55; cursor: not-allowed; }
+    .searchband__disabled { margin: 10px 0 0; font-size: 13px; color: var(--muted); }
+
+    /* --- content --- */
+    main { padding: 30px 0 64px; }
+    .cols { display: grid; grid-template-columns: 2fr 1fr; gap: 26px; align-items: start; }
+    @media (max-width: 800px) { .cols { grid-template-columns: 1fr; } }
+
+    .card {
+      background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+      padding: 20px 22px; margin-bottom: 22px;
+    }
+    .card h2 { font-size: 21px; margin-bottom: 10px; }
+    .card h3 { font-size: 16px; margin: 18px 0 6px; font-family: inherit; font-weight: 700; }
+    .card p { margin: 0 0 12px; }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+
+    .card--accent { border-left: 5px solid var(--maroon); }
+
+    .stack { list-style: none; margin: 0; padding: 0; }
+    .stack li { padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 15px; }
+    .stack li:last-child { border-bottom: none; }
+    .stack a { font-weight: 600; text-decoration: none; }
+    .stack a:hover { text-decoration: underline; }
+
+    .note { font-size: 14px; color: var(--muted); }
+
+    .askbox { background: #fdf9f2; border: 1px solid #e6d9b8; border-radius: 8px; padding: 18px 20px; }
+    .askbox h2 { font-size: 19px; margin-bottom: 8px; }
+    .askbox p { margin: 0 0 10px; font-size: 15px; }
+    .askbox p:last-child { margin-bottom: 0; }
+    .askbox strong { color: var(--maroon); }
+
+    .qs { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+    .qs li {
+      background: #fff; border: 1px solid var(--line); border-radius: 999px;
+      padding: 6px 13px; font-size: 14px; color: var(--maroon); font-weight: 600;
+    }
+
+    .faq { margin: 0; }
+    .faq dt { font-weight: 700; margin-top: 14px; }
+    .faq dt:first-child { margin-top: 0; }
+    .faq dd { margin: 4px 0 0; color: var(--muted); }
+
+    /* --- footer --- */
+    footer {
+      background: var(--maroon-dark); color: rgba(255,255,255,.85);
+      padding: 26px 0; font-size: 14px;
+    }
+    footer .wrap > p { margin: 0 0 10px; }
+    footer p:last-child { margin-bottom: 0; }
+    footer a { color: #fff; }
+    .footer__meta {
+      margin-top: 16px; padding-top: 14px; border-top: 1px solid rgba(255,255,255,.22);
+      font-size: 12.5px; color: rgba(255,255,255,.7); word-break: break-all;
+    }
+    .footer__meta code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px; color: #fff;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="demo-banner" role="note">
+    <div class="demo-banner__inner">
+      <span class="demo-banner__tag">Demo site</span>
+      <span>
+        This is <strong>not</strong> the Gavilan College Library website. It is a sample page
+        built by Cal Poly DxHub to show the library chat assistant in context - the page
+        content around it is illustrative only. The real site is
+        <a href="https://www.gavilan.edu/library/" target="_blank" rel="noopener">gavilan.edu/library</a>.
+      </span>
+    </div>
+  </div>
+
+  <div class="utility">
+    <div class="utility__inner">
+      <a href="https://www.gavilan.edu/" target="_blank" rel="noopener">Gavilan College</a>
+      <a href="https://www.gavilan.edu/library/contactus.php" target="_blank" rel="noopener">Contact</a>
+      <a href="https://gavilan.libguides.com/" target="_blank" rel="noopener">Research Guides</a>
+    </div>
+  </div>
+
+  <header class="masthead">
+    <div class="masthead__inner">
+      <!-- Local inline SVG mark. Deliberately generic (an open book), NOT the college seal:
+           a demo page must not present itself as officially branded. -->
+      <svg class="mark" viewBox="0 0 48 48" role="img" aria-label="Open book">
+        <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round">
+          <path d="M24 14c-4-3-9-4-14-4v26c5 0 10 1 14 4 4-3 9-4 14-4V10c-5 0-10 1-14 4z" />
+          <path d="M24 14v26" />
+        </g>
+      </svg>
+      <div class="wordmark">
+        <span class="wordmark__college">Gavilan College</span>
+        <span class="wordmark__site">Library</span>
+      </div>
+      <div class="masthead__spacer"></div>
+      <div class="masthead__note">Gilroy Campus &middot; Building&nbsp;LI</div>
+    </div>
+  </header>
+
+  <nav class="nav" aria-label="Library sections">
+    <div class="nav__inner">
+      <a href="https://www.gavilan.edu/library/" target="_blank" rel="noopener" aria-current="page">Home</a>
+      <a href="https://www.gavilan.edu/library/findresources.php" target="_blank" rel="noopener">Find Resources</a>
+      <a href="https://www.gavilan.edu/library/libraryservices.php" target="_blank" rel="noopener">Services</a>
+      <a href="https://www.gavilan.edu/library/researchassistance.php" target="_blank" rel="noopener">Research Help</a>
+      <a href="https://www.gavilan.edu/library/howdoi.php" target="_blank" rel="noopener">How Do I&hellip;?</a>
+      <a href="https://www.gavilan.edu/library/librarycard.php" target="_blank" rel="noopener">Library Card</a>
+      <a href="https://www.gavilan.edu/library/about-the-library.php" target="_blank" rel="noopener">About</a>
+    </div>
+  </nav>
+
+  <div class="searchband">
+    <div class="searchband__inner">
+      <h1>Gavilan College Library</h1>
+      <p>Books, e-books, articles, course reserves, and research help for Gavilan students.</p>
+      <form class="searchform" onsubmit="return false;">
+        <input type="search" aria-label="Search the catalog"
+               placeholder="Search books, articles, and more&hellip;" disabled />
+        <button type="submit" disabled>Search</button>
+      </form>
+      <p class="searchband__disabled">
+        Catalog search is switched off on this demo page. The chat assistant at the
+        bottom&#8209;right is live and does search the real catalog.
+      </p>
+    </div>
+  </div>
+
+  <main>
+    <div class="wrap cols">
+      <div>
+        <section class="card card--accent">
+          <h2>Ask the library assistant</h2>
+          <p>
+            Click <strong>Ask the Library</strong> in the bottom&#8209;right corner. The assistant
+            answers routine questions about hours, borrowing, textbooks, course reserves,
+            research databases, and what the library offers, and it hands research questions
+            off to a librarian. It is the same assistant the library would embed on their own
+            pages - this page just adds the one script tag.
+          </p>
+          <ul class="qs">
+            <li>What are the library hours?</li>
+            <li>How do I check out a book?</li>
+            <li>Do you have the textbook for ENGL 1A?</li>
+            <li>Can I borrow a laptop?</li>
+            <li>What research databases are available?</li>
+          </ul>
+        </section>
+
+        <section class="card">
+          <h2>How do I&hellip;?</h2>
+          <dl class="faq">
+            <dt>Get a library card</dt>
+            <dd>Currently enrolled students are set up with borrowing privileges; bring your GavID to the circulation desk.</dd>
+            <dt>Find my course textbook</dt>
+            <dd>Many textbooks are on course reserve or available online through the catalog. The bookstore sells and rents course materials.</dd>
+            <dt>Request something the library does not own</dt>
+            <dd>Interlibrary Loan borrows books and articles from other libraries on your behalf.</dd>
+            <dt>Get research help</dt>
+            <dd>Reference librarians are available in person, by phone, and by email during open hours.</dd>
+          </dl>
+        </section>
+      </div>
+
+      <aside>
+        <section class="card">
+          <h2>Hours</h2>
+          <p class="note">
+            Library hours change by term and around holidays. This demo page deliberately
+            does not print a schedule that could go stale - ask the assistant instead. It
+            answers from the library's own pages and cites the page it used.
+          </p>
+        </section>
+
+        <section class="card">
+          <h2>Quick links</h2>
+          <ul class="stack">
+            <li><a href="https://www.gavilan.edu/library/databases.php" target="_blank" rel="noopener">Research databases (A&ndash;Z)</a></li>
+            <li><a href="https://gavilan.libguides.com/" target="_blank" rel="noopener">Subject research guides</a></li>
+            <li><a href="https://www.gavilan.edu/library/ill.php" target="_blank" rel="noopener">Interlibrary Loan</a></li>
+            <li><a href="https://gavilan.bkstr.com/pages/courses-materials-results" target="_blank" rel="noopener">Bookstore course materials</a></li>
+            <li><a href="https://www.gavilan.edu/about/maps/main_map.php" target="_blank" rel="noopener">Campus map</a></li>
+          </ul>
+        </section>
+
+        <section class="askbox">
+          <h2>Talk to a librarian</h2>
+          <p>
+            The assistant is for routine questions. For help shaping a research topic,
+            picking sources, or citing them, a <strong>librarian</strong> is the right
+            person - the assistant will point you there.
+          </p>
+          <p><a href="https://www.gavilan.edu/library/contactus.php" target="_blank" rel="noopener">Contact the library</a></p>
+        </section>
+      </aside>
+    </div>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <p>
+        <strong>Demo build.</strong> A packaging demo of the Gavilan College Library chat
+        assistant, deployed by the project's own CDK stack. Not an official Gavilan College
+        page, and not indexed by search engines.
+      </p>
+      <p>Built with Cal Poly DxHub. The real library site is
+        <a href="https://www.gavilan.edu/library/" target="_blank" rel="noopener">gavilan.edu/library</a>.</p>
+      <!-- Both values are stamped at deploy time, so this footer doubles as proof that the
+           page discovered its own backend rather than carrying a hardcoded endpoint. -->
+      <p class="footer__meta">
+        Assistant endpoint: <code>__API_URL__</code><br />
+        Widget served from: <code>__WIDGET_SRC__</code>
+      </p>
+    </div>
+  </footer>
+
+  <!--
+    ============================================================
+    THE PRODUCTION EMBED. Exactly the tag the library would paste
+    onto their own site: the same widget.js, from the same
+    CloudFront distribution, pointed at the same /query endpoint.
+    No mock.js, no forked copy, no inlined widget code.
+    ============================================================
+  -->
+  <script src="__WIDGET_SRC__" data-api-url="__API_URL__" defer></script>
+</body>
+</html>

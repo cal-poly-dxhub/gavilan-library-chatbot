@@ -164,6 +164,25 @@ cors:
     - https://www.gavilan.edu       # production: the library site hosting the widget
     - http://localhost:8000         # DEV ONLY (frontend/demo.html) - safe to delete for final launch
 
+# --- Shareable demo site ---
+#
+# A public page (its own S3 bucket + CloudFront distribution) that embeds the production widget
+# in a Gavilan-Library-looking sample site, so one `cdk deploy` hands back a link the client can
+# open with no setup. The page is frontend/demo-site.html; the stack stamps the deployed API URL
+# and widget CDN URL into it at deploy time, so nothing about it is account- or region-specific.
+#
+# Two things follow from enabling it, both handled by the stack:
+#   - its CloudFront origin is appended to the CORS allowlist above (the demo runs the REAL
+#     cross-origin embed, so the browser needs the origin listed - it is resolved from the
+#     distribution at deploy, never hardcoded)
+#   - the page is served with a noindex meta tag AND an X-Robots-Tag response header
+#
+# Set to false for a launched install that no longer needs a showcase; the next deploy removes
+# the bucket, the distribution, and the extra CORS origin. Removing the widget/production path
+# is NOT affected either way - the demo has its own bucket and CDN.
+demo_site:
+  enabled: true
+
 request:
   # Max characters accepted for a user query. Over this, the handler returns HTTP 400 BEFORE
   # any retrieval or guardrail call. This is the real server-side size control
