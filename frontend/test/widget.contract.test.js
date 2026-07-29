@@ -1403,6 +1403,102 @@ test("switching before the first message re-renders the greeting and starter que
   }
 });
 
+// --- where the bilingual UI meets the accessibility remediation ----------
+//
+// The two features touch the same nodes from opposite directions: the audit added text
+// that only a screen reader ever reads, and the toggle says every string a person can
+// perceive comes out of the table. These pin the overlap, which neither feature's own
+// tests cover.
+
+test("the visually-hidden speaker labels are localized too", async () => {
+  // A label nobody can see is still text that gets read aloud - so a Spanish UI reading
+  // "Library assistant said:" over a Spanish answer is exactly the gap the toggle exists
+  // to close, and it is invisible to every check that looks at the rendered page.
+  const restore = withNetwork(okJson({ answer: "Abierto de 9 a 5.", sources: [] }));
+  try {
+    const doc = makeDoc();
+    const handle = widget.mount(doc);
+    clickLanguage(handle, "es");
+    handle.submit("¿horario?");
+    await flush();
+
+    const labels = findAll(handle.shadow, "msg").map(function (m) {
+      return findByClass(m, "sr-only").textContent;
+    });
+    assert.deepStrictEqual(labels, [
+      widget.STRINGS.es.speakerBot,   // the re-seeded Spanish greeting
+      widget.STRINGS.es.speakerYou,
+      widget.STRINGS.es.speakerBot
+    ]);
+    // English is what dev's speaker-label test asserts by literal; keep the tables honest
+    // about it so that test and this one cannot drift apart.
+    assert.strictEqual(widget.STRINGS.en.speakerYou, "You said:");
+    assert.strictEqual(widget.STRINGS.en.speakerBot, "Library assistant said:");
+  } finally {
+    widget.resetLanguage();
+    restore();
+  }
+});
+
+test("the pending status region announces in the chosen language", async () => {
+  const restore = withNetwork(function () { return new Promise(function () {}); }); // never settles
+  const priorDelay = widget.CONFIG.wakingHintDelayMs;
+  widget.CONFIG.wakingHintDelayMs = 10;
+  try {
+    const doc = makeDoc();
+    const handle = widget.mount(doc);
+    clickLanguage(handle, "es");
+    handle.submit("¿horario?");
+
+    const bubble = findTypingBubble(handle.shadow);
+    assert.ok(bubble, "a pending indicator is rendered");
+    assert.strictEqual(bubble.getAttribute("role"), "status");
+    // One status region, not two: the dots row must not carry a nested role/aria-label,
+    // or the pending state is announced twice.
+    const dots = findByClass(bubble, "typing");
+    assert.strictEqual(dots.getAttribute("role"), null, "the dots row is not a second region");
+    assert.strictEqual(dots.getAttribute("aria-label"), null, "and carries no label of its own");
+    assert.ok(bubble.textContent.indexOf(widget.STRINGS.es.typingStatus) >= 0);
+
+    await sleep(40);
+    assert.ok(
+      bubble.textContent.indexOf(widget.STRINGS.es.workingHint) >= 0,
+      "the slow-response note is Spanish as well"
+    );
+  } finally {
+    widget.CONFIG.wakingHintDelayMs = priorDelay;
+    widget.resetLanguage();
+    restore();
+  }
+});
+
+test("switching language before the first message keeps the composer described", async () => {
+  // The greeting describes the composer (F3), and a switch tears that greeting down and
+  // builds a new one. Wired at mount only, the description would point at a removed node
+  // and the Spanish opening state would arrive undescribed - a silent regression, since
+  // both features' own tests still pass.
+  const doc = makeFocusDoc();
+  const handle = widget.mount(doc);
+  try {
+    const input = findByClass(handle.shadow, "composer__input");
+    const before = input.getAttribute("aria-describedby");
+    assert.ok(before, "described on first launch");
+
+    clickLanguage(handle, "es");
+
+    const id = input.getAttribute("aria-describedby");
+    assert.ok(id, "still described after the switch");
+    const described = findAll(handle.shadow, "bubble").filter(function (b) { return b.id === id; });
+    assert.strictEqual(described.length, 1, "exactly one live node answers to the id");
+    assert.ok(
+      described[0].textContent.indexOf("Biblioteca de Gavilan College") >= 0,
+      "and it is the SPANISH greeting, not the removed English one"
+    );
+  } finally {
+    widget.resetLanguage();
+  }
+});
+
 test("switching mid-conversation leaves every past turn exactly as it was said", async () => {
   const restore = withNetwork(okJson({ answer: "Open **9-5**.", sources: [] }));
   try {
