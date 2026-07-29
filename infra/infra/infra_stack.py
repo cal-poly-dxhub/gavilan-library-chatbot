@@ -45,12 +45,15 @@ from aws_cdk import (
     aws_s3 as s3,
     aws_s3_deployment as s3deploy,
     aws_s3vectors as s3vectors,
+    aws_sns as sns,
+    aws_sns_subscriptions as sns_subs,
     triggers,
 )
 from constructs import Construct
 
 from infra.config import (
     resolve_cors_allow_origins,
+    resolve_feedback,
     resolve_scraper_tiers,
     resolve_seed_urls,
 )
@@ -175,6 +178,10 @@ class GavilanChatbotStack(Stack):
         # removes the bucket, the distribution, and its CORS origin with it. Optional block so a
         # config predating this feature still synths.
         demo_site_enabled = bool(config.get("demo_site", {}).get("enabled", True))
+        # Feedback endpoint (POST /feedback -> SNS email). Resolved in infra/config.py, which
+        # decides between "off", "on with a destination", and "misconfigured" - a malformed
+        # address fails synth there rather than deploying a subscription nobody can confirm.
+        feedback_cfg = resolve_feedback(config)
 
         kb_name = kb_cfg["name"]
         # S3 Vectors store knobs (replaces the OpenSearch Serverless collection/index).
@@ -1076,6 +1083,107 @@ class GavilanChatbotStack(Stack):
             throttling_burst_limit=http_api_cfg["throttling_burst_limit"],
         )
 
+        # --- Feedback path: SNS topic + email subscription + Lambda + POST /feedback ----
+        #
+        # "It said something wrong, how do we fix it?" The fix is RAG-first (D-20260727-10): edit
+        # the library webpage and the next scheduled scrape of that page's tier corrects the bot.
+        # So the value of this
+        # path is entirely in telling a librarian WHICH PAGE to edit - the notification carries the
+        # source URLs the reported answer cited.
+        #
+        # SNS, NOT SES. SES starts every account in a sandbox restricted to pre-verified addresses
+        # and needs a support request to leave it, which would land on the client at handoff and
+        # break one-click install into a fresh account (verified on the deploy account 2026-07-29:
+        # ProductionAccessEnabled false). An SNS email subscription needs one confirmation click by
+        # the recipient and nothing else.
+        #
+        # NO SERVER-SIDE STORE: no table, no bucket, no logged copy. The email is the record.
+        #
+        # NOTHING IS CREATED unless there is somewhere to send: no topic, no subscription, no
+        # Lambda, no route. An endpoint that accepts reports with no destination loses them
+        # silently, which is worse than not having one - see resolve_feedback for the three cases.
+        feedback_url = None
+        if feedback_cfg["provision"]:
+            # Standard topic; the destination address is its ONLY subscription. enforce_ssl adds a
+            # topic policy denying non-TLS publishes, matching the buckets' posture. No KMS: the
+            # message lands unencrypted in a mailbox either way, so encrypting it at rest inside
+            # SNS protects nothing while adding a key to the one-click install.
+            feedback_topic = sns.Topic(
+                self,
+                "FeedbackTopic",
+                display_name="Gavilan Library chatbot",
+                enforce_ssl=True,
+            )
+            # The recipient from config.yaml. CloudFormation creates the subscription in
+            # PendingConfirmation and SNS emails a confirmation link; until someone clicks it,
+            # publishes succeed and nothing is delivered. That is inherent to SNS email and is
+            # exactly the one-time step SES production access would have replaced with a ticket.
+            feedback_topic.add_subscription(
+                sns_subs.EmailSubscription(feedback_cfg["email"])
+            )
+
+            # Its OWN role and its OWN function, not a third route on the query Lambda: this code
+            # needs sns:Publish and nothing else, and the query role can already invoke Bedrock and
+            # read the KB. Keeping them apart also keeps the student's free text out of a process
+            # that logs guardrail assessments and query diagnostics.
+            feedback_lambda_role = iam.Role(
+                self,
+                "FeedbackFunctionRole",
+                assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+                description="Execution role for the feedback Lambda (publish one SNS email).",
+                managed_policies=[
+                    iam.ManagedPolicy.from_aws_managed_policy_name(
+                        "service-role/AWSLambdaBasicExecutionRole"
+                    )
+                ],
+            )
+            feedback_topic.grant_publish(feedback_lambda_role)
+
+            feedback_log_group = logs.LogGroup(
+                self,
+                "FeedbackFunctionLogGroup",
+                retention=logs.RetentionDays.THREE_MONTHS,
+                removal_policy=RemovalPolicy.DESTROY,
+            )
+
+            feedback_lambda = _lambda.Function(
+                self,
+                "FeedbackFunction",
+                runtime=_LAMBDA_PYTHON,
+                handler="feedback_handler.lambda_handler",
+                # ONLY feedback_handler.py: it shares app/ with the query handler but needs none
+                # of the query handler's prompt, seed catalog or link table, and bundling them
+                # would tie this function's asset hash to changes it does not care about.
+                code=_lambda.Code.from_asset(
+                    str(_APP_DIR), exclude=["*", "!feedback_handler.py"]
+                ),
+                role=feedback_lambda_role,
+                # One validate + one SNS publish. Nothing to retrieve, nothing to generate.
+                timeout=Duration.seconds(10),
+                memory_size=128,
+                log_group=feedback_log_group,
+                environment={
+                    "FEEDBACK_TOPIC_ARN": feedback_topic.topic_arn,
+                    # Size caps from config.yaml. Feedback text never reaches a model, so the
+                    # guardrails do not screen it and these caps are the controls that exist.
+                    "FEEDBACK_MAX_COMMENT_CHARS": str(feedback_cfg["max_comment_chars"]),
+                    "FEEDBACK_MAX_BODY_BYTES": str(feedback_cfg["max_body_bytes"]),
+                    "FEEDBACK_MAX_SOURCES": str(feedback_cfg["max_sources"]),
+                },
+            )
+
+            # Same HTTP API, so /feedback inherits the SAME CORS allowlist as /query and /warm
+            # (cors_preflight is configured on the API, not per route) and the SAME stage
+            # throttling. Nothing here names an origin.
+            http_api.add_routes(
+                path="/feedback",
+                methods=[apigwv2.HttpMethod.POST],
+                integration=apigwv2_integrations.HttpLambdaIntegration(
+                    "FeedbackIntegration", feedback_lambda
+                ),
+            )
+            feedback_url = f"{http_api.api_endpoint}/feedback"
+
         # --- Widget hosting: private S3 bucket + CloudFront (OAC) ----------------------
 
         # The production widget file is served from a private S3 bucket, reachable ONLY
@@ -1229,6 +1337,26 @@ class GavilanChatbotStack(Stack):
             value=knowledge_base.attr_knowledge_base_id,
             description="Bedrock Knowledge Base id (for eval/eval_config.yaml).",
         )
+        # Feedback: either the endpoint the widget will POST to, or - for the one case that is a
+        # mistake rather than a choice (enabled with no address) - a line in the deploy output
+        # saying why there is no endpoint. A silently absent feature is how this ships broken.
+        if feedback_url:
+            CfnOutput(
+                self,
+                "FeedbackApiUrl",
+                value=feedback_url,
+                description=(
+                    "HTTP API POST /feedback endpoint. The recipient must click the SNS "
+                    "subscription confirmation email once before anything is delivered."
+                ),
+            )
+        elif feedback_cfg["status"]:
+            CfnOutput(
+                self,
+                "FeedbackStatus",
+                value=feedback_cfg["status"],
+                description="Why no /feedback endpoint was created.",
+            )
         if demo_site_enabled:
             CfnOutput(
                 self,

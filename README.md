@@ -12,6 +12,7 @@ AWS-native:
 - **Live catalog:** `search_book_catalog` + `search_course_reserves` query the Ex Libris Primo discovery API directly - the only external, non-AWS dependency (timed out and soft-failing so a slow/broken Primo never blocks a response)
 - **Ingestion:** a scraper Lambda pulls the library site into the KB source bucket and regenerates the database catalog on a weekly schedule
 - **Backend:** Lambda + API Gateway (Python)
+- **Feedback:** `POST /feedback` emails a librarian, via SNS, when someone reports a wrong answer - carrying the pages that answer cited, because fixing the page fixes the bot. Set `feedback.notify_email` in `config.yaml` to switch it on
 - **Infrastructure:** AWS CDK (Python)
 - **Guardrails:** Bedrock Guardrails (content filtering + PII redaction)
 - **Frontend:** embeddable JS widget, plus a deployed demo page that embeds it
@@ -22,7 +23,7 @@ AWS-native:
 - `app/` — Lambda backend (agentic tool-use loop + tools)
 - `eval/` — retrieval and answer-quality evaluation harness
 - `frontend/` — chat widget and the deployed demo page
-- `config.yaml` — model, chunking, retrieval, catalog, and guardrail settings
+- `config.yaml` — model, chunking, retrieval, catalog, feedback, and guardrail settings
 - `docs/` — architecture and planning
 
 ## Architecture
