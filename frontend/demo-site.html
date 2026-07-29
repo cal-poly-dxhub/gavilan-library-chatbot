@@ -777,8 +777,14 @@
 
         $("fixed-total").textContent = money(fixed.total, 2);
         $("var-total").textContent = money(variable, 2);
+        // Name the SOURCE of the per-question price. The meter on the left prices the
+        // conversation actually in front of you and will usually read lower (a short,
+        // friendly conversation is mostly one-call questions), so without this the two
+        // halves of the panel look like they contradict each other.
         $("var-sub").textContent = num(questions) + " questions/month at " +
-                                   money(per.total, 4) + " each";
+                                   money(per.total, 4) + " each (" +
+                                   Q.sample_questions +
+                                   "-question average, not this conversation)";
 
         // The depth term, stated rather than buried: it is much smaller than a
         // reader expects, and hiding that would make the slider look like it is
