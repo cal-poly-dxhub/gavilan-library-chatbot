@@ -51,6 +51,11 @@ Wiring comes from env vars set by the CDK stack.
         curated link reads as ungrounded to the eval judge.
     The widget never sets the flag, so its responses are exactly the `{answer, sources}`
     shape above. Nothing here changes what is sent to the model.
+  - When the request sets `language: "en"|"es"`, the reply is written in that language even if
+    the question was typed in the other one. The field is OPTIONAL and allowlisted: absent (or
+    unrecognized) means no extra system block at all, so the model keeps auto-detecting the
+    language from the question exactly as it did before. It is a generation-side instruction
+    only - retrieval, the tools, and the knowledge base are untouched. See _extract_language.
   - When the request sets `include_usage: true`, the response also carries a `usage`
     object: the BILLABLE units this one question consumed, summed across the whole agent
     loop (every Converse call, the input guardrail screen, the output backstop on each
@@ -123,9 +128,16 @@ _ITEM_ANONYMIZED = "ANONYMIZED"
 # Last-resort student-facing message if the input guardrail blocks but returns no message
 # text (documented behavior is that `outputs` carries the configured block message, so this
 # is only a defensive fallback and should not normally be reached).
+#
+# BILINGUAL, like the configured block messages in config.yaml, and for the same reason: a
+# guardrail block bypasses the model entirely, so nothing here can be translated on the fly and
+# the widget's language control cannot reach it. A Spanish-speaking student who trips a
+# guardrail would otherwise hit an English wall.
 _FALLBACK_BLOCK_MESSAGE = (
     "I can't help with that request. Try asking about the Gavilan College Library, like "
-    "hours, checkouts, and finding materials."
+    "hours, checkouts, and finding materials.\n\n"
+    "No puedo ayudarte con esa solicitud. Puedes preguntar sobre la Biblioteca de Gavilan "
+    "College, como horarios, préstamos y cómo encontrar materiales."
 )
 
 # The tools the agent is given. These names are referenced by the system prompt's <tools>
@@ -195,14 +207,68 @@ def _today_pacific():
     return now.strftime("%A, %Y-%m-%d")
 
 
-def _system_blocks():
-    """The Converse `system` payload: the packaged prompt, today's date, and the curated links.
+# --- Reply language (optional request field) ------------------------------------------------
+#
+# The widget carries a visible English/Español control, and sends `language` ONLY when the
+# person actually chose one. That distinction is the whole design:
+#   - field absent  -> nothing changes. No extra system block, and the model keeps doing what
+#                      it already does well, which is answering in whatever language it was
+#                      asked in. Every pre-existing client (the eval, curl, the legacy
+#                      {"query": ...} shape) is unaffected.
+#   - field present -> one extra system block naming the language to reply in, so an explicit
+#                      Español selection is honored even for a question typed in English.
+# Nothing about retrieval, the tools, or the knowledge base is language-aware: the KB is
+# English and Spanish questions already retrieve from it correctly (measured), so this is a
+# generation-side instruction only.
+#
+# STRICTLY ALLOWLISTED. The code is checked against the table below before it is used, and the
+# prompt text is built from the TABLE's value, never from the client's string - a request field
+# that reached the system prompt verbatim would be a prompt-injection channel.
+_LANGUAGE_FIELD = "language"
+_LANGUAGES = {"en": "English", "es": "Spanish"}
+
+
+def _extract_language(data):
+    """The requested reply language as a supported code, or None if unset/unsupported.
+
+    Tolerant about the shape a client sends (case, surrounding space, a full IETF tag like
+    'es-MX' whose primary subtag is what matters) and strict about the result: anything not in
+    _LANGUAGES yields None, which behaves exactly like no preference at all."""
+    if not isinstance(data, dict):
+        return None
+    raw = data.get(_LANGUAGE_FIELD)
+    if not isinstance(raw, str):
+        return None
+    code = raw.strip().lower().split("-")[0]
+    return code if code in _LANGUAGES else None
+
+
+def _language_block(code):
+    """The system block for an explicitly chosen reply language.
+
+    The <priority_responses> carve-out is not decoration: that section carries the verbatim
+    emergency response (911, the campus-safety number, the safety page URL) and the prompt
+    forbids translating or reformatting it. A blanket "reply in Spanish" arriving after it in
+    the system payload could plausibly override that, which would put a safety-critical,
+    hand-verified message through the model. One clause keeps the existing invariant."""
+    name = _LANGUAGES[code]
+    return (
+        f"The person using the chat has selected {name} as their language. Write your entire "
+        f"reply in {name}, even if they wrote to you in another language. (A "
+        "<priority_responses> reply is still sent exactly as written, in the language it is "
+        "written in.)"
+    )
+
+
+def _system_blocks(language=None):
+    """The Converse `system` payload: the packaged prompt, today's date, the curated links, and
+    - only when the person explicitly chose one - the reply language.
 
     Separate blocks rather than one interpolated string so the prompt itself stays a static
-    asset - the date and the link table are the injected parts, and keeping them apart makes
-    that obvious in a trace.
+    asset - the date, the link table, and the language are the injected parts, and keeping them
+    apart makes that obvious in a trace.
     """
-    return [
+    blocks = [
         {"text": SYSTEM_PROMPT},
         {
             "text": (
@@ -215,6 +281,11 @@ def _system_blocks():
         },
         {"text": _links_block()},
     ]
+    # Appended last, and only if asked for: with no preference the payload is byte-identical to
+    # what it was before this existed.
+    if language:
+        blocks.append({"text": _language_block(language)})
+    return blocks
 
 # Database catalog (Phase 2b: self-updating).
 #   - The HELD list is regenerated weekly by the scraper and written to S3; this Lambda reads the
@@ -1665,7 +1736,7 @@ def _prime_loop(messages, tool_calls, usage=None):
     return chunks
 
 
-def run_agent(messages, usage=None):
+def run_agent(messages, usage=None, language=None):
     """Agentic Bedrock Converse tool-use loop over four tools (KB search, database catalog,
     live Primo book/media catalog, live Primo course reserves).
 
@@ -1693,7 +1764,10 @@ def run_agent(messages, usage=None):
 
     `usage` is the optional billable-usage tally (see _new_usage), mutated in place as the loop
     runs. It is the only way to see that ONE question can be several billed model calls, each
-    resending everything before it. Pass None (the default) to skip the accounting entirely."""
+    resending everything before it. Pass None (the default) to skip the accounting entirely.
+
+    `language` is the explicitly chosen reply language (see _extract_language), or None. It adds
+    one system block and changes nothing else - no tool, no retrieval, no request shape."""
     collected_chunks = []
     catalog_sources = []
     tool_calls = []
@@ -1707,7 +1781,7 @@ def run_agent(messages, usage=None):
     for _ in range(MAX_AGENT_ITERATIONS):
         kwargs = {
             "modelId": GENERATION_MODEL_ID,
-            "system": _system_blocks(),
+            "system": _system_blocks(language),
             "messages": messages,
             "toolConfig": tool_config,
             # Short, direct, low-variance answers for a factual FAQ bot. The maxTokens/temperature
@@ -2046,6 +2120,10 @@ def _handle_query(event):
     # it, so a student's request does not even allocate the dict, let alone return it.
     include_usage = include_full_context or bool(data and data.get(_USAGE_FLAG))
     usage = _new_usage() if include_usage else None
+    # Optional, allowlisted reply language. None (the default, and what every client that does
+    # not send the field gets) leaves the system payload and the model's own language detection
+    # exactly as they were.
+    language = _extract_language(data)
 
     # Everything past validation touches AWS; wrap it so any fault surfaces as a clean, staged
     # JSON error instead of an opaque 500. `stage` names the step that failed. No retry logic.
@@ -2069,7 +2147,7 @@ def _handle_query(event):
         # generation, and the output-guardrail backstop all happen inside; on any fault this
         # whole step reports as the "agent" stage. Seed it with the trimmed conversation history.
         stage = "agent"
-        result = run_agent(_seed_messages(conversation), usage=usage)
+        result = run_agent(_seed_messages(conversation), usage=usage, language=language)
     except Exception as exc:  # noqa: BLE001 - deliberately broad: any AWS/runtime fault
         return _error_response(stage, exc)
 

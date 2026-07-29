@@ -18,10 +18,179 @@
  * `messages` array ({ role: "user"|"assistant", content }) so the bot remembers
  * earlier turns within the session; closing the tab discards it. The server caps
  * and trims the history, so the widget just sends what it has.
+ *
+ * The UI is bilingual (English + Spanish). Every user-visible string lives in the
+ * STRINGS table below, keyed by language code, and a control in the panel header
+ * switches between them. The language choice is session-only too, for the same
+ * reason as the transcript: this widget stores nothing in the browser.
  * ===========================================================================
  */
 (function () {
   "use strict";
+
+  // =========================================================================
+  // =========================  LOCALIZATION  ================================
+  // =========================================================================
+  //
+  // ONE table, keyed by language code. Render code below never holds a user-visible
+  // literal - it calls t("key") - so adding a language is adding a table, not hunting
+  // for strings in DOM-building code.
+  //
+  // WHY A VISIBLE CONTROL AND NOT AUTO-DETECTION. Gavilan serves a large Spanish-speaking
+  // community, and the bot already answers Spanish questions correctly from the English
+  // knowledge base. What was missing is the SHELL: every piece of chrome was English, so
+  // before typing anything a Spanish speaker had no signal that the bot speaks Spanish.
+  // Auto-detection cannot fix that, because it needs a message first. The control's primary
+  // job is discovery in the pre-first-message state; switching is the secondary one.
+  //
+  // Each language is offered under its OWN name (`languageName`), in both UIs: someone
+  // looking for Spanish scans for "Español", not for the word "Spanish".
+  var DEFAULT_LANG = "en";
+
+  // Offered languages, in the order the control shows them.
+  var LANGUAGES = ["en", "es"];
+
+  var STRINGS = {
+    en: {
+      languageName: "English",
+      languageGroupLabel: "Language",
+      title: "Library Help",
+      // The launcher's VISIBLE text, and deliberately its whole accessible name: it carries
+      // no aria-label, so speech input can activate it by the words on screen (2.5.3).
+      launcherLabel: "Ask the Library",
+      panelAria: "Gavilan College Library chat",
+      expandAria: "Expand chat",
+      shrinkAria: "Shrink chat",
+      closeAria: "Close chat",
+      threadAria: "Conversation",
+      inputAria: "Type your question",
+      inputPlaceholder: "Ask a question…",
+      sendLabel: "Send",
+      sendAria: "Send message",
+      // Visually-hidden speaker labels. Who said what is otherwise carried only by bubble
+      // colour and alignment, which is nothing at all in the accessibility tree (1.3.1) -
+      // so these are read aloud, and a Spanish UI has to read them in Spanish.
+      speakerYou: "You said:",
+      speakerBot: "Library assistant said:",
+      // The TEXT of the pending bubble's status region, not a label on it: a live region
+      // announces its content, and the dots beside it are decorative.
+      typingStatus: "Assistant is typing",
+      workingHint: "Working…",
+      greeting:
+        "Hi! I'm the Gavilan College Library assistant. I can help with hours, " +
+        "checking out materials, textbooks, and what the library offers. " +
+        "What can I help you find?",
+      suggestionsLabel: "Try asking:",
+      // Starter questions shown as clickable buttons on first launch, under the greeting.
+      // They disappear as soon as the user sends any message. Scoped to what the bot handles.
+      suggestedQuestions: [
+        "What are the library hours?",
+        "How do I check out a book?",
+        "Where do I find my textbook?",
+        "What research databases are available?"
+      ],
+      sourceOne: "Source",
+      // {n} is replaced with the count; substituted into a text node, never markup.
+      sourcesMany: "Sources ({n})",
+      noAnswer: "Sorry, I didn't get a response. Please try again.",
+      networkError:
+        "Sorry, I couldn't reach the library assistant just now. " +
+        "Please try again in a moment.",
+      retryLabel: "Try again",
+      notConnected: "The library assistant isn't connected yet. Please try again later."
+    },
+    es: {
+      languageName: "Español",
+      languageGroupLabel: "Idioma",
+      title: "Ayuda de la biblioteca",
+      launcherLabel: "Pregunta a la biblioteca",
+      panelAria: "Chat de la Biblioteca de Gavilan College",
+      expandAria: "Ampliar el chat",
+      shrinkAria: "Reducir el chat",
+      closeAria: "Cerrar el chat",
+      threadAria: "Conversación",
+      inputAria: "Escribe tu pregunta",
+      inputPlaceholder: "Haz una pregunta…",
+      sendLabel: "Enviar",
+      sendAria: "Enviar mensaje",
+      speakerYou: "Tú dijiste:",
+      speakerBot: "El asistente de la biblioteca dijo:",
+      typingStatus: "El asistente está escribiendo",
+      workingHint: "Sigo trabajando…",
+      greeting:
+        "¡Hola! Soy el asistente de la Biblioteca de Gavilan College. Te puedo ayudar " +
+        "con los horarios, cómo pedir prestados materiales, los libros de texto y lo " +
+        "que ofrece la biblioteca. ¿Qué buscas?",
+      suggestionsLabel: "Prueba preguntando:",
+      suggestedQuestions: [
+        "¿Cuál es el horario de la biblioteca?",
+        "¿Cómo pido prestado un libro?",
+        "¿Dónde encuentro mi libro de texto?",
+        "¿Qué bases de datos de investigación hay?"
+      ],
+      sourceOne: "Fuente",
+      sourcesMany: "Fuentes ({n})",
+      noAnswer: "Lo siento, no recibí una respuesta. Vuelve a intentarlo.",
+      networkError:
+        "Lo siento, ahora mismo no pude conectarme con el asistente de la biblioteca. " +
+        "Vuelve a intentarlo en unos momentos.",
+      retryLabel: "Reintentar",
+      notConnected:
+        "El asistente de la biblioteca aún no está conectado. Vuelve a intentarlo más tarde."
+    }
+  };
+
+  // The active language, and whether the PERSON chose it. That second flag is load-bearing:
+  // only an explicit choice is sent to the backend (see requestBody), so a visitor who never
+  // touches the control gets exactly the request - and exactly the auto-detected reply
+  // language - that they got before this feature existed.
+  var lang = { code: DEFAULT_LANG, chosen: false };
+
+  /** One localized string. Falls back to the default language for a key a table is missing. */
+  function t(key) {
+    var table = STRINGS[lang.code] || STRINGS[DEFAULT_LANG];
+    var value = table[key];
+    return value === undefined ? STRINGS[DEFAULT_LANG][key] : value;
+  }
+
+  /** t() with {n} filled in. The result is always used as text, never as markup. */
+  function tCount(key, n) {
+    return String(t(key)).replace("{n}", String(n));
+  }
+
+  /** The chosen language code, or null if nobody chose one. */
+  function chosenLanguage() {
+    return lang.chosen ? lang.code : null;
+  }
+
+  /**
+   * Set the language. `chosen` records that a PERSON picked it (which is what reaches the
+   * backend); the UI only ever calls this with chosen = true. Exported for test isolation:
+   * the module is loaded once per process, so a test that clicks "Español" must be able to
+   * put the module back to its shipped default for the tests after it.
+   */
+  function setLanguage(code, chosen) {
+    if (!STRINGS[code]) return false;
+    lang.code = code;
+    lang.chosen = !!chosen;
+    return true;
+  }
+
+  function resetLanguage() {
+    setLanguage(DEFAULT_LANG, false);
+  }
+
+  function getLanguage() {
+    return { code: lang.code, chosen: lang.chosen };
+  }
+
+  // =========================================================================
+  // ========================  END LOCALIZATION  =============================
+  // =========================================================================
+  //
+  // Everything below builds DOM. No user-visible literal belongs past this line -
+  // it comes from t() / STRINGS above, and the contract test scans this half of the
+  // file to keep it that way.
 
   // =========================================================================
   // ============================  API LAYER  ================================
@@ -40,6 +209,8 @@
   // intercepts fetch() to this same URL to serve canned answers; widget.js has
   // no knowledge of that and ships only the real path.
   // -------------------------------------------------------------------------
+  // Timing knobs only. Every user-visible string lives in STRINGS above, so this object
+  // carries numbers and nothing else - a copy change never touches it.
   var CONFIG = {
     // Abort a hung request after this long. Aligned to API Gateway's hard 30s integration
     // cap: past 30s the gateway kills the request anyway, so the browser should outlive the
@@ -49,21 +220,7 @@
     // After this long with no response, the typing indicator gains an honest "still working"
     // note so a slow turn doesn't look frozen. Kept generous so it only shows on genuinely slow
     // responses, not routine ones (it must not read like a startup message every message).
-    wakingHintDelayMs: 6000,
-    title: "Library Help",
-    launcherLabel: "Ask the Library",
-    greeting:
-      "Hi! I'm the Gavilan College Library assistant. I can help with hours, " +
-      "checking out materials, textbooks, and what the library offers. " +
-      "What can I help you find?",
-    // Starter questions shown as clickable buttons on first launch, under the greeting.
-    // They disappear as soon as the user sends any message. Scoped to what the bot handles.
-    suggestedQuestions: [
-      "What are the library hours?",
-      "How do I check out a book?",
-      "Where do I find my textbook?",
-      "What research databases are available?"
-    ]
+    wakingHintDelayMs: 6000
   };
 
   // Capture the script element at load time (before the deferred mount runs),
@@ -147,13 +304,29 @@
   function sendQuery(messages) {
     var url = apiUrl();
     if (!url) {
-      return Promise.resolve({
-        answer:
-          "The library assistant isn't connected yet. Please try again later.",
-        sources: []
-      });
+      return Promise.resolve({ answer: t("notConnected"), sources: [] });
     }
     return realQuery(url, messages);
+  }
+
+  /**
+   * The POST body. Three shapes, written out rather than assembled blindly, because the
+   * DEFAULT one is a contract:
+   *   - nothing opted in     -> the literal { messages } this widget has always sent;
+   *   - a chosen language    -> + `language`, so the backend can tell the model which
+   *                             language to answer in even when the question is typed in
+   *                             the other one (an unset field leaves the backend's existing
+   *                             auto-detection alone);
+   *   - data-usage-events    -> + `include_usage` (demo-only metering, see above).
+   */
+  function requestBody(messages) {
+    var language = chosenLanguage();
+    var usage = usageEventsEnabled();
+    if (!language && !usage) return JSON.stringify({ messages: messages });
+    var body = { messages: messages };
+    if (usage) body.include_usage = true;
+    if (language) body.language = language;
+    return JSON.stringify(body);
   }
 
   /**
@@ -170,17 +343,10 @@
         controller.abort();
       }, CONFIG.requestTimeoutMs);
     }
-    // Two bodies, written out side by side rather than one object mutated by a
-    // conditional: the production request stays the literal { messages } shape,
-    // visible as such in the source and pinned by the contract test. The flag is
-    // added only for an embed that set data-usage-events.
-    var body = usageEventsEnabled()
-      ? JSON.stringify({ messages: messages, include_usage: true })
-      : JSON.stringify({ messages: messages });
     return fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: body,
+      body: requestBody(messages),
       signal: controller ? controller.signal : undefined
     })
       .then(function (res) {
@@ -782,13 +948,26 @@
     "}",
     ".panel[hidden], .launcher[hidden] { display: none !important; }",
     // header
+    //
+    // WRAPS on purpose. The header now holds a title AND the language control, and a translated
+    // title is longer than the English one ("Ayuda de la biblioteca" vs "Library Help"), so on a
+    // narrow panel the two genuinely do not fit on one line. Wrapping drops the controls onto
+    // their own right-aligned row instead of truncating the title or pushing the close button
+    // off the edge - and it needs no per-language width tuning, so a third language cannot
+    // break the layout.
     ".header {",
     "  display: flex; align-items: center; justify-content: space-between;",
+    "  flex-wrap: wrap; row-gap: 8px;",
     "  padding: 12px 14px; background: var(--accent); color: var(--accent-ink);",
     "}",
     // Title uses Bitter (loaded from Google Fonts into the host document head at mount);
     // falls back to a serif until/if it loads. Only the title uses it - body/UI stays default.
-    ".header__title { font-family: 'Bitter', Georgia, 'Times New Roman', serif; font-size: 15px; font-weight: 700; }",
+    ".header__title {",
+    "  font-family: 'Bitter', Georgia, 'Times New Roman', serif; font-size: 15px; font-weight: 700;",
+    // Takes the row it is on, and ellipsises only as a last resort (one unbreakably long word),
+    // since the header wraps before it comes to that.
+    "  flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+    "}",
     ".header__close {",
     "  appearance: none; border: none; background: transparent;",
     "  color: var(--accent-ink); font-size: 22px; line-height: 1;",
@@ -796,7 +975,23 @@
     "}",
     ".header__close:hover { background: rgba(255,255,255,0.18); }",
     ".header__close:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }",
-    ".header__actions { display: inline-flex; align-items: center; gap: 2px; }",
+    ".header__actions { display: inline-flex; align-items: center; gap: 2px; flex: 0 0 auto; margin-left: auto; }",
+    // language control: a segmented pair of real buttons in the header. The ACTIVE one is a
+    // filled white pill, not merely a different text color, so the state reads without relying
+    // on color perception - and it is exposed to assistive tech as aria-pressed, which is also
+    // what drives the styling (one source of truth, no parallel class to fall out of sync).
+    ".header__lang {",
+    "  display: inline-flex; align-items: center; gap: 2px; margin-right: 4px;",
+    "  background: rgba(255,255,255,0.16); border-radius: 999px; padding: 2px;",
+    "}",
+    ".header__lang-btn {",
+    "  appearance: none; border: none; background: transparent; color: var(--accent-ink);",
+    "  font: inherit; font-size: 11px; font-weight: 700; line-height: 1; white-space: nowrap;",
+    "  cursor: pointer; padding: 4px 8px; border-radius: 999px;",
+    "}",
+    ".header__lang-btn:hover { background: rgba(255,255,255,0.2); }",
+    ".header__lang-btn[aria-pressed=\"true\"] { background: #fff; color: var(--brand); }",
+    ".header__lang-btn:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }",
     ".header__expand {",
     "  appearance: none; border: none; background: transparent;",
     "  color: var(--accent-ink); font-size: 17px; line-height: 1;",
@@ -997,31 +1192,40 @@
 
     var root = doc.createElement("div");
     root.className = "root";
-    // Declare the chrome's own language instead of inheriting whatever the host page
-    // says (3.1.2). Every string the widget itself renders is English; the ANSWERS are
-    // not covered by this - the widget is not told what language the model replied in,
-    // so a per-bubble `lang` needs a field on the /query response contract first.
-    root.lang = "en";
+    // The chrome declares its own language rather than inheriting whatever the host page
+    // says (3.1.2). applyLanguage() sets it, here and on every switch, so the declaration
+    // tracks the language the chrome is actually in. Individual turns carry their own
+    // `lang` on top of it (see appendBotMessage), because a switch does not retranslate
+    // what was already said.
     shadow.appendChild(root);
 
-    // in-memory session state (no storage)
-    var state = { open: false, pending: false, expanded: false, messages: [], lastQuestion: null };
+    // in-memory session state (no storage). `started` flips on the first real message and
+    // freezes the opening state (greeting + starter questions) against language switches.
+    var state = {
+      open: false,
+      pending: false,
+      expanded: false,
+      started: false,
+      messages: [],
+      lastQuestion: null
+    };
 
     // launcher
     var launcher = doc.createElement("button");
     launcher.type = "button";
     launcher.className = "launcher";
-    // NO aria-label. The old one named opening the chat, which OVERRODE the visible
-    // "Ask the Library" as the accessible name and left a speech-input user unable to
-    // activate the button by the words on screen (2.5.3). The button's own text is the
-    // name now; aria-haspopup carries what that label used to hint at - it opens a dialog.
+    // NO aria-label, in either language. The old one named opening the chat, which
+    // OVERRODE the visible "Ask the Library" as the accessible name and left a
+    // speech-input user unable to activate the button by the words on screen (2.5.3).
+    // The button's own text is the name now - localized, so the spoken words and the
+    // printed ones still match in Spanish - and aria-haspopup carries what that label
+    // used to hint at: it opens a dialog.
     launcher.setAttribute("aria-haspopup", "dialog");
     var lIcon = doc.createElement("span");
     lIcon.className = "launcher__icon";
     lIcon.setAttribute("aria-hidden", "true");
     lIcon.appendChild(iconChat(doc)); // inline SVG chat bubble
     var lText = doc.createElement("span");
-    lText.textContent = CONFIG.launcherLabel;
     launcher.appendChild(lIcon);
     launcher.appendChild(lText);
     root.appendChild(launcher);
@@ -1034,28 +1238,48 @@
     // launcher hidden while it is open - so it declares itself one and contains focus
     // (see the Tab handling below). Previously it declared modal=false to assistive
     // technology while visually acting modal, and let Tab wander invisibly behind it.
+    // Its aria-label is localized, so applyLanguage() sets it.
     panel.setAttribute("aria-modal", "true");
-    panel.setAttribute("aria-label", "Gavilan College Library chat");
     panel.hidden = true;
 
     var header = doc.createElement("div");
     header.className = "header";
     var hTitle = doc.createElement("span");
     hTitle.className = "header__title";
-    hTitle.textContent = CONFIG.title;
+
+    // Language control. Real buttons (focusable, Enter/Space, name from their own text) in a
+    // labelled group, with the active one exposed as aria-pressed. No ID-based ARIA pairing:
+    // `for`/`aria-labelledby` do not cross a shadow boundary, so the group carries its own
+    // aria-label and each button names itself.
+    var hLang = doc.createElement("div");
+    hLang.className = "header__lang";
+    hLang.setAttribute("role", "group");
+    var langButtons = [];
+    LANGUAGES.forEach(function (code) {
+      var btn = doc.createElement("button");
+      btn.type = "button";
+      btn.className = "header__lang-btn";
+      btn.setAttribute("data-lang", code);
+      // Each language in its own name, identical in both UIs - that is the discovery
+      // affordance, so it must not itself be translated.
+      btn.textContent = STRINGS[code].languageName;
+      btn.addEventListener("click", function () { chooseLanguage(code); });
+      hLang.appendChild(btn);
+      langButtons.push(btn);
+    });
+
     var hExpand = doc.createElement("button");
     hExpand.type = "button";
     hExpand.className = "header__expand";
-    hExpand.setAttribute("aria-label", "Expand chat");
     hExpand.setAttribute("aria-pressed", "false");
     hExpand.appendChild(iconExpand(doc)); // inline SVG, swapped on toggle
     var hClose = doc.createElement("button");
     hClose.type = "button";
     hClose.className = "header__close";
-    hClose.setAttribute("aria-label", "Close chat");
     hClose.textContent = "×"; // ×
     var hActions = doc.createElement("div");
     hActions.className = "header__actions";
+    hActions.appendChild(hLang);
     hActions.appendChild(hExpand);
     hActions.appendChild(hClose);
     header.appendChild(hTitle);
@@ -1066,7 +1290,6 @@
     thread.setAttribute("role", "log");
     thread.setAttribute("aria-live", "polite");
     thread.setAttribute("aria-relevant", "additions");
-    thread.setAttribute("aria-label", "Conversation");
 
     var form = doc.createElement("form");
     form.className = "composer";
@@ -1076,13 +1299,9 @@
     // Advisory input cap so a user gets feedback instead of typing a wall of text. The real
     // limit is the server-side length check; this is intentionally lower and UX-only.
     input.setAttribute("maxlength", "1000");
-    input.setAttribute("aria-label", "Type your question");
-    input.setAttribute("placeholder", "Ask a question…");
     var send = doc.createElement("button");
     send.type = "submit";
     send.className = "composer__send";
-    send.textContent = "Send";
-    send.setAttribute("aria-label", "Send message");
     form.appendChild(input);
     form.appendChild(send);
 
@@ -1090,6 +1309,73 @@
     panel.appendChild(thread);
     panel.appendChild(form);
     root.appendChild(panel);
+
+    // ---- language ----
+
+    /**
+     * Declare a language on one element, in both places the DOM exposes it: the attribute
+     * (what the markup says, and what a stylesheet or an audit reads) and the property (which
+     * a real browser reflects from the attribute anyway). Setting both keeps them in step.
+     */
+    function setLangOn(el) {
+      el.lang = lang.code;
+      el.setAttribute("lang", lang.code);
+    }
+
+    /**
+     * Push the active language into every piece of chrome, and onto the widget's `lang`
+     * attribute so assistive tech and browsers pronounce it correctly. Set on the host element
+     * (the light-DOM node, where the attribute is inherited into the shadow tree) AND on the
+     * shadow's own root container, so neither traversal order misses it.
+     *
+     * Chrome ONLY. Messages already in the thread are never touched: each was rendered with
+     * its own `lang` attribute (see appendBotMessage) and keeps the wording it was said in.
+     */
+    function applyLanguage() {
+      setLangOn(host);
+      setLangOn(root);
+      // The launcher gets its name from its own visible text and nothing else - no
+      // aria-label here, deliberately (2.5.3; see where the launcher is built).
+      lText.textContent = t("launcherLabel");
+      panel.setAttribute("aria-label", t("panelAria"));
+      hTitle.textContent = t("title");
+      hLang.setAttribute("aria-label", t("languageGroupLabel"));
+      for (var i = 0; i < langButtons.length; i++) {
+        var btn = langButtons[i];
+        btn.setAttribute(
+          "aria-pressed",
+          btn.getAttribute("data-lang") === lang.code ? "true" : "false"
+        );
+      }
+      hExpand.setAttribute("aria-label", state.expanded ? t("shrinkAria") : t("expandAria"));
+      hClose.setAttribute("aria-label", t("closeAria"));
+      thread.setAttribute("aria-label", t("threadAria"));
+      input.setAttribute("aria-label", t("inputAria"));
+      input.setAttribute("placeholder", t("inputPlaceholder"));
+      send.textContent = t("sendLabel");
+      send.setAttribute("aria-label", t("sendAria"));
+    }
+
+    /**
+     * A person picked a language. Two effects, and deliberately no third:
+     *   - the chrome switches, and the choice starts riding along with each request so the
+     *     model answers in that language even for a question typed in the other one;
+     *   - the OPENING state (canned greeting + starter questions) re-renders, but only while
+     *     the conversation has not started. That text is not a turn anyone took - it is what
+     *     the panel says before anyone speaks - and leaving it in the other language is the
+     *     one thing that would make the switch look broken.
+     * What does NOT happen: an existing conversation is never retranslated. Past turns are
+     * what was actually said, and rewriting them would cost a model call per message and read
+     * as the bot editing its own history.
+     */
+    function chooseLanguage(code) {
+      if (!STRINGS[code]) return;
+      var same = lang.code === code && lang.chosen;
+      if (same) return;
+      setLanguage(code, true);
+      applyLanguage();
+      if (!state.started) resetOpeningState();
+    }
 
     // ---- rendering ----
 
@@ -1103,6 +1389,10 @@
      * user, nothing at all in the accessibility tree (1.3.1). It goes FIRST in the
      * wrapper so it is read before the message it introduces, and it is out of flow
      * (`.sr-only` is absolutely positioned), so the flex layout is untouched.
+     *
+     * The caller passes a localized string: the label is inside the turn's wrapper, which
+     * carries that turn's `lang`, so it is read in the same language as the turn it names
+     * and stays put when the chrome switches.
      */
     function speakerLabel(who) {
       var label = doc.createElement("span");
@@ -1115,10 +1405,13 @@
       state.messages.push({ role: "user", text: text });
       var wrap = doc.createElement("div");
       wrap.className = "msg msg--user";
+      // Stamp the language this turn happened in, so a later switch relabels the chrome
+      // without relabelling what was already said.
+      wrap.setAttribute("lang", lang.code);
       var bubble = doc.createElement("div");
       bubble.className = "bubble";
       bubble.textContent = text; // text node only — never innerHTML
-      wrap.appendChild(speakerLabel("You said:"));
+      wrap.appendChild(speakerLabel(t("speakerYou")));
       wrap.appendChild(bubble);
       thread.appendChild(wrap);
       scrollToBottom();
@@ -1146,7 +1439,7 @@
       var toggleText = doc.createElement("span");
       toggleText.className = "sources__toggle-text";
       toggleText.textContent =
-        sources.length > 1 ? "Sources (" + sources.length + ")" : "Source";
+        sources.length > 1 ? tCount("sourcesMany", sources.length) : t("sourceOne");
       toggle.appendChild(caret);
       toggle.appendChild(toggleText);
       toggle.addEventListener("click", function () {
@@ -1192,33 +1485,35 @@
       return container;
     }
 
-    /** Append one assistant turn; returns its bubble so the caller can reference it. */
+    /**
+     * Append one assistant turn. Returns both of its nodes, because the greeting needs
+     * each for a different job: the BUBBLE is what the composer's aria-describedby points
+     * at (the description has to be the text, not the wrapper with the speaker label in
+     * it), and the WRAP is what a language switch removes before re-seeding.
+     */
     function appendBotMessage(answer, sources) {
       state.messages.push({ role: "bot", text: answer, sources: sources });
       var wrap = doc.createElement("div");
       wrap.className = "msg msg--bot";
+      // The language this answer was given in; it stays on the message even after the chrome
+      // switches, because the answer itself is not retranslated.
+      wrap.setAttribute("lang", lang.code);
       var bubble = doc.createElement("div");
       bubble.className = "bubble";
       var textEl = doc.createElement("div");
       textEl.className = "md";
       // Render the assistant answer as markdown (safe DOM, no innerHTML). The
       // no-response fallback is plain text and renders as a single paragraph.
-      renderMarkdown(
-        textEl,
-        answer && answer.trim()
-          ? answer
-          : "Sorry, I didn't get a response. Please try again.",
-        doc
-      );
+      renderMarkdown(textEl, answer && answer.trim() ? answer : t("noAnswer"), doc);
       bubble.appendChild(textEl);
       if (sources && sources.length) {
         bubble.appendChild(buildSources(sources));
       }
-      wrap.appendChild(speakerLabel("Library assistant said:"));
+      wrap.appendChild(speakerLabel(t("speakerBot")));
       wrap.appendChild(bubble);
       thread.appendChild(wrap);
       scrollToBottom();
-      return bubble;
+      return { wrap: wrap, bubble: bubble };
     }
 
     function showTyping() {
@@ -1236,7 +1531,7 @@
       bubble.setAttribute("role", "status");
       var statusText = doc.createElement("span");
       statusText.className = "sr-only";
-      statusText.textContent = "Assistant is typing";
+      statusText.textContent = t("typingStatus");
       bubble.appendChild(statusText);
       var typing = doc.createElement("div");
       typing.className = "typing";
@@ -1262,7 +1557,7 @@
       var hintTimer = setTimeout(function () {
         var hint = doc.createElement("div");
         hint.className = "typing__hint";
-        hint.textContent = "Working…";
+        hint.textContent = t("workingHint");
         bubble.appendChild(hint);
         scrollToBottom();
       }, CONFIG.wakingHintDelayMs);
@@ -1281,19 +1576,18 @@
     function appendError(question) {
       var wrap = doc.createElement("div");
       wrap.className = "msg msg--bot";
+      wrap.setAttribute("lang", lang.code);
       var bubble = doc.createElement("div");
       bubble.className = "bubble bubble--error";
       var msg = doc.createElement("div");
-      msg.textContent =
-        "Sorry, I couldn't reach the library assistant just now. " +
-        "Please try again in a moment.";
+      msg.textContent = t("networkError");
       bubble.appendChild(msg);
       var retry = null;
       if (question) {
         retry = doc.createElement("button");
         retry.type = "button";
         retry.className = "retry";
-        retry.textContent = "Try again";
+        retry.textContent = t("retryLabel");
         retry.addEventListener("click", function () {
           wrap.parentNode && wrap.parentNode.removeChild(wrap);
           // Resend the existing transcript; do NOT re-append the user turn (it's already there).
@@ -1301,7 +1595,7 @@
         });
         bubble.appendChild(retry);
       }
-      wrap.appendChild(speakerLabel("Library assistant said:"));
+      wrap.appendChild(speakerLabel(t("speakerBot")));
       wrap.appendChild(bubble);
       thread.appendChild(wrap);
       scrollToBottom();
@@ -1338,15 +1632,18 @@
     // First-launch example questions. Rendered under the greeting; each is a button that submits
     // that question. They are removed on the first message (typed or clicked), never to return.
     var suggestionsWrap = null;
+    // The greeting bubble, kept so a language switch before the first message can replace it.
+    var greetingWrap = null;
 
     function renderSuggestions() {
-      var qs = CONFIG.suggestedQuestions;
+      var qs = t("suggestedQuestions");
       if (!qs || !qs.length) return;
       var wrap = doc.createElement("div");
       wrap.className = "suggestions";
+      wrap.setAttribute("lang", lang.code);
       var label = doc.createElement("div");
       label.className = "suggestions__label";
-      label.textContent = "Try asking:";
+      label.textContent = t("suggestionsLabel");
       wrap.appendChild(label);
       qs.forEach(function (q) {
         var btn = doc.createElement("button");
@@ -1375,9 +1672,52 @@
       }
     }
 
+    /**
+     * Re-render the panel's opening state (canned greeting + starter questions) in the current
+     * language. Only ever called while state.started is false, so this replaces text the widget
+     * wrote itself and never a turn from a real exchange. No network call: the greeting is
+     * canned in both languages, so switching costs nothing.
+     */
+    function resetOpeningState() {
+      if (state.started) return;
+      if (greetingWrap && greetingWrap.parentNode) {
+        greetingWrap.parentNode.removeChild(greetingWrap);
+      }
+      greetingWrap = null;
+      removeSuggestions();
+      // Nothing but the greeting can be in the transcript before the first message.
+      state.messages = [];
+      seedOpeningState();
+    }
+
+    /**
+     * Render the opening state: the canned greeting, the starter questions, and the
+     * composer's description.
+     *
+     * On first launch, focus lands in the composer with the greeting and the starter
+     * questions behind it in the tab order, so a screen-reader user met an empty text box.
+     * Describing the composer with the greeting offers that content instead. It is dropped
+     * with the suggestions on the first message (see removeSuggestions), so later turns are
+     * not prefixed by a stale description every time focus returns here. Both ends of the
+     * reference are inside this shadow root, which is the only way an id reference resolves.
+     *
+     * The wiring lives HERE rather than at mount, because a language switch before the first
+     * message tears the greeting down and builds a new one: done at mount only, the
+     * description would point at a removed node and the Spanish opening state would arrive
+     * undescribed.
+     */
+    function seedOpeningState() {
+      var greeting = appendBotMessage(t("greeting"), []);
+      greetingWrap = greeting.wrap;
+      renderSuggestions();
+      greeting.bubble.id = GREETING_ID;
+      input.setAttribute("aria-describedby", GREETING_ID);
+    }
+
     function submitQuestion(question) {
       var text = String(question == null ? "" : question).trim();
       if (!text || state.pending) return;
+      state.started = true; // the opening state is now history: never re-rendered
       removeSuggestions(); // the starter questions go away once any message is sent
       state.lastQuestion = text;
       appendUserMessage(text); // the user turn is appended to the transcript exactly ONCE, here
@@ -1479,7 +1819,7 @@
         panel.classList.remove("panel--expanded");
       }
       hExpand.setAttribute("aria-pressed", state.expanded ? "true" : "false");
-      hExpand.setAttribute("aria-label", state.expanded ? "Shrink chat" : "Expand chat");
+      hExpand.setAttribute("aria-label", state.expanded ? t("shrinkAria") : t("expandAria"));
       setIcon(hExpand, state.expanded ? iconCollapse(doc) : iconExpand(doc));
       scrollToBottom();
     }
@@ -1545,19 +1885,12 @@
       }, true);
     }
 
+    // Paint every string + the lang attribute before anything is shown, so the panel opens in
+    // the active language rather than in English-then-corrected.
+    applyLanguage();
+
     // seed the greeting + first-launch example questions so they're present when the panel opens
-    var greetingBubble = appendBotMessage(CONFIG.greeting, []);
-    renderSuggestions();
-    // On first launch, focus lands in the composer with the greeting and the starter
-    // questions behind it in the tab order, so a screen-reader user met an empty text
-    // box. Describing the composer with the greeting offers that content instead. It is
-    // dropped with the suggestions on the first message, so later turns are not prefixed
-    // by a stale description every time focus returns here. Both ends of the reference
-    // are inside this shadow root, which is the only way an id reference resolves here.
-    if (greetingBubble) {
-      greetingBubble.id = GREETING_ID;
-      input.setAttribute("aria-describedby", GREETING_ID);
-    }
+    seedOpeningState();
 
     return {
       host: host,
@@ -1565,6 +1898,7 @@
       open: openPanel,
       close: closePanel,
       submit: submitQuestion,
+      chooseLanguage: chooseLanguage,
       getState: function () { return state; }
     };
   }
@@ -1600,7 +1934,16 @@
       USAGE_ATTR: USAGE_ATTR,
       USAGE_EVENT: USAGE_EVENT,
       CONFIG: CONFIG,
-      HOST_ID: HOST_ID
+      HOST_ID: HOST_ID,
+      // Localization surface. setLanguage/resetLanguage exist for test isolation: the module
+      // is loaded once per process, so a test that switches language has to hand the default
+      // back to the tests that follow it.
+      STRINGS: STRINGS,
+      LANGUAGES: LANGUAGES,
+      DEFAULT_LANG: DEFAULT_LANG,
+      getLanguage: getLanguage,
+      setLanguage: setLanguage,
+      resetLanguage: resetLanguage
     };
   }
 })();

@@ -1214,6 +1214,466 @@ test("clicking an example question submits it and removes the suggestions", asyn
   }
 });
 
+// =========================================================================
+// ===================  bilingual UI (English / Español)  ==================
+// =========================================================================
+//
+// The bot already answers Spanish questions correctly; what was missing was the shell
+// around the conversation. So these tests are about the SHELL: that a Spanish speaker can
+// see and reach their language before typing anything, that switching swaps every string
+// and the `lang` attribute, that it does NOT rewrite what was already said, and that a
+// visitor who never touches the control sends exactly the request they sent before.
+//
+// Deliberately invariant-based rather than copy-based: they assert that every English key
+// has a Spanish counterpart and that no user-visible literal is left inline in render code,
+// so the copy can be corrected by a native speaker without touching the tests.
+
+// The render half of the file: everything after the localization table. User-visible
+// literals are allowed above this point and nowhere below it.
+const RENDER_SOURCE = SOURCE.slice(SOURCE.indexOf("END LOCALIZATION"));
+
+// Switch language the way a person does - by clicking the control - and hand the module's
+// default back afterwards (it is loaded once per process, so language leaks between tests).
+function clickLanguage(handle, code) {
+  const btn = findAll(handle.shadow, "header__lang-btn").filter(function (b) {
+    return b.getAttribute("data-lang") === code;
+  })[0];
+  assert.ok(btn, "a control button exists for " + code);
+  btn.fire("click");
+  return btn;
+}
+
+function chromeText(handle) {
+  return {
+    title: findByClass(handle.shadow, "header__title").textContent,
+    placeholder: findByClass(handle.shadow, "composer__input").getAttribute("placeholder"),
+    send: findByClass(handle.shadow, "composer__send").textContent,
+    launcher: findByClass(handle.shadow, "launcher").textContent,
+    closeAria: findByClass(handle.shadow, "header__close").getAttribute("aria-label")
+  };
+}
+
+// --- the one string table ------------------------------------------------
+test("every language table carries the same keys, and none is empty", () => {
+  const codes = widget.LANGUAGES;
+  assert.ok(codes.length >= 2, "at least English and one other language are offered");
+  assert.ok(codes.indexOf(widget.DEFAULT_LANG) >= 0, "the default language is one of them");
+
+  const reference = Object.keys(widget.STRINGS[widget.DEFAULT_LANG]).sort();
+  codes.forEach(function (code) {
+    const table = widget.STRINGS[code];
+    assert.ok(table, "a table exists for " + code);
+    assert.deepStrictEqual(
+      Object.keys(table).sort(),
+      reference,
+      "table for " + code + " has exactly the default language's keys"
+    );
+    reference.forEach(function (key) {
+      const value = table[key];
+      const ref = widget.STRINGS[widget.DEFAULT_LANG][key];
+      assert.strictEqual(typeof value, typeof ref, code + "." + key + " has the same type");
+      if (Array.isArray(ref)) {
+        assert.strictEqual(value.length, ref.length, code + "." + key + " has the same length");
+        value.forEach(function (v) {
+          assert.ok(typeof v === "string" && v.trim(), code + "." + key + " entries are non-empty");
+        });
+      } else {
+        assert.ok(typeof value === "string" && value.trim(), code + "." + key + " is non-empty");
+      }
+    });
+  });
+});
+
+test("a language is offered under its own name, identically in both UIs", () => {
+  // The whole point of a visible control is that someone looking for Spanish sees the word
+  // "Español" - so the language NAMES are the one thing that must not be translated.
+  assert.strictEqual(widget.STRINGS.en.languageName, "English");
+  assert.strictEqual(widget.STRINGS.es.languageName, "Español");
+});
+
+test("CONFIG carries knobs, not copy", () => {
+  // All user-visible strings moved to STRINGS; a copy change must never have to touch CONFIG.
+  Object.keys(widget.CONFIG).forEach(function (key) {
+    assert.strictEqual(typeof widget.CONFIG[key], "number", "CONFIG." + key + " is a number");
+  });
+});
+
+test("no user-visible literal is left inline in the render code", () => {
+  // Two sinks account for every visible string in this widget: a text node, and a labelling
+  // attribute. Below the localization table, neither may take a word-bearing literal.
+  const inlineText = /textContent\s*=\s*"[^"]*[A-Za-z]{3,}/.exec(RENDER_SOURCE);
+  assert.strictEqual(inlineText, null, "inline textContent literal: " + (inlineText && inlineText[0]));
+  const inlineAttr =
+    /setAttribute\(\s*"(?:aria-label|placeholder|title)"\s*,\s*"[^"]*[A-Za-z]{3,}/.exec(RENDER_SOURCE);
+  assert.strictEqual(inlineAttr, null, "inline label literal: " + (inlineAttr && inlineAttr[0]));
+  // ...and it really does read from the table.
+  assert.ok(/textContent\s*=\s*t\(/.test(RENDER_SOURCE), "render code reads copy from t()");
+  assert.ok(/setAttribute\("aria-label",\s*t\(/.test(RENDER_SOURCE), "labels read from t()");
+});
+
+// --- the control ---------------------------------------------------------
+test("the language control is a labelled group of real, named, keyboard-operable buttons", () => {
+  const doc = makeDoc();
+  const handle = widget.mount(doc);
+  try {
+    const group = findByClass(handle.shadow, "header__lang");
+    assert.ok(group, "the control is present in the panel header");
+    assert.strictEqual(group.getAttribute("role"), "group");
+    // The group names itself: `aria-labelledby`/`for` cannot cross the shadow boundary.
+    assert.ok(group.getAttribute("aria-label"), "the group has an accessible name");
+
+    const btns = findAll(handle.shadow, "header__lang-btn");
+    assert.strictEqual(btns.length, widget.LANGUAGES.length, "one button per offered language");
+    btns.forEach(function (b) {
+      assert.strictEqual(b.tagName, "button", "a real button, so it is focusable and keyboard-operable");
+      assert.strictEqual(b.type, "button", "type=button: it never submits the composer form");
+      // Accessible name from its own text content - no aria-label to drift from the label.
+      assert.ok(b.textContent && b.textContent.trim(), "the button names itself");
+      assert.ok(b.getAttribute("aria-pressed"), "state is exposed to assistive tech");
+    });
+    // English is the shipped default and reads as pressed.
+    assert.strictEqual(btns[0].getAttribute("aria-pressed"), "true");
+    assert.strictEqual(btns[1].getAttribute("aria-pressed"), "false");
+  } finally {
+    widget.resetLanguage();
+  }
+});
+
+test("the control has a visible focus indicator and does not signal state by color alone", () => {
+  assert.ok(
+    /\.header__lang-btn:focus-visible \{[^}]*outline:/.test(SOURCE),
+    "focus-visible draws an outline"
+  );
+  // The pressed state is a filled pill (background change), not just a different text color.
+  assert.ok(
+    /\.header__lang-btn\[aria-pressed=\\"true\\"\] \{[^}]*background:/.test(SOURCE),
+    "the pressed state changes the background, driven by aria-pressed itself"
+  );
+});
+
+test("choosing Español swaps every piece of chrome and the lang attribute", () => {
+  const doc = makeDoc();
+  const handle = widget.mount(doc);
+  try {
+    const before = chromeText(handle);
+    assert.strictEqual(handle.host.getAttribute("lang"), "en");
+
+    clickLanguage(handle, "es");
+
+    const after = chromeText(handle);
+    Object.keys(before).forEach(function (key) {
+      assert.notStrictEqual(after[key], before[key], key + " switched language");
+    });
+    assert.strictEqual(after.title, widget.STRINGS.es.title);
+    assert.strictEqual(after.placeholder, widget.STRINGS.es.inputPlaceholder);
+    assert.strictEqual(after.send, widget.STRINGS.es.sendLabel);
+    // Both the host element and the shadow root's container carry the language.
+    assert.strictEqual(handle.host.getAttribute("lang"), "es");
+    assert.strictEqual(findByClass(handle.shadow, "root").getAttribute("lang"), "es");
+    // aria-pressed follows.
+    const btns = findAll(handle.shadow, "header__lang-btn");
+    assert.strictEqual(btns[0].getAttribute("aria-pressed"), "false");
+    assert.strictEqual(btns[1].getAttribute("aria-pressed"), "true");
+  } finally {
+    widget.resetLanguage();
+  }
+});
+
+test("switching before the first message re-renders the greeting and starter questions", () => {
+  // The greeting is not a turn anyone took - it is what the panel says before anyone speaks -
+  // and leaving it in the other language is what would make the switch look broken. It is
+  // canned in both languages, so this costs no model call.
+  const doc = makeDoc();
+  const handle = widget.mount(doc);
+  try {
+    clickLanguage(handle, "es");
+    const bots = findAll(handle.shadow, "msg--bot");
+    assert.strictEqual(bots.length, 1, "still exactly one greeting, not two");
+    assert.ok(
+      allText(bots[0]).indexOf("Biblioteca de Gavilan College") >= 0,
+      "the greeting is the Spanish one"
+    );
+    assert.strictEqual(handle.getState().messages.length, 1, "the transcript still holds one turn");
+    assert.strictEqual(handle.getState().messages[0].text, widget.STRINGS.es.greeting);
+
+    const suggestions = findAll(handle.shadow, "suggestion").map(function (b) { return b.textContent; });
+    assert.deepStrictEqual(suggestions, widget.STRINGS.es.suggestedQuestions);
+  } finally {
+    widget.resetLanguage();
+  }
+});
+
+// --- where the bilingual UI meets the accessibility remediation ----------
+//
+// The two features touch the same nodes from opposite directions: the audit added text
+// that only a screen reader ever reads, and the toggle says every string a person can
+// perceive comes out of the table. These pin the overlap, which neither feature's own
+// tests cover.
+
+test("the visually-hidden speaker labels are localized too", async () => {
+  // A label nobody can see is still text that gets read aloud - so a Spanish UI reading
+  // "Library assistant said:" over a Spanish answer is exactly the gap the toggle exists
+  // to close, and it is invisible to every check that looks at the rendered page.
+  const restore = withNetwork(okJson({ answer: "Abierto de 9 a 5.", sources: [] }));
+  try {
+    const doc = makeDoc();
+    const handle = widget.mount(doc);
+    clickLanguage(handle, "es");
+    handle.submit("¿horario?");
+    await flush();
+
+    const labels = findAll(handle.shadow, "msg").map(function (m) {
+      return findByClass(m, "sr-only").textContent;
+    });
+    assert.deepStrictEqual(labels, [
+      widget.STRINGS.es.speakerBot,   // the re-seeded Spanish greeting
+      widget.STRINGS.es.speakerYou,
+      widget.STRINGS.es.speakerBot
+    ]);
+    // English is what dev's speaker-label test asserts by literal; keep the tables honest
+    // about it so that test and this one cannot drift apart.
+    assert.strictEqual(widget.STRINGS.en.speakerYou, "You said:");
+    assert.strictEqual(widget.STRINGS.en.speakerBot, "Library assistant said:");
+  } finally {
+    widget.resetLanguage();
+    restore();
+  }
+});
+
+test("the pending status region announces in the chosen language", async () => {
+  const restore = withNetwork(function () { return new Promise(function () {}); }); // never settles
+  const priorDelay = widget.CONFIG.wakingHintDelayMs;
+  widget.CONFIG.wakingHintDelayMs = 10;
+  try {
+    const doc = makeDoc();
+    const handle = widget.mount(doc);
+    clickLanguage(handle, "es");
+    handle.submit("¿horario?");
+
+    const bubble = findTypingBubble(handle.shadow);
+    assert.ok(bubble, "a pending indicator is rendered");
+    assert.strictEqual(bubble.getAttribute("role"), "status");
+    // One status region, not two: the dots row must not carry a nested role/aria-label,
+    // or the pending state is announced twice.
+    const dots = findByClass(bubble, "typing");
+    assert.strictEqual(dots.getAttribute("role"), null, "the dots row is not a second region");
+    assert.strictEqual(dots.getAttribute("aria-label"), null, "and carries no label of its own");
+    assert.ok(bubble.textContent.indexOf(widget.STRINGS.es.typingStatus) >= 0);
+
+    await sleep(40);
+    assert.ok(
+      bubble.textContent.indexOf(widget.STRINGS.es.workingHint) >= 0,
+      "the slow-response note is Spanish as well"
+    );
+  } finally {
+    widget.CONFIG.wakingHintDelayMs = priorDelay;
+    widget.resetLanguage();
+    restore();
+  }
+});
+
+test("switching language before the first message keeps the composer described", async () => {
+  // The greeting describes the composer (F3), and a switch tears that greeting down and
+  // builds a new one. Wired at mount only, the description would point at a removed node
+  // and the Spanish opening state would arrive undescribed - a silent regression, since
+  // both features' own tests still pass.
+  const doc = makeFocusDoc();
+  const handle = widget.mount(doc);
+  try {
+    const input = findByClass(handle.shadow, "composer__input");
+    const before = input.getAttribute("aria-describedby");
+    assert.ok(before, "described on first launch");
+
+    clickLanguage(handle, "es");
+
+    const id = input.getAttribute("aria-describedby");
+    assert.ok(id, "still described after the switch");
+    const described = findAll(handle.shadow, "bubble").filter(function (b) { return b.id === id; });
+    assert.strictEqual(described.length, 1, "exactly one live node answers to the id");
+    assert.ok(
+      described[0].textContent.indexOf("Biblioteca de Gavilan College") >= 0,
+      "and it is the SPANISH greeting, not the removed English one"
+    );
+  } finally {
+    widget.resetLanguage();
+  }
+});
+
+test("switching mid-conversation leaves every past turn exactly as it was said", async () => {
+  const restore = withNetwork(okJson({ answer: "Open **9-5**.", sources: [] }));
+  try {
+    const doc = makeDoc();
+    const handle = widget.mount(doc);
+    handle.submit("what are the hours?");
+    await flush();
+
+    const msgsBefore = findAll(handle.shadow, "msg").map(function (m) { return allText(m); });
+    const transcriptBefore = handle.getState().messages.map(function (m) { return m.text; });
+
+    clickLanguage(handle, "es");
+
+    assert.deepStrictEqual(
+      findAll(handle.shadow, "msg").map(function (m) { return allText(m); }),
+      msgsBefore,
+      "no rendered message changed"
+    );
+    assert.deepStrictEqual(
+      handle.getState().messages.map(function (m) { return m.text; }),
+      transcriptBefore,
+      "no transcript entry changed"
+    );
+    // The English greeting/answer keep their own lang, so a screen reader does not read
+    // English text with a Spanish voice after the switch.
+    findAll(handle.shadow, "msg").forEach(function (m) {
+      assert.strictEqual(m.getAttribute("lang"), "en", "past turns keep the language they were said in");
+    });
+    // Chrome DID switch.
+    assert.strictEqual(chromeText(handle).title, widget.STRINGS.es.title);
+  } finally {
+    restore();
+    widget.resetLanguage();
+  }
+});
+
+test("switching after the first message does not resurrect the starter questions", async () => {
+  const restore = withNetwork(okJson({ answer: "A", sources: [] }));
+  try {
+    const doc = makeDoc();
+    const handle = widget.mount(doc);
+    handle.submit("hours?");
+    await flush();
+    clickLanguage(handle, "es");
+    assert.strictEqual(findByClass(handle.shadow, "suggestions"), null, "suggestions stay gone");
+  } finally {
+    restore();
+    widget.resetLanguage();
+  }
+});
+
+// --- the preference on the wire -----------------------------------------
+test("with no language chosen the request body is unchanged: exactly { messages }", async () => {
+  const bodies = [];
+  const h = withNetworkAttrs(
+    okJsonCapturing({ answer: "hi", sources: [] }, bodies),
+    { "data-api-url": "https://api.test/query" }
+  );
+  try {
+    assert.deepStrictEqual(widget.getLanguage(), { code: "en", chosen: false });
+    await widget.sendQuery([{ role: "user", content: "hours?" }]);
+    assert.deepStrictEqual(bodies, [{ messages: [{ role: "user", content: "hours?" }] }]);
+    assert.ok(!("language" in bodies[0]), "no preference means no field, so the backend behaves as before");
+  } finally {
+    h.restore();
+  }
+});
+
+test("an explicit choice rides along as one extra field", async () => {
+  const bodies = [];
+  const h = withNetworkAttrs(
+    okJsonCapturing({ answer: "hola", sources: [] }, bodies),
+    { "data-api-url": "https://api.test/query" }
+  );
+  try {
+    const doc = makeDoc();
+    const handle = widget.mount(doc);
+    clickLanguage(handle, "es");
+    await widget.sendQuery([{ role: "user", content: "what are the hours?" }]);
+    assert.deepStrictEqual(bodies[0], {
+      messages: [{ role: "user", content: "what are the hours?" }],
+      language: "es"
+    });
+    // Explicitly choosing English is also a choice: it must pin the reply language too,
+    // rather than falling back to auto-detection from a Spanish-looking question.
+    clickLanguage(handle, "en");
+    await widget.sendQuery([{ role: "user", content: "¿horario?" }]);
+    assert.strictEqual(bodies[1].language, "en");
+    assert.strictEqual(widget.getLanguage().chosen, true);
+  } finally {
+    h.restore();
+    widget.resetLanguage();
+  }
+});
+
+test("the demo page's metering and a language choice coexist without disturbing each other", async () => {
+  const bodies = [];
+  const h = withNetworkAttrs(
+    okJsonCapturing({ answer: "hola", sources: [], usage: { model_calls: 1 } }, bodies),
+    { "data-api-url": "https://api.test/query", "data-usage-events": "true" }
+  );
+  try {
+    widget.setLanguage("es", true);
+    await widget.sendQuery([{ role: "user", content: "hours?" }]);
+    assert.strictEqual(bodies[0].include_usage, true);
+    assert.strictEqual(bodies[0].language, "es");
+    assert.strictEqual(h.events.length, 1, "metering still fires exactly once");
+  } finally {
+    h.restore();
+    widget.resetLanguage();
+  }
+});
+
+// --- localized runtime states -------------------------------------------
+test("the sources disclosure heading is localized, with the count filled in", async () => {
+  const restore = withNetwork(
+    okJson({
+      answer: "A",
+      sources: [
+        { uri: "https://gav.edu/a", excerpt: "a" },
+        { uri: "https://gav.edu/b", excerpt: "b" }
+      ]
+    })
+  );
+  try {
+    const doc = makeDoc();
+    const handle = widget.mount(doc);
+    clickLanguage(handle, "es");
+    handle.submit("¿horario?");
+    await flush();
+
+    const toggle = findByClass(findAll(handle.shadow, "msg--bot").pop(), "sources__toggle");
+    assert.strictEqual(toggle.textContent, widget.STRINGS.es.sourcesMany.replace("{n}", "2"));
+    assert.ok(toggle.textContent.indexOf("2") >= 0, "the count is substituted");
+  } finally {
+    restore();
+    widget.resetLanguage();
+  }
+});
+
+test("the network-failure bubble and its retry button are localized", async () => {
+  const restore = withNetwork(function () {
+    return Promise.reject(new Error("network down"));
+  });
+  try {
+    const doc = makeDoc();
+    const handle = widget.mount(doc);
+    clickLanguage(handle, "es");
+    handle.submit("¿horario?");
+    await flush();
+
+    const bubble = findByClass(handle.shadow, "bubble--error");
+    assert.ok(bubble, "an error bubble is shown");
+    assert.ok(allText(bubble).indexOf(widget.STRINGS.es.networkError) >= 0, "the error text is Spanish");
+    assert.strictEqual(findByClass(handle.shadow, "retry").textContent, widget.STRINGS.es.retryLabel);
+  } finally {
+    restore();
+    widget.resetLanguage();
+  }
+});
+
+test("the not-connected fallback is localized (no data-api-url)", async () => {
+  const priorDoc = global.document;
+  global.document = { querySelector: function () { return null; } };
+  try {
+    widget.setLanguage("es", true);
+    const res = await widget.sendQuery([{ role: "user", content: "hola" }]);
+    assert.strictEqual(res.answer, widget.STRINGS.es.notConnected);
+    assert.deepStrictEqual(res.sources, []);
+  } finally {
+    global.document = priorDoc;
+    widget.resetLanguage();
+  }
+});
+
 test("suggestions disappear after a typed message and do not come back", async () => {
   var restore = withNetwork(okJson({ answer: "A", sources: [] }));
   try {
@@ -1424,9 +1884,13 @@ test("Tab and Shift+Tab wrap at the open panel's edges instead of walking into t
     var doc = makeFocusDoc();
     var handle = widget.mount(doc);
     var panel = findByClass(handle.shadow, "panel");
-    var expand = findByClass(handle.shadow, "header__expand");
     var send = findByClass(handle.shadow, "composer__send");
     var input = findByClass(handle.shadow, "composer__input");
+    // The panel's first control is the language toggle's leading button - it is the first
+    // focusable thing in the header, ahead of the expand control. Named from the DOM rather
+    // than hardcoded, so adding chrome moves the edge instead of breaking this test.
+    var first = findAll(handle.shadow, "header__lang-btn")[0];
+    assert.ok(first, "the language control leads the panel's tab order");
     handle.open();
 
     // The shared fake's default preventDefault is a no-op, so bring a spy.
@@ -1440,10 +1904,10 @@ test("Tab and Shift+Tab wrap at the open panel's edges instead of walking into t
     handle.shadow.activeElement = send;
     doc.focused = null;
     assert.ok(tab().prevented, "Tab at the last control is intercepted");
-    assert.strictEqual(doc.focused, expand, "...and wraps to the first control");
+    assert.strictEqual(doc.focused, first, "...and wraps to the first control");
 
     // At the first control, Shift+Tab wraps to the last.
-    handle.shadow.activeElement = expand;
+    handle.shadow.activeElement = first;
     doc.focused = null;
     assert.ok(tab(true).prevented, "Shift+Tab at the first control is intercepted");
     assert.strictEqual(doc.focused, send, "...and wraps to the last control");
@@ -1462,7 +1926,7 @@ test("Tab and Shift+Tab wrap at the open panel's edges instead of walking into t
     handle.shadow.activeElement = send;
     doc.focused = null;
     tab();
-    assert.strictEqual(doc.focused, expand, "a collapsed disclosure's links are not panel edges");
+    assert.strictEqual(doc.focused, first, "a collapsed disclosure's links are not panel edges");
 
     var pending = withNetwork(function () { return new Promise(function () {}); });
     try {
@@ -1471,7 +1935,7 @@ test("Tab and Shift+Tab wrap at the open panel's edges instead of walking into t
       handle.shadow.activeElement = input; // the textarea is the last enabled control now
       doc.focused = null;
       assert.ok(tab().prevented, "the last edge followed the disabled Send");
-      assert.strictEqual(doc.focused, expand);
+      assert.strictEqual(doc.focused, first);
     } finally {
       pending();
     }
@@ -1487,10 +1951,17 @@ test("the launcher's accessible name contains its visible label", () => {
   var launcher = findByClass(handle.shadow, "launcher");
   // No aria-label: the button's own text IS the name, so "click Ask the Library" works.
   assert.strictEqual(launcher.getAttribute("aria-label"), null, "no aria-label overriding the text");
-  assert.ok(
-    launcher.textContent.indexOf(widget.CONFIG.launcherLabel) >= 0,
-    "the visible label is the accessible name"
-  );
+  // The label now comes from the string table (CONFIG carries knobs, not copy), and the
+  // rule holds in every language: whatever is printed on the button is its whole name.
+  widget.LANGUAGES.forEach(function (code) {
+    clickLanguage(handle, code);
+    assert.strictEqual(launcher.getAttribute("aria-label"), null, "still no aria-label in " + code);
+    assert.ok(
+      launcher.textContent.indexOf(widget.STRINGS[code].launcherLabel) >= 0,
+      "the visible label is the accessible name in " + code
+    );
+  });
+  widget.resetLanguage();
   assert.ok(!/Open the library chat/.test(SOURCE), "the overriding label string is gone");
   // What that label used to hint at is now carried by a standard attribute instead.
   assert.strictEqual(launcher.getAttribute("aria-haspopup"), "dialog");
