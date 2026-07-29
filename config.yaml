@@ -52,56 +52,111 @@ data_source:
     max_pages: 1000
     rate_limit: 300   # max crawl requests per minute
 
-# --- Custom scraper (standalone local tool; NOT part of the CDK/Lambda yet) ---
+# --- Custom scraper (runs as a Lambda on a tiered schedule; also runnable locally) ---
 #
-# Replaces the removed managed Web Crawler. For now it runs locally (scraper/scraper.py) and
-# writes clean markdown + a metadata JSON sidecar per page to output_dir for manual inspection;
-# a Lambda wrapper uploads to the KB S3 source bucket. seed_urls is an EXPLICIT curated list -
-# NO recursive crawling (the managed crawler over-crawled the /library/ tree and hit ingestion
-# limits, so pages are listed explicitly instead).
+# Replaces the removed managed Web Crawler. scraper/scraper.py is the importable fetch/extract
+# core (also a CLI that writes markdown + a metadata JSON sidecar per page to output_dir for
+# manual inspection); scraper/lambda_function.py wraps it to upload into the KB S3 source bucket.
+# The URL lists are EXPLICIT and curated - NO recursive crawling (the managed crawler over-crawled
+# the /library/ tree and hit ingestion limits, so pages are listed explicitly instead).
+#
+# FRESHNESS TIERS. Every seed URL lives under exactly one tier, and each tier carries its own
+# EventBridge cron. This block is the ONLY place either is declared: moving a page between tiers
+# is moving a line, and changing a cadence is editing a cron string. No code change for either.
+#
+# The tiers answer the question the library will certainly ask - "we changed our hours, when does
+# the bot know?" - with "hours within a day, everything else within five" instead of the old
+# single weekly scrape's "up to a week".
+#
+# Scraping more often is nearly free, which is what makes this affordable: Bedrock knowledge-base
+# sync is incremental (unchanged documents are skipped, not re-embedded), and the scraper now
+# hashes each page's extracted content against what is already in the source bucket, so an
+# unchanged page uploads nothing and starts no ingestion job. The one genuinely per-run cost is
+# the Sonnet call that enriches the database catalog, and that is gated separately (see `catalog`
+# below): it runs only when the parsed databases.php rows actually change, and never on the fast
+# tier at all.
 scraper:
-  seed_urls:
-    - https://www.gavilan.edu/library/howdoi.php
-    - https://www.gavilan.edu/library/libraryservices.php
-    - https://www.gavilan.edu/library/about-the-library.php
-    - https://www.gavilan.edu/library/contactus.php
-    - https://www.gavilan.edu/library/ill.php
-    - https://www.gavilan.edu/library/researchassistance.php
-    - https://www.gavilan.edu/library/findresources.php
-    - https://www.gavilan.edu/library/librarycard.php
-    - https://www.gavilan.edu/library/libcardexamples.php
-    - https://www.gavilan.edu/library/citingsources.php
-    - https://www.gavilan.edu/library/librarycourses.php
-    - https://www.gavilan.edu/library/facultyservices.php
-    - https://www.gavilan.edu/library/otherlibraries.php
-    - https://www.gavilan.edu/library/orientationrequest.php
-    # Stays in the SEED list but is excluded from the KB below: the scraper parses this page's
-    # HTML to regenerate the held database_catalog (lambda_function.regenerate_catalog looks for
-    # "databases.php" in the scrape results), so dropping it here would silently freeze the
-    # catalog at its last-good copy.
-    - https://www.gavilan.edu/library/databases.php
-    # REMOVED: sites.php ("Selected Websites by Subject"). 13,209 chars - the single largest noise
-    # source in the corpus. It is 133 alphabetical entries of EXTERNAL website names, and the
-    # extractor strips their URLs, so the bot could name a site but never link to it while
-    # <citations> forbids writing the URL from memory. In a live 11-question round it surfaced in
-    # 8 answers and contributed to none: subject words match nearly every query. Nothing is lost -
-    # researchassistance.php still describes the service, and the questions it would serve are
-    # research questions, which are out of scope by design.
-    # Laptop and equipment support. The ONLY source for the program lending list (EOPS,
-    # Non-Credit, CTE, El Centro, AEC), the semester renewal-by-emailed-form flow, and the
-    # "laptop tech support goes to circulation, not IT" routing. Note it contradicts
-    # howdoi.php ("Reserves and semester laptops cannot be renewed") - staff are resolving.
-    - https://www.gavilan.edu/library/laptopsupport.php
-    # --- College pages, not library pages ---
-    # Every seed above is under /library/. These three answer questions the bot is actually
-    # asked but the library site cannot cover: where a campus office is, and which books a
-    # course requires. They widen scope past library operations, which is deliberate.
-    #   main_map      - Office Guide (Financial Aid Office -> SC) + Building Guide legend
-    #   finaid        - Financial Aid office hours
-    #   bookstore     - the bookstore as the per-course materials source, plus its hours
-    - https://www.gavilan.edu/about/maps/main_map.php
-    - https://www.gavilan.edu/finaid/index.php
-    - https://www.gavilan.edu/student/bookstore/index.php
+  tiers:
+    # FAST: pages that carry hours, closures, holiday schedules, semester dates, or dated
+    # announcements. It fetches ONLY the three URLs listed here - never the whole site - and it
+    # never touches the database catalog, so a daily run is three HTTP GETs and, on a day when
+    # nothing changed, zero uploads, zero ingestion, and zero model calls.
+    #
+    # 11:30 UTC (~3:30-4:30am Pacific) is deliberately 90 minutes clear of the full tier's slot
+    # below. Overlap is handled correctly if it ever happens (the scraper skips when an ingestion
+    # job is already running, and the next run picks the change back up), but the cheapest fix
+    # for a once-per-five-days collision is to not schedule them at the same minute.
+    fast:
+      schedule_cron: "cron(30 11 * * ? *)"
+      urls:
+        # THE hours page: "LIBRARY HOURS" per semester, each semester's date range, and the
+        # holiday-closure list. Verified 2026-07-29 as the library's single authoritative hours
+        # source - the library home page carries no hours of its own, only links to this page's
+        # #hours anchor. Also holds the staff directory, which rides along harmlessly.
+        - https://www.gavilan.edu/library/about-the-library.php
+        # Financial Aid office hours, and they are TERM-BOUNDED ("Summer Hours: July 6 - August 1,
+        # 2026") plus a separate Hollister drop-in schedule, so they turn over several times a year.
+        - https://www.gavilan.edu/finaid/index.php
+        # Bookstore "Store Hours" plus dated one-off closure announcements ("The Bookstore will be
+        # closed Monday May 25th") - the announcement pattern this tier exists to catch.
+        - https://www.gavilan.edu/student/bookstore/index.php
+    # FULL: everything else - policies, services, FAQs, about pages, the databases page.
+    #
+    # NOTE WHAT "full" MEANS AT RUN TIME: a full run fetches EVERY url in this block, fast tier
+    # included, not just the ones listed under it. It is the complete refresh, so it self-heals a
+    # fast tier that has been failing and it keeps the stale-object prune (which deletes anything
+    # configuration no longer calls for) safe by construction - a run that saw only a third of the
+    # corpus must never be allowed to decide what is stale. The extra cost is three HTTP GETs
+    # every five days; with change gating they upload nothing when nothing changed.
+    #
+    # The cron fires on the 1st, 6th, 11th, 16th, 21st and 26th at 10:00 UTC (~2-3am Pacific),
+    # which is exactly five days apart within a month and 3-6 days across a month boundary. That
+    # is a deliberate trade for a FIXED low-traffic maintenance window: EventBridge's `rate(5 days)`
+    # would hold the interval exactly but drifts the time of day and re-anchors on every deploy.
+    full:
+      schedule_cron: "cron(0 10 1,6,11,16,21,26 * ? *)"
+      urls:
+        - https://www.gavilan.edu/library/howdoi.php
+        - https://www.gavilan.edu/library/libraryservices.php
+        - https://www.gavilan.edu/library/contactus.php
+        - https://www.gavilan.edu/library/ill.php
+        - https://www.gavilan.edu/library/researchassistance.php
+        - https://www.gavilan.edu/library/findresources.php
+        - https://www.gavilan.edu/library/librarycard.php
+        - https://www.gavilan.edu/library/libcardexamples.php
+        - https://www.gavilan.edu/library/citingsources.php
+        - https://www.gavilan.edu/library/librarycourses.php
+        - https://www.gavilan.edu/library/facultyservices.php
+        - https://www.gavilan.edu/library/otherlibraries.php
+        - https://www.gavilan.edu/library/orientationrequest.php
+        # Stays in the SEED list but is excluded from the KB below: the scraper parses this page's
+        # HTML to regenerate the held database_catalog (lambda_function.regenerate_catalog looks for
+        # "databases.php" in the scrape results), so dropping it here would silently freeze the
+        # catalog at its last-good copy. FULL tier on purpose - it is the only page whose scrape
+        # can cost a model call, and there is nothing time-sensitive on it.
+        - https://www.gavilan.edu/library/databases.php
+        # REMOVED: sites.php ("Selected Websites by Subject"). 13,209 chars - the single largest noise
+        # source in the corpus. It is 133 alphabetical entries of EXTERNAL website names, and the
+        # extractor strips their URLs, so the bot could name a site but never link to it while
+        # <citations> forbids writing the URL from memory. In a live 11-question round it surfaced in
+        # 8 answers and contributed to none: subject words match nearly every query. Nothing is lost -
+        # researchassistance.php still describes the service, and the questions it would serve are
+        # research questions, which are out of scope by design.
+        # Laptop and equipment support. The ONLY source for the program lending list (EOPS,
+        # Non-Credit, CTE, El Centro, AEC), the semester renewal-by-emailed-form flow, and the
+        # "laptop tech support goes to circulation, not IT" routing. Note it contradicts
+        # howdoi.php ("Reserves and semester laptops cannot be renewed") - staff are resolving.
+        # "semester" here is a LOAN PERIOD, not a schedule, so this is not a fast-tier page.
+        - https://www.gavilan.edu/library/laptopsupport.php
+        # --- College pages, not library pages ---
+        # Every seed above is under /library/. The college pages answer questions the bot is
+        # actually asked but the library site cannot cover: where a campus office is, and which
+        # books a course requires. They widen scope past library operations, which is deliberate.
+        # (finaid and bookstore are the other two, and they are in the fast tier above because
+        # their hours turn over per-term.)
+        #   main_map - Office Guide (Financial Aid Office -> SC) + Building Guide legend. Static
+        #   building/room mapping with no hours on it, so it belongs here.
+        - https://www.gavilan.edu/about/maps/main_map.php
   # Scraped for their side effects, never indexed. The scraper fetches these normally but does not
   # upload them to the KB source bucket, and the prune step keeps them out of it.
   #   databases.php - regenerate_catalog needs its HTML, but the CONTENT is redundant: the whole
@@ -115,10 +170,6 @@ scraper:
   output_dir: ./scraper_output
   timeout_seconds: 20
   user_agent: "GavilanLibraryScraper/1.0 (+https://www.gavilan.edu/library/)"
-  # EventBridge schedule for the automated re-scrape Lambda (maintenance window). Standard
-  # EventBridge cron, UTC. Default: weekly, Sunday 10:00 UTC (~2-3am Pacific), a low-traffic
-  # window. Change cadence here. (output_dir is local-run only; the Lambda uploads to S3.)
-  schedule_cron: "cron(0 10 ? * SUN *)"
 
 chunking:
   # v1 uses managed FIXED_SIZE chunking (architecture.md Phase 1). Phase 2 moves to
@@ -285,14 +336,25 @@ cost_model:
     # Tokens embedded by ONE full re-ingestion: the 18 indexed documents (~7,500 tokens)
     # plus the 20% chunk overlap.
     ingest_embedded_tokens: 9000
-    # Scraper Lambda: 512 MB, measured billed durations of 25s and 67s.
+    # Scraper Lambda: 512 MB, measured billed durations of 25s and 67s. That is a FULL run over
+    # all 19 pages; a fast-tier run fetches 3, so applying this figure to every run overstates
+    # the Lambda line. Left conservative on purpose - the whole line is a fraction of a cent.
     scraper_seconds_per_run: 46
     scraper_memory_gb: 0.5
-    # Weekly EventBridge schedule.
-    scrapes_per_month: 4.33
-    # Every `cdk deploy` re-runs the scraper and re-ingests the corpus, so deploy frequency
-    # is a real (if small) driver of the floor. Assumption, not a measurement - it is the one
-    # number here nobody can measure for you. Shown as a line item on the page.
+    # Scraper INVOCATIONS per month, from the tiered schedule above: the fast tier daily (~30.4)
+    # plus the full sweep on the 1st/6th/11th/16th/21st/26th (6). This drives Lambda compute only.
+    scrapes_per_month: 36.4
+    # RE-INDEXES per month - how often a run actually finds changed content and pays for
+    # embeddings + S3 Vectors writes. Deliberately a SEPARATE number from scrapes_per_month,
+    # because change gating broke the old one-to-one relationship: most runs now upload nothing
+    # and start no ingestion job, so counting every scrape as a re-index would overstate this
+    # line roughly ninefold. Like deploys_per_month this is an assumption about how often the
+    # library edits its site, not a measurement - nobody can measure it for you.
+    reindexes_per_month: 4
+    # `cdk deploy` re-runs the scraper only when the SCRAPER LAMBDA ITSELF changed: the install
+    # Trigger is tied to the function's currentVersion, whose logical id hashes the code asset
+    # plus the function configuration, so a widget/demo/query-path deploy does not fire it.
+    # Assumption, not a measurement, and an upper bound for that reason. Shown as a line item.
     deploys_per_month: 4
     # CloudWatch Logs across the stack's log groups, at rest.
     log_gb_per_month: 0.02
@@ -327,17 +389,31 @@ generation:
 
 # --- Database catalog (Phase 2b: self-updating) ---
 #
-# The database_catalog tool's HELD list is regenerated from databases.php on every scrape: the
-# scraper parses the A-Z table (deterministic names/descriptions/URLs) then a model enriches each
-# database with subjects + aliases, and writes the result to S3. The agent reads that fresh copy.
-# The hand-authored NOT-HELD list stays in the bundled app/data/database_catalog.json (absence
-# can't be scraped) and is merged in at read time.
+# The database_catalog tool's HELD list is regenerated from databases.php: the scraper parses the
+# A-Z table (deterministic names/descriptions/URLs) then a model enriches each database with
+# subjects + aliases, and writes the result to S3. The agent reads that fresh copy. The
+# hand-authored NOT-HELD list stays in the bundled app/data/database_catalog.json (absence can't
+# be scraped) and is merged in at read time.
+#
+# WHEN THIS RUNS, AND WHY IT IS GATED. This model call is the only meaningful per-run cost in the
+# whole ingestion path - embeddings, S3 Vectors writes, Lambda and EventBridge are pennies or free
+# at this corpus size - so it is the thing the change gating exists to protect. Two gates:
+#   - it is on a FULL-tier page, so the daily fast tier never reaches it at all;
+#   - a full run fingerprints the PARSED rows (name/description/url) and compares against the
+#     fingerprint stored in the catalog object it wrote last time. Identical rows -> the catalog
+#     is left completely untouched, no model call and no S3 write.
+# The parsed rows are hashed rather than the raw HTML on purpose: enrichment only ever sees those
+# three fields, so a nav tweak or a rotating banner must not be able to bill a Sonnet call.
 catalog:
   # S3 object key for the regenerated held catalog (in the dedicated catalog bucket the stack
   # creates). The bucket name is wired to both Lambdas as an env var by the stack.
   s3_key: database_catalog.json
-  # Model that assigns subjects + aliases to each parsed database. Runs once per weekly scrape on
-  # ~one page, and only for newly-added databases, so cost is negligible. A live dry-run showed
+  # Model that assigns subjects + aliases to each parsed database. Runs at most once per FULL
+  # scrape, only when the parsed rows changed, and then only for newly-added databases. Measured
+  # 2026-07-29 against the live page: 3,395 in / 3,359 out tokens ($0.06 at the rates above) to
+  # enrich all 46 databases from scratch, and 242 in / 111 out ($0.002) for a single added one -
+  # so the steady-state cost is the second figure on the rare month the library adds a database,
+  # and zero otherwise. A live dry-run showed
   # Sonnet 4.6 produces high-quality subjects AND aliases (e.g. "EBSCO", "OVIC", "PBSC"), matching
   # the hand-built catalog; cheaper models gave good subjects but almost no aliases, which would
   # break name-matching like "do you have EBSCO?". So use Sonnet.

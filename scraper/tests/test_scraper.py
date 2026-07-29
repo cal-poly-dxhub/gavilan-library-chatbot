@@ -381,3 +381,48 @@ def test_validate_held_list_guard():
     assert scraper.validate_held_list("nonsense", 1) is False     # not a list
     assert scraper.validate_held_list([{"name": "", "description": "d"}], 1) is False   # blank name
     assert scraper.validate_held_list([{"name": "X", "description": 5}], 1) is False    # bad desc type
+
+
+# --- Freshness tiers -------------------------------------------------------------------------
+#
+# Cadence and membership live entirely in config.yaml; these pin the only interpretation of that
+# block. The property that matters most is the LAST one: a fast run must never be able to shrink
+# the set of URLs the prune considers legitimate.
+
+TIERS = {
+    "fast": {"schedule_cron": "cron(30 11 * * ? *)", "urls": ["https://x/hours"]},
+    "full": {"schedule_cron": "cron(0 10 1,6,11,16,21,26 * ? *)", "urls": ["https://x/a", "https://x/b"]},
+}
+
+
+def test_named_tier_fetches_only_its_own_urls():
+    # The whole point of the fast tier: three pages a day, not the whole site.
+    assert scraper.urls_for_tier(TIERS, "fast") == ["https://x/hours"]
+
+
+def test_full_tier_fetches_every_url_in_every_tier():
+    # "full" is the COMPLETE sweep, not the complement of fast - it re-fetches the fast pages too,
+    # so a fast tier that has been quietly failing gets healed by the next full run.
+    assert scraper.urls_for_tier(TIERS, "full") == ["https://x/hours", "https://x/a", "https://x/b"]
+
+
+@pytest.mark.parametrize("tier", [None, "", "typo-tier"])
+def test_unrecognised_tier_falls_back_to_the_complete_sweep(tier):
+    # No tier at all is what the one-shot deploy Trigger and a console test invoke send. Defaulting
+    # UP to everything means an unrecognised tier costs a few extra fetches instead of silently
+    # refreshing a third of the corpus.
+    assert scraper.urls_for_tier(TIERS, tier) == ["https://x/hours", "https://x/a", "https://x/b"]
+
+
+def test_all_seed_urls_preserves_order_and_deduplicates():
+    tiers = {
+        "fast": {"urls": ["https://x/hours"]},
+        "full": {"urls": ["https://x/a", "https://x/hours"]},
+    }
+    assert scraper.all_seed_urls(tiers) == ["https://x/hours", "https://x/a"]
+
+
+def test_tier_helpers_survive_a_missing_or_empty_tier_block():
+    assert scraper.all_seed_urls({}) == []
+    assert scraper.urls_for_tier({}, "fast") == []
+    assert scraper.urls_for_tier({"fast": {}}, "fast") == []

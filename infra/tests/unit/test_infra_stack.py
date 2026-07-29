@@ -9,10 +9,17 @@ import aws_cdk.assertions as assertions
 
 import pytest
 
-from infra.config import load_config, resolve_cors_allow_origins
+from infra.config import (
+    load_config,
+    resolve_cors_allow_origins,
+    resolve_scraper_tiers,
+    resolve_seed_urls,
+)
 from infra.infra_stack import GavilanChatbotStack
 
 CONFIG = load_config()
+SCRAPER_TIERS = resolve_scraper_tiers(CONFIG)
+SEED_URLS = resolve_seed_urls(CONFIG)
 
 
 def _template():
@@ -321,6 +328,52 @@ def test_cors_config_rejects_wildcard_and_missing_origins():
             resolve_cors_allow_origins(bad)
 
 
+def test_tier_config_rejects_the_ways_it_can_be_silently_wrong():
+    # Every failure below deploys happily and only shows up as stale content weeks later, so each
+    # one is a synth-time error instead.
+    missing = copy.deepcopy(CONFIG)
+    del missing["scraper"]["tiers"]
+    with pytest.raises(ValueError, match=r"missing scraper.tiers"):
+        resolve_scraper_tiers(missing)
+
+    # A tier with no cron is a Lambda nothing ever invokes.
+    no_cron = copy.deepcopy(CONFIG)
+    del no_cron["scraper"]["tiers"]["fast"]["schedule_cron"]
+    with pytest.raises(ValueError, match=r"missing schedule_cron"):
+        resolve_scraper_tiers(no_cron)
+
+    # A tier with no URLs is a schedule that scrapes nothing.
+    no_urls = copy.deepcopy(CONFIG)
+    no_urls["scraper"]["tiers"]["fast"]["urls"] = []
+    with pytest.raises(ValueError, match=r"non-empty list"):
+        resolve_scraper_tiers(no_urls)
+
+    # A URL in two tiers makes "which tier owns this page" unanswerable and double-fetches it.
+    duplicated = copy.deepcopy(CONFIG)
+    duplicated["scraper"]["tiers"]["full"]["urls"].append(
+        duplicated["scraper"]["tiers"]["fast"]["urls"][0]
+    )
+    with pytest.raises(ValueError, match=r"exactly one tier"):
+        resolve_scraper_tiers(duplicated)
+
+    # No full tier means no complete sweep, and the prune has nothing safe to key off.
+    no_full = copy.deepcopy(CONFIG)
+    del no_full["scraper"]["tiers"]["full"]
+    with pytest.raises(ValueError, match=r"complete sweep"):
+        resolve_scraper_tiers(no_full)
+
+
+def test_a_kb_exclusion_for_an_unscraped_url_fails_synth():
+    # An exclusion means "fetch this but do not index it". Naming a URL no tier fetches is a
+    # no-op that reads like a working exclusion - and for databases.php it would freeze the
+    # database catalog at its last-good copy with nothing in the logs to say why.
+    config = copy.deepcopy(CONFIG)
+    config["scraper"]["kb_exclude_urls"] = ["https://www.gavilan.edu/library/not-seeded.php"]
+    app = core.App(context={"aws:cdk:bundling-stacks": []})
+    with pytest.raises(ValueError, match=r"no tier scrapes"):
+        GavilanChatbotStack(app, "GavilanChatbotStack", config=config)
+
+
 def test_http_api_stage_throttled_from_config():
     # Stage-level throttling (rate + burst from config) is the load-bearing cost-abuse
     # control, applied to the default route settings so it covers every route.
@@ -626,9 +679,40 @@ def test_scraper_lambda_has_deps_layer_and_arch():
 def test_scraper_lambda_env_wires_bucket_kb_and_data_source():
     template = _template()
     env = _scraper_function(template)["Properties"]["Environment"]["Variables"]
-    # seed_urls come from config as a JSON string; bucket/KB/data-source are resource refs.
-    assert json.loads(env["SEED_URLS"]) == CONFIG["scraper"]["seed_urls"]
+    # The WHOLE tier map comes from config as a JSON string - each EventBridge rule names a tier
+    # and the Lambda looks it up here. Handing over every tier (not just one) is also what lets
+    # the stale-object prune key off the full corpus rather than one run's slice.
+    assert json.loads(env["SCRAPER_TIERS"]) == SCRAPER_TIERS
+    # bucket/KB/data-source are resource refs.
     assert "SOURCE_BUCKET" in env and "KNOWLEDGE_BASE_ID" in env and "DATA_SOURCE_ID" in env
+
+
+def test_every_configured_seed_url_reaches_the_lambda_exactly_once():
+    # Tier membership is the only declaration of which pages exist. A URL that fell out of the
+    # env entirely would simply stop being refreshed, and the prune would then delete it from the
+    # knowledge base - silently, and only on whichever run noticed.
+    env = _scraper_function(_template())["Properties"]["Environment"]["Variables"]
+    wired = [u for tier in json.loads(env["SCRAPER_TIERS"]).values() for u in tier["urls"]]
+    assert sorted(wired) == sorted(SEED_URLS)
+    assert len(wired) == len(set(wired)), "a seed URL is declared in more than one tier"
+
+
+def test_each_tier_carries_its_own_cadence():
+    # Cadence is per-tier and comes from config; nothing about it is spelled out in the stack.
+    env = _scraper_function(_template())["Properties"]["Environment"]["Variables"]
+    tiers = json.loads(env["SCRAPER_TIERS"])
+    assert set(tiers) == set(SCRAPER_TIERS)
+    for name, tier in tiers.items():
+        assert tier["schedule_cron"] == SCRAPER_TIERS[name]["schedule_cron"]
+
+
+def test_the_fast_tier_is_a_strict_subset_and_excludes_the_databases_page():
+    # The two properties that make a daily run cheap: it is a handful of pages, and it cannot
+    # reach databases.php, which is the only page whose scrape can cost a model call.
+    fast = set(SCRAPER_TIERS["fast"]["urls"])
+    assert fast, "the fast tier must declare at least one URL"
+    assert fast < set(SEED_URLS)
+    assert not any("databases.php" in url for url in fast)
 
 
 def test_scraper_role_can_write_prune_and_start_ingestion():
@@ -653,33 +737,82 @@ def test_scraper_role_can_write_prune_and_start_ingestion():
     assert len(source_lists) == 1, source_lists
     assert "/*" not in json.dumps(source_lists[0]["Resource"])
 
-    ingest = [s for s in statements if s["Action"] == "bedrock:StartIngestionJob"]
+    # READ the source objects. Change gating HEADs each markdown object to read back the
+    # content fingerprint it stamped last time, and HeadObject is authorized as s3:GetObject.
+    # Without this every page reads as changed and the gating quietly stops gating anything.
+    reads = [
+        s
+        for s in statements
+        if s["Action"] == "s3:GetObject" and "KnowledgeBaseSourceBucket" in json.dumps(s["Resource"])
+    ]
+    assert len(reads) == 1, reads
+    assert "/*" in json.dumps(reads[0]["Resource"]), "object-level, not bucket-level"
+
+    # StartIngestionJob to index, ListIngestionJobs to see whether a job is already running (one
+    # per data source) and when the last one started - which is how a deferred change gets found
+    # again without storing anything.
+    ingest = [
+        s
+        for s in statements
+        if isinstance(s["Action"], list) and "bedrock:StartIngestionJob" in s["Action"]
+    ]
     assert len(ingest) == 1, ingest
+    assert set(ingest[0]["Action"]) == {"bedrock:StartIngestionJob", "bedrock:ListIngestionJobs"}
     assert "KnowledgeBase" in json.dumps(ingest[0]["Resource"])
 
 
 def test_scraper_env_carries_the_kb_exclusion_list():
-    # databases.php must stay in SEED_URLS (regenerate_catalog parses its HTML) while being kept
-    # out of the knowledge base. If these two ever disagree, either the catalog freezes or the
-    # largest redundant document in the corpus comes back.
+    # databases.php must stay in the seed list (regenerate_catalog parses its HTML) while being
+    # kept out of the knowledge base. If these two ever disagree, either the catalog freezes or
+    # the largest redundant document in the corpus comes back.
     env = _scraper_function(_template())["Properties"]["Environment"]["Variables"]
     excluded = json.loads(env["KB_EXCLUDE_URLS"])
     assert excluded == CONFIG["scraper"].get("kb_exclude_urls", [])
     for url in excluded:
-        assert url in CONFIG["scraper"]["seed_urls"], url
+        assert url in SEED_URLS, url
 
 
-def test_eventbridge_schedule_targets_the_scraper_lambda():
+def _scraper_rules(template):
+    """The scheduled re-scrape rules, keyed by the tier each one invokes."""
+    rules = {}
+    for rule in template.find_resources("AWS::Events::Rule").values():
+        targets = rule["Properties"]["Targets"]
+        assert len(targets) == 1, targets
+        assert "ScraperFunction" in json.dumps(targets[0]["Arn"])
+        rules[json.loads(targets[0]["Input"])["tier"]] = rule
+    return rules
+
+
+def test_one_eventbridge_schedule_per_tier_targets_the_scraper_lambda():
+    # One rule per tier, each firing on that tier's own cron and telling the Lambda which tier it
+    # is. Both come straight from config, so a cadence change or a new tier is a config edit.
     template = _template()
-    template.has_resource_properties(
-        "AWS::Events::Rule",
-        {"ScheduleExpression": CONFIG["scraper"]["schedule_cron"], "State": "ENABLED"},
-    )
-    # The rule targets exactly the scraper function (by its logical id via Fn::GetAtt Arn).
-    (rule,) = template.find_resources("AWS::Events::Rule").values()
-    targets = rule["Properties"]["Targets"]
-    assert len(targets) == 1, targets
-    assert "ScraperFunction" in json.dumps(targets[0]["Arn"])
+    template.resource_count_is("AWS::Events::Rule", len(SCRAPER_TIERS))
+    rules = _scraper_rules(template)
+
+    assert set(rules) == set(SCRAPER_TIERS)
+    for tier_name, tier in SCRAPER_TIERS.items():
+        props = rules[tier_name]["Properties"]
+        assert props["ScheduleExpression"] == tier["schedule_cron"], tier_name
+        assert props["State"] == "ENABLED", tier_name
+
+
+def test_the_two_tiers_do_not_share_a_firing_time():
+    # Overlap is handled (the scraper defers behind a running ingestion job and the change is
+    # picked up next run), but the cheapest way to not need that path is to not schedule both
+    # tiers at the same minute. This catches an edit that accidentally aligns them.
+    crons = [tier["schedule_cron"] for tier in SCRAPER_TIERS.values()]
+    minutes_and_hours = [tuple(c.removeprefix("cron(").split()[:2]) for c in crons]
+    assert len(set(minutes_and_hours)) == len(crons), crons
+
+
+def test_the_fast_schedule_runs_more_often_than_the_full_one():
+    # The whole point of the split. Day-of-month is '*' for a daily tier and an explicit list for
+    # the slower sweep; if that inverts, "hours within a day" stops being true.
+    fast_dom = SCRAPER_TIERS["fast"]["schedule_cron"].removeprefix("cron(").split()[2]
+    full_dom = SCRAPER_TIERS["full"]["schedule_cron"].removeprefix("cron(").split()[2]
+    assert fast_dom == "*", SCRAPER_TIERS["fast"]["schedule_cron"]
+    assert full_dom != "*", SCRAPER_TIERS["full"]["schedule_cron"]
 
 
 def test_install_trigger_invokes_scraper_fire_and_forget():

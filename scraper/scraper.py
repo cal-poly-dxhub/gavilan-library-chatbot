@@ -40,6 +40,10 @@ DEFAULT_TIMEOUT = 20.0
 DEFAULT_USER_AGENT = "GavilanLibraryScraper/1.0 (+https://www.gavilan.edu/library/)"
 DEFAULT_OUTPUT_DIR = "./scraper_output"
 
+# The freshness tier that performs the COMPLETE sweep. Every other tier fetches only the URLs
+# declared under it in config.yaml; this one fetches every URL in every tier. See urls_for_tier.
+TIER_FULL = "full"
+
 # "ï¿½" (U+00EF U+00BF U+00BD) - the Latin-1 view of a UTF-8-encoded U+FFFD. Baked into some
 # source pages as the entities &#239;&#191;&#189;. See _scrub_replacement_chars.
 _REPLACEMENT_SEQ = "ï¿½"
@@ -68,6 +72,42 @@ class ScrapeResult:
     metadata: Optional[dict] = None
     error: Optional[str] = None
     html: Optional[str] = None
+
+
+# --- Freshness tiers -----------------------------------------------------------------------
+#
+# Tier membership and cadence are declared entirely in config.yaml under `scraper.tiers`; nothing
+# about either is spelled out here. These two helpers are the only interpretation of that block,
+# shared by the Lambda (which receives the tiers as JSON in an env var) and the local CLI.
+
+
+def all_seed_urls(tiers: dict) -> list[str]:
+    """Every configured seed URL across all tiers, in declaration order, de-duplicated.
+
+    This is the corpus as CONFIGURATION defines it, which is what the stale-object prune must
+    key off - never the subset a particular tier run happened to fetch, or a daily fast run
+    would delete five sixths of the knowledge base.
+    """
+    urls: list[str] = []
+    for tier in (tiers or {}).values():
+        for url in tier.get("urls") or []:
+            if url not in urls:
+                urls.append(url)
+    return urls
+
+
+def urls_for_tier(tiers: dict, tier: Optional[str]) -> list[str]:
+    """The URLs one tier run fetches.
+
+    A named tier fetches ONLY its own URLs; TIER_FULL fetches everything. Anything else - an
+    unknown tier name, or no tier at all (a manual invoke, or the one-shot deploy Trigger, which
+    passes no tier) - also fetches everything. Defaulting UP to the complete sweep is deliberate:
+    the failure mode of an unrecognised tier is then a slightly more expensive run, not a corpus
+    silently refreshed one third at a time.
+    """
+    if tier and tier != TIER_FULL and tier in (tiers or {}):
+        return list((tiers[tier] or {}).get("urls") or [])
+    return all_seed_urls(tiers)
 
 
 def slugify_url(url: str) -> str:
@@ -388,7 +428,7 @@ def load_scraper_config(config_path=None) -> dict:
 
 
 def main(argv=None) -> int:
-    """CLI: scrape config seed_urls (or URLs passed on the command line) to `output_dir`.
+    """CLI: scrape a tier's URLs (or URLs passed on the command line) to `output_dir`.
 
     Exit codes: 0 all URLs succeeded; 1 the run completed but some URLs failed; 2 nothing to do.
     """
@@ -401,21 +441,32 @@ def main(argv=None) -> int:
         "--output-dir", type=Path, default=None, help="Override scraper.output_dir."
     )
     parser.add_argument(
-        "urls", nargs="*", help="Explicit URLs to scrape (override config seed_urls)."
+        "--tier",
+        default=TIER_FULL,
+        help=(
+            "Freshness tier to scrape, from config's scraper.tiers "
+            f"(default {TIER_FULL!r} = every URL in every tier)."
+        ),
+    )
+    parser.add_argument(
+        "urls", nargs="*", help="Explicit URLs to scrape (override the tier's URLs)."
     )
     args = parser.parse_args(argv)
 
     cfg = load_scraper_config(args.config)
-    urls = args.urls or cfg.get("seed_urls") or []
+    urls = args.urls or urls_for_tier(cfg.get("tiers") or {}, args.tier)
     output_dir = args.output_dir or Path(cfg.get("output_dir", DEFAULT_OUTPUT_DIR))
     timeout = float(cfg.get("timeout_seconds", DEFAULT_TIMEOUT))
     user_agent = cfg.get("user_agent", DEFAULT_USER_AGENT)
 
     if not urls:
-        LOG.error("nothing to scrape: scraper.seed_urls is empty and no URLs were passed")
+        LOG.error(
+            "nothing to scrape: no URLs passed and scraper.tiers has no urls for tier %r",
+            args.tier,
+        )
         return 2
 
-    LOG.info("scraping %d URL(s) -> %s", len(urls), output_dir)
+    LOG.info("scraping %d URL(s) [tier=%s] -> %s", len(urls), args.tier, output_dir)
     results = scrape_urls(urls, timeout=timeout, user_agent=user_agent)
 
     ok = [r for r in results if r.ok]
