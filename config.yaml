@@ -450,5 +450,15 @@ guardrail:
     - DRIVER_ID
   # Friendly, student-facing blocked messages (match the bot's tone). The INPUT screen
   # returns blocked_input_messaging; the Converse OUTPUT backstop returns blocked_outputs_messaging.
-  blocked_input_messaging: "I can't help with that request. I'm here for questions about the Gavilan College Library, like hours, checkouts, and finding materials."
-  blocked_outputs_messaging: "I'm not able to provide a response to that. Try asking about library hours, services, or materials, or reach out to a librarian for more help."
+  #
+  # BILINGUAL (English then Spanish, one blank line between them, rendered as two paragraphs
+  # by the widget). These are STATIC guardrail configuration, returned by Bedrock instead of a
+  # model reply: nothing translates them at runtime, and the widget's language control cannot
+  # reach them either, so a Spanish-speaking student who trips a guardrail would otherwise hit
+  # an English wall. Carrying both languages in the one string is the only way to serve both.
+  # Bedrock caps each of these at 500 characters - keep the pair under it.
+  # NOTE: guardrail policy text is baked into a published guardrail VERSION, so editing these
+  # only takes effect on the next `cdk deploy` (which publishes a new version and repins the
+  # Lambda). The Spanish copy has NOT had native review yet.
+  blocked_input_messaging: "I can't help with that request. I'm here for questions about the Gavilan College Library, like hours, checkouts, and finding materials.\n\nNo puedo ayudarte con esa solicitud. Estoy aquí para responder preguntas sobre la Biblioteca de Gavilan College, como horarios, préstamos y cómo encontrar materiales."
+  blocked_outputs_messaging: "I'm not able to provide a response to that. Try asking about library hours, services, or materials, or reach out to a librarian for more help.\n\nNo puedo responder a eso. Puedes preguntar sobre los horarios, los servicios o los materiales de la biblioteca, o pedir ayuda a un bibliotecario."
