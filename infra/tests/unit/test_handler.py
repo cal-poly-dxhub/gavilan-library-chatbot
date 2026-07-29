@@ -3167,3 +3167,225 @@ def test_today_pacific_is_a_weekday_and_iso_date():
     weekday, iso = stamp.split(", ")
     parsed = _dt.date.fromisoformat(iso)
     assert parsed.strftime("%A") == weekday
+
+
+# --- billable-usage payload (include_usage) -------------------------------------------------
+#
+# The demo site's cost meter is the only caller that asks for this. These tests pin the two
+# things that matter: a student's response never carries it, and when it IS asked for the
+# numbers reflect the WHOLE loop (every model call, the guardrail on each turn, each retrieval)
+# rather than the single final Converse call.
+
+
+def _usage_turn_end(answer, *, in_tokens, out_tokens, guardrail_units=None):
+    """A terminal Converse response carrying Bedrock's own `usage` block, and (optionally) the
+    guardrail invocation metrics that ride in trace.guardrail."""
+    resp = end_turn(answer)
+    resp["usage"] = {
+        "inputTokens": in_tokens,
+        "outputTokens": out_tokens,
+        "totalTokens": in_tokens + out_tokens,
+    }
+    if guardrail_units is not None:
+        resp["trace"] = {
+            "guardrail": {
+                "outputAssessments": {
+                    "gr-out": [{"invocationMetrics": {"usage": guardrail_units}}]
+                }
+            }
+        }
+    return resp
+
+
+def _usage_turn_tool(query, *, in_tokens, out_tokens, tool_use_id="tu-u1"):
+    """A tool_use Converse turn that also reports token usage, so a multi-call loop can be
+    scripted with realistic per-call numbers."""
+    resp = {
+        "output": {
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "toolUse": {
+                            "toolUseId": tool_use_id,
+                            "name": handler.SEARCH_TOOL_NAME,
+                            "input": {"query": query},
+                        }
+                    }
+                ],
+            }
+        },
+        "stopReason": "tool_use",
+        "usage": {
+            "inputTokens": in_tokens,
+            "outputTokens": out_tokens,
+            "totalTokens": in_tokens + out_tokens,
+        },
+    }
+    return resp
+
+
+def _guardrail_with_usage(units):
+    resp = clean_input_response()
+    resp["usage"] = units
+    return resp
+
+
+def test_student_response_never_carries_usage(monkeypatch):
+    # THE regression that matters: no flag -> exactly {answer, sources}, byte-for-byte the
+    # shape the widget has always received, even though the loop now tallies internally.
+    bedrock = FakeBedrockRuntime(
+        converse_script=[_usage_turn_end("Open 9-5.", in_tokens=9000, out_tokens=120)]
+    )
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(_payload_v2_event(json.dumps({"query": "hours?"})), None)
+
+    body = json.loads(resp["body"])
+    assert set(body.keys()) == {"answer", "sources"}
+    assert "usage" not in body
+
+
+def test_include_usage_false_omits_usage(monkeypatch):
+    bedrock = FakeBedrockRuntime(
+        converse_script=[_usage_turn_end("Open 9-5.", in_tokens=9000, out_tokens=120)]
+    )
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "hours?", "include_usage": False})), None
+    )
+    assert "usage" not in json.loads(resp["body"])
+
+
+def test_usage_sums_every_model_call_in_the_loop(monkeypatch):
+    # One student question, three Converse calls. A meter that read only the last response
+    # would report 9,000 input tokens instead of 39,000 - the exact under-count this exists
+    # to prevent, because each call resends everything before it.
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            _usage_turn_tool("hours", in_tokens=9000, out_tokens=40, tool_use_id="a"),
+            _usage_turn_tool("hours summer", in_tokens=13000, out_tokens=45, tool_use_id="b"),
+            _usage_turn_end("Open 9-5.", in_tokens=17000, out_tokens=130),
+        ]
+    )
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "hours?", "include_usage": True})), None
+    )
+
+    usage = json.loads(resp["body"])["usage"]
+    assert usage["model_calls"] == 3
+    assert usage["input_tokens"] == 9000 + 13000 + 17000
+    assert usage["output_tokens"] == 40 + 45 + 130
+
+
+def test_usage_counts_the_priming_retrieval_and_each_model_retrieval(monkeypatch):
+    # Retrievals are billed (query embedding + vector-index query), and the priming one runs
+    # on every single turn whether or not the model asks. Three here: priming + two tool calls.
+    bedrock = FakeBedrockRuntime(
+        converse_script=[
+            _usage_turn_tool("hours", in_tokens=9000, out_tokens=40, tool_use_id="a"),
+            _usage_turn_tool("hours summer", in_tokens=13000, out_tokens=45, tool_use_id="b"),
+            _usage_turn_end("Open 9-5.", in_tokens=17000, out_tokens=130),
+        ]
+    )
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "hours?", "include_usage": True})), None
+    )
+
+    usage = json.loads(resp["body"])["usage"]
+    assert usage["retrievals"] == 3
+    # tool_calls counts the priming call too, since it is a real tool result the model saw.
+    assert usage["tool_calls"] == 3
+
+
+def test_usage_accumulates_guardrail_units_per_policy(monkeypatch):
+    # Guardrails bill per text unit PER POLICY, and the output backstop runs on every turn -
+    # so the units must accumulate across turns and stay split by policy, not collapse to one
+    # number priced at a single rate.
+    bedrock = FakeBedrockRuntime(
+        guardrail_response=_guardrail_with_usage(
+            {"contentPolicyUnits": 1, "sensitiveInformationPolicyUnits": 1}
+        ),
+        converse_script=[
+            _usage_turn_tool("hours", in_tokens=9000, out_tokens=40, tool_use_id="a"),
+            _usage_turn_end(
+                "Open 9-5.",
+                in_tokens=17000,
+                out_tokens=130,
+                guardrail_units={"contentPolicyUnits": 6},
+            ),
+        ],
+    )
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "hours?", "include_usage": True})), None
+    )
+
+    usage = json.loads(resp["body"])["usage"]
+    assert usage["guardrail_units"]["content_policy_units"] == 1 + 6
+    assert usage["guardrail_units"]["sensitive_information_policy_units"] == 1
+    # The input screen plus the one turn that reported metrics.
+    assert usage["guardrail_calls"] == 2
+
+
+def test_a_guardrail_blocked_query_still_reports_what_it_cost(monkeypatch):
+    # A blocked query never reaches Converse, but it DID pay for the input screen. Reporting
+    # zero there would make abuse look free.
+    blocked = blocked_input_response("I can't help with that.")
+    blocked["usage"] = {"contentPolicyUnits": 1}
+    bedrock = FakeBedrockRuntime(guardrail_response=blocked)
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "something awful", "include_usage": True})), None
+    )
+
+    body = json.loads(resp["body"])
+    assert body["sources"] == []
+    assert body["usage"]["model_calls"] == 0
+    assert body["usage"]["guardrail_calls"] == 1
+    assert body["usage"]["guardrail_units"]["content_policy_units"] == 1
+
+
+def test_usage_survives_a_response_with_no_usage_block(monkeypatch):
+    # A Converse response missing `usage` was still a billed call: count the call, not zero.
+    bedrock = FakeBedrockRuntime(converse_script=[end_turn("Open 9-5.")])
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "hours?", "include_usage": True})), None
+    )
+
+    usage = json.loads(resp["body"])["usage"]
+    assert usage["model_calls"] == 1
+    assert usage["input_tokens"] == 0
+
+
+def test_the_full_context_flag_also_returns_usage(monkeypatch):
+    # The eval already asks for the heavy debug payload; the tally is already computed, so it
+    # rides along rather than needing a second round trip.
+    bedrock = FakeBedrockRuntime(
+        converse_script=[_usage_turn_end("Open 9-5.", in_tokens=9000, out_tokens=120)]
+    )
+    _wire(monkeypatch, FakeAgentRuntime(), bedrock)
+
+    resp = handler.lambda_handler(
+        _payload_v2_event(json.dumps({"query": "hours?", "include_full_context": True})), None
+    )
+    body = json.loads(resp["body"])
+    assert body["usage"]["input_tokens"] == 9000
+    assert "tool_calls" in body
+
+
+def test_camel_to_snake_handles_the_guardrail_field_names():
+    assert handler._camel_to_snake("contentPolicyUnits") == "content_policy_units"
+    assert (
+        handler._camel_to_snake("sensitiveInformationPolicyFreeUnits")
+        == "sensitive_information_policy_free_units"
+    )

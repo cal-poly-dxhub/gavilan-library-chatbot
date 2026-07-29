@@ -1,0 +1,871 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Never index this page. It is a styled stand-in for the library's site, and a search
+       result pointing here instead of gavilan.edu would be actively harmful. The CDN in
+       front of it also sends X-Robots-Tag: noindex, nofollow (see infra_stack.py), so the
+       instruction survives even for a crawler that only reads headers. -->
+  <meta name="robots" content="noindex, nofollow, noarchive" />
+  <title>DEMO - Gavilan College Library chat assistant</title>
+  <!--
+    ==========================================================================
+    SHIPPED DEMO PAGE. This is the one HTML file the CDK stack deploys to its
+    own S3 + CloudFront distribution, so `cdk deploy` hands back a public URL
+    that shows the chat widget in something resembling its real setting.
+
+    TWO DEPLOY-TIME PLACEHOLDERS are stamped into this file by the stack
+    (infra/infra/infra_stack.py, "Demo site" sections) via s3deploy.Source.data,
+    which resolves CDK tokens during deployment:
+
+      the widget-src placeholder -> https://<widget CloudFront domain>/widget.js
+      the api-url placeholder    -> https://<api id>.execute-api.<region>.amazonaws.com/query
+
+    Their exact spellings are _DEMO_WIDGET_SRC_TOKEN / _DEMO_API_URL_TOKEN in
+    infra_stack.py; they are not written out here because every literal
+    occurrence in this file gets substituted, comments included. Nothing here
+    is hardcoded to an account or region, so a fresh install in a different AWS
+    account produces a correct page with no hand-editing. The stack ASSERTS both
+    placeholders are present at synth - renaming one here without updating the
+    stack fails the build instead of shipping a dead page.
+
+    The script tag at the bottom is the real production embed: the SAME
+    widget.js the library would paste onto their own site, served from the SAME
+    CloudFront distribution, over the SAME cross-origin POST to /query. Nothing
+    about the widget is forked or inlined here, and nothing is mocked.
+
+    LOCAL PREVIEW (to iterate on this page's own styling):
+      cd frontend && python3 -m http.server 8000
+      then open http://localhost:8000/demo-site.html
+    The placeholders are not stamped locally, so the widget will not load. To
+    exercise it locally, hand-edit YOUR COPY the way frontend/demo-live.html
+    documents - set src="widget.js" (the sibling file) and data-api-url to the
+    deployed ChatbotApiUrl - and leave the placeholders intact in the committed
+    file. http://localhost:8000 is already in cors.allow_origins for this.
+    ==========================================================================
+  -->
+  <style>
+    /* ---------------------------------------------------------------------
+       All styling is local and hand-authored. NOTHING is fetched from
+       gavilan.edu - no stylesheets, no logos, no images. Hotlinking their
+       assets would break the moment they redesign and would read as a scrape.
+       The palette is built around the same maroon the widget uses for its
+       brand token (--brand: #8a1c30), so the widget sits in the page instead
+       of on top of it.
+       --------------------------------------------------------------------- */
+    :root {
+      --maroon: #8a1c30;
+      --maroon-dark: #6b1425;
+      --maroon-ink: #ffffff;
+      --gold: #c9a227;
+      --ink: #1a1d21;
+      --muted: #5b6570;
+      --page: #f6f4f2;
+      --card: #ffffff;
+      --line: #e3e0db;
+      --demo: #7c2d12;
+      --demo-bg: #fef3c7;
+      --demo-line: #b45309;
+    }
+
+    * { box-sizing: border-box; }
+
+    html { -webkit-text-size-adjust: 100%; }
+
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.55;
+    }
+
+    h1, h2, h3 {
+      font-family: Georgia, "Times New Roman", serif;
+      line-height: 1.2;
+      margin: 0;
+    }
+
+    a { color: var(--maroon); }
+    a:hover { text-decoration: none; }
+
+    .wrap { max-width: 1080px; margin: 0 auto; padding: 0 20px; }
+
+    /* --- demo banner: the first thing on the page, and impossible to miss --- */
+    .demo-banner {
+      background: var(--demo-bg);
+      border-bottom: 3px solid var(--demo-line);
+      color: var(--demo);
+      font-size: 14px;
+      padding: 10px 20px;
+    }
+    .demo-banner__inner {
+      max-width: 1080px;
+      margin: 0 auto;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 4px 10px;
+    }
+    .demo-banner__tag {
+      background: var(--demo-line);
+      color: #fff;
+      font-weight: 700;
+      font-size: 12px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      padding: 3px 8px;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+    .demo-banner a { color: var(--demo); font-weight: 600; }
+
+    /* --- cost control ---------------------------------------------------
+       Deliberately part of the DEMO BANNER, not the library chrome. Money is
+       demo scaffolding: a librarian being shown the assistant should be able
+       to ignore this completely, and nothing on the page mentions cost until
+       this is pressed. Grouping it with the banner is what says "this is the
+       demo talking", not something the college would ever publish.
+       -------------------------------------------------------------------- */
+    .demo-banner__spacer { flex: 1 1 auto; }
+    .costbtn {
+      flex: 0 0 auto;
+      font: inherit; font-size: 12.5px; font-weight: 600;
+      color: var(--demo);
+      background: rgba(255,255,255,.75);
+      border: 1px solid var(--demo-line);
+      border-radius: 4px;
+      padding: 3px 10px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .costbtn:hover { background: #fff; }
+    .costbtn:focus-visible { outline: 2px solid var(--demo-line); outline-offset: 2px; }
+
+    .costpanel {
+      background: #fffdf7;
+      border-bottom: 3px solid var(--demo-line);
+      color: var(--ink);
+      font-size: 14px;
+    }
+    .costpanel[hidden] { display: none; }
+    .costpanel__inner { max-width: 1080px; margin: 0 auto; padding: 18px 20px 22px; }
+    .costpanel h2 {
+      font-family: inherit; font-size: 13px; font-weight: 700;
+      letter-spacing: .06em; text-transform: uppercase; color: var(--demo);
+      margin: 0 0 10px;
+    }
+    .costpanel__cols { display: grid; grid-template-columns: 1fr 1.25fr; gap: 26px; align-items: start; }
+    @media (max-width: 820px) { .costpanel__cols { grid-template-columns: 1fr; } }
+
+    .costcard {
+      background: #fff; border: 1px solid #e7dfc9; border-radius: 8px; padding: 15px 17px;
+    }
+
+    .bignum {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 27px; font-weight: 700; color: var(--maroon); line-height: 1.1;
+    }
+    .bignum--sm { font-size: 20px; }
+    .sublabel { font-size: 12.5px; color: var(--muted); margin-top: 3px; }
+
+    .costrows { list-style: none; margin: 12px 0 0; padding: 0; font-size: 13px; }
+    .costrows li {
+      display: flex; justify-content: space-between; gap: 12px;
+      padding: 4px 0; border-bottom: 1px dotted #e3ddd0;
+    }
+    .costrows li:last-child { border-bottom: none; }
+    .costrows .k { color: var(--muted); }
+    .costrows .v {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: nowrap;
+    }
+
+    .sliders { margin: 0; }
+    .slider { margin-bottom: 13px; }
+    .slider__top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+    .slider__label { font-size: 13px; font-weight: 600; }
+    .slider__val {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13px; color: var(--maroon); font-weight: 700;
+    }
+    .slider input[type="range"] { width: 100%; margin: 5px 0 0; accent-color: var(--maroon); }
+    .slider__hint { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+    .twofig { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 4px; }
+    @media (max-width: 480px) { .twofig { grid-template-columns: 1fr; } }
+    .fig { border: 1px solid #e7dfc9; border-radius: 6px; padding: 11px 13px; background: #fffaf0; }
+    .fig__label { font-size: 11.5px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+
+    .costnote { font-size: 12px; color: var(--muted); margin: 12px 0 0; line-height: 1.5; }
+    .costnote strong { color: var(--demo); }
+
+    .ratebox { margin-top: 12px; }
+    .ratebox summary { font-size: 12.5px; color: var(--muted); cursor: pointer; }
+    .ratebox summary:focus-visible { outline: 2px solid var(--demo-line); outline-offset: 2px; }
+    .ratebox table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 12px; }
+    .ratebox th, .ratebox td { text-align: left; padding: 3px 8px 3px 0; vertical-align: top; }
+    .ratebox th { color: var(--muted); font-weight: 600; }
+    .ratebox td:last-child {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: nowrap;
+    }
+    .estimate-tag {
+      display: inline-block; background: var(--demo-line); color: #fff;
+      font-size: 10.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+      padding: 2px 7px; border-radius: 3px; margin-left: 8px; vertical-align: middle;
+    }
+
+    /* --- utility strip + masthead --- */
+    .utility {
+      background: var(--maroon-dark);
+      color: rgba(255,255,255,.85);
+      font-size: 13px;
+    }
+    .utility__inner {
+      max-width: 1080px; margin: 0 auto; padding: 6px 20px;
+      display: flex; flex-wrap: wrap; gap: 18px; justify-content: flex-end;
+    }
+    .utility a { color: rgba(255,255,255,.85); text-decoration: none; }
+    .utility a:hover { color: #fff; text-decoration: underline; }
+
+    .masthead { background: var(--maroon); color: var(--maroon-ink); }
+    .masthead__inner {
+      max-width: 1080px; margin: 0 auto; padding: 18px 20px;
+      display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    }
+    .mark { flex: 0 0 auto; display: block; width: 42px; height: 42px; }
+    .wordmark { display: flex; flex-direction: column; }
+    .wordmark__college {
+      font-size: 12px; letter-spacing: .22em; text-transform: uppercase;
+      color: rgba(255,255,255,.82);
+    }
+    .wordmark__site {
+      font-family: Georgia, "Times New Roman", serif;
+      font-size: 27px; font-weight: 700; letter-spacing: .01em;
+    }
+    .masthead__spacer { flex: 1 1 auto; }
+    .masthead__note {
+      font-size: 13px; color: rgba(255,255,255,.8);
+      border-left: 2px solid var(--gold); padding-left: 12px;
+    }
+
+    /* --- primary nav --- */
+    .nav { background: #fff; border-bottom: 3px solid var(--gold); }
+    .nav__inner {
+      max-width: 1080px; margin: 0 auto; padding: 0 20px;
+      display: flex; flex-wrap: wrap;
+    }
+    .nav a {
+      display: block; padding: 13px 15px;
+      color: var(--ink); text-decoration: none;
+      font-size: 14px; font-weight: 600; letter-spacing: .01em;
+      border-bottom: 3px solid transparent; margin-bottom: -3px;
+    }
+    .nav a:hover { color: var(--maroon); border-bottom-color: var(--maroon); }
+    .nav a[aria-current="page"] { color: var(--maroon); border-bottom-color: var(--maroon); }
+
+    /* --- search band (visual context only; see the disabled note) --- */
+    .searchband { background: #ece8e4; border-bottom: 1px solid var(--line); }
+    .searchband__inner { max-width: 1080px; margin: 0 auto; padding: 26px 20px; }
+    .searchband h1 { font-size: 30px; margin-bottom: 6px; }
+    .searchband p { margin: 0 0 16px; color: var(--muted); }
+    .searchform { display: flex; gap: 8px; flex-wrap: wrap; max-width: 640px; }
+    .searchform input {
+      flex: 1 1 260px; min-width: 0;
+      padding: 11px 14px; font: inherit; font-size: 15px;
+      border: 1px solid #c8c3bc; border-radius: 6px; background: #fff; color: var(--ink);
+    }
+    .searchform input:disabled { background: #f4f2f0; color: #8b8681; cursor: not-allowed; }
+    .searchform button {
+      flex: 0 0 auto; padding: 11px 22px; font: inherit; font-weight: 600; font-size: 15px;
+      border: none; border-radius: 6px; background: var(--maroon); color: #fff;
+    }
+    .searchform button:disabled { opacity: .55; cursor: not-allowed; }
+    .searchband__disabled { margin: 10px 0 0; font-size: 13px; color: var(--muted); }
+
+    /* --- content --- */
+    main { padding: 30px 0 64px; }
+    .cols { display: grid; grid-template-columns: 2fr 1fr; gap: 26px; align-items: start; }
+    @media (max-width: 800px) { .cols { grid-template-columns: 1fr; } }
+
+    .card {
+      background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+      padding: 20px 22px; margin-bottom: 22px;
+    }
+    .card h2 { font-size: 21px; margin-bottom: 10px; }
+    .card h3 { font-size: 16px; margin: 18px 0 6px; font-family: inherit; font-weight: 700; }
+    .card p { margin: 0 0 12px; }
+    .card p:last-child, .card ul:last-child { margin-bottom: 0; }
+
+    .card--accent { border-left: 5px solid var(--maroon); }
+
+    .stack { list-style: none; margin: 0; padding: 0; }
+    .stack li { padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 15px; }
+    .stack li:last-child { border-bottom: none; }
+    .stack a { font-weight: 600; text-decoration: none; }
+    .stack a:hover { text-decoration: underline; }
+
+    .note { font-size: 14px; color: var(--muted); }
+
+    .askbox { background: #fdf9f2; border: 1px solid #e6d9b8; border-radius: 8px; padding: 18px 20px; }
+    .askbox h2 { font-size: 19px; margin-bottom: 8px; }
+    .askbox p { margin: 0 0 10px; font-size: 15px; }
+    .askbox p:last-child { margin-bottom: 0; }
+    .askbox strong { color: var(--maroon); }
+
+    .qs { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+    .qs li {
+      background: #fff; border: 1px solid var(--line); border-radius: 999px;
+      padding: 6px 13px; font-size: 14px; color: var(--maroon); font-weight: 600;
+    }
+
+    .faq { margin: 0; }
+    .faq dt { font-weight: 700; margin-top: 14px; }
+    .faq dt:first-child { margin-top: 0; }
+    .faq dd { margin: 4px 0 0; color: var(--muted); }
+
+    /* --- footer --- */
+    footer {
+      background: var(--maroon-dark); color: rgba(255,255,255,.85);
+      padding: 26px 0; font-size: 14px;
+    }
+    footer .wrap > p { margin: 0 0 10px; }
+    footer p:last-child { margin-bottom: 0; }
+    footer a { color: #fff; }
+    .footer__meta {
+      margin-top: 16px; padding-top: 14px; border-top: 1px solid rgba(255,255,255,.22);
+      font-size: 12.5px; color: rgba(255,255,255,.7); word-break: break-all;
+    }
+    .footer__meta code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px; color: #fff;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="demo-banner" role="note">
+    <div class="demo-banner__inner">
+      <span class="demo-banner__tag">Demo site</span>
+      <span>
+        This is <strong>not</strong> the Gavilan College Library website. It is a sample page
+        built by Cal Poly DxHub to show the library chat assistant in context - the page
+        content around it is illustrative only. The real site is
+        <a href="https://www.gavilan.edu/library/" target="_blank" rel="noopener">gavilan.edu/library</a>.
+      </span>
+      <span class="demo-banner__spacer"></span>
+      <!-- The ONLY thing on this page that mentions cost until it is pressed. -->
+      <button type="button" class="costbtn" id="cost-toggle"
+              aria-expanded="false" aria-controls="cost-panel">What does this cost?</button>
+    </div>
+  </div>
+
+  <!--
+    ============================================================
+    COST PANEL. Hidden until the banner control is pressed.
+
+    Two halves, on purpose:
+      1. What the conversation you just had actually cost. It meters
+         from the FIRST message, not from when this panel opened, so
+         the numbers are already here when the question gets asked.
+      2. A monthly estimate for a real student population, split into
+         a fixed floor and a variable part rather than one blended
+         number, because those two answer different questions.
+
+    Every figure is published-list-rate arithmetic over measured token
+    usage. Nothing here reads an AWS bill.
+    ============================================================
+  -->
+  <section class="costpanel" id="cost-panel" hidden aria-labelledby="cost-toggle">
+    <div class="costpanel__inner">
+      <div class="costpanel__cols">
+
+        <div class="costcard">
+          <h2>This conversation <span class="estimate-tag">Estimate</span></h2>
+          <div class="bignum" id="sess-total">$0.0000</div>
+          <div class="sublabel" id="sess-sub">No questions asked yet. Ask the assistant something.</div>
+          <ul class="costrows" id="sess-rows">
+            <li><span class="k">Questions asked</span><span class="v" id="sess-q">0</span></li>
+            <li><span class="k">Model calls made</span><span class="v" id="sess-calls">0</span></li>
+            <li><span class="k">Input tokens</span><span class="v" id="sess-in">0</span></li>
+            <li><span class="k">Output tokens</span><span class="v" id="sess-out">0</span></li>
+            <li><span class="k">Guardrail text units</span><span class="v" id="sess-gr">0</span></li>
+            <li><span class="k">Cost per question</span><span class="v" id="sess-per">-</span></li>
+          </ul>
+          <p class="costnote" id="sess-note">
+            One question is not one model call. This is an agentic loop: when the assistant
+            needs a tool it calls the model again, and each call resends the whole context.
+          </p>
+        </div>
+
+        <div class="costcard">
+          <h2>Monthly estimate <span class="estimate-tag">Estimate</span></h2>
+          <div class="sliders">
+            <div class="slider">
+              <div class="slider__top">
+                <label class="slider__label" for="s-users">Students using it each month</label>
+                <span class="slider__val" id="v-users">1,000</span>
+              </div>
+              <input type="range" id="s-users" min="0" max="12000" step="100" value="1000" />
+            </div>
+            <div class="slider">
+              <div class="slider__top">
+                <label class="slider__label" for="s-q">Questions per student per month</label>
+                <span class="slider__val" id="v-q">4</span>
+              </div>
+              <input type="range" id="s-q" min="0" max="30" step="1" value="4" />
+            </div>
+            <div class="slider">
+              <div class="slider__top">
+                <label class="slider__label" for="s-len">Typical conversation length</label>
+                <span class="slider__val" id="v-len">3</span>
+              </div>
+              <input type="range" id="s-len" min="1" max="10" step="1" value="3" />
+              <div class="slider__hint" id="len-hint"></div>
+            </div>
+          </div>
+
+          <div class="twofig">
+            <div class="fig">
+              <div class="fig__label">Fixed floor</div>
+              <div class="bignum bignum--sm" id="fixed-total">$0.00</div>
+              <div class="sublabel">Every month, even at zero use</div>
+            </div>
+            <div class="fig">
+              <div class="fig__label">Variable</div>
+              <div class="bignum bignum--sm" id="var-total">$0.00</div>
+              <div class="sublabel" id="var-sub">&nbsp;</div>
+            </div>
+          </div>
+
+          <ul class="costrows" id="fixed-rows">
+            <li><span class="k">Stored data (S3 + vector index)</span><span class="v" id="f-storage">-</span></li>
+            <li><span class="k">Weekly re-scrape + re-index</span><span class="v" id="f-reindex">-</span></li>
+            <li><span class="k">Scraper compute</span><span class="v" id="f-scraper">-</span></li>
+            <li><span class="k">CloudWatch logs</span><span class="v" id="f-logs">-</span></li>
+          </ul>
+
+          <p class="costnote" id="floor-note"></p>
+
+          <details class="ratebox">
+            <summary id="rates-summary">Rates used</summary>
+            <table>
+              <thead><tr><th>Item</th><th>Rate</th></tr></thead>
+              <tbody id="rate-rows"></tbody>
+            </table>
+          </details>
+        </div>
+
+      </div>
+
+      <p class="costnote">
+        <strong>These are estimates, not a bill.</strong> They are published AWS list prices
+        multiplied by token usage measured against this deployment; no billing or account
+        spend data is read, and nothing here accounts for taxes, credits, free-tier
+        allowances, support plans, or the other AWS activity in the same account.
+      </p>
+    </div>
+  </section>
+
+  <div class="utility">
+    <div class="utility__inner">
+      <a href="https://www.gavilan.edu/" target="_blank" rel="noopener">Gavilan College</a>
+      <a href="https://www.gavilan.edu/library/contactus.php" target="_blank" rel="noopener">Contact</a>
+      <a href="https://gavilan.libguides.com/" target="_blank" rel="noopener">Research Guides</a>
+    </div>
+  </div>
+
+  <header class="masthead">
+    <div class="masthead__inner">
+      <!-- Local inline SVG mark. Deliberately generic (an open book), NOT the college seal:
+           a demo page must not present itself as officially branded. -->
+      <svg class="mark" viewBox="0 0 48 48" role="img" aria-label="Open book">
+        <g fill="none" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round">
+          <path d="M24 14c-4-3-9-4-14-4v26c5 0 10 1 14 4 4-3 9-4 14-4V10c-5 0-10 1-14 4z" />
+          <path d="M24 14v26" />
+        </g>
+      </svg>
+      <div class="wordmark">
+        <span class="wordmark__college">Gavilan College</span>
+        <span class="wordmark__site">Library</span>
+      </div>
+      <div class="masthead__spacer"></div>
+      <div class="masthead__note">Gilroy Campus &middot; Building&nbsp;LI</div>
+    </div>
+  </header>
+
+  <nav class="nav" aria-label="Library sections">
+    <div class="nav__inner">
+      <a href="https://www.gavilan.edu/library/" target="_blank" rel="noopener" aria-current="page">Home</a>
+      <a href="https://www.gavilan.edu/library/findresources.php" target="_blank" rel="noopener">Find Resources</a>
+      <a href="https://www.gavilan.edu/library/libraryservices.php" target="_blank" rel="noopener">Services</a>
+      <a href="https://www.gavilan.edu/library/researchassistance.php" target="_blank" rel="noopener">Research Help</a>
+      <a href="https://www.gavilan.edu/library/howdoi.php" target="_blank" rel="noopener">How Do I&hellip;?</a>
+      <a href="https://www.gavilan.edu/library/librarycard.php" target="_blank" rel="noopener">Library Card</a>
+      <a href="https://www.gavilan.edu/library/about-the-library.php" target="_blank" rel="noopener">About</a>
+    </div>
+  </nav>
+
+  <div class="searchband">
+    <div class="searchband__inner">
+      <h1>Gavilan College Library</h1>
+      <p>Books, e-books, articles, course reserves, and research help for Gavilan students.</p>
+      <form class="searchform" onsubmit="return false;">
+        <input type="search" aria-label="Search the catalog"
+               placeholder="Search books, articles, and more&hellip;" disabled />
+        <button type="submit" disabled>Search</button>
+      </form>
+      <p class="searchband__disabled">
+        Catalog search is switched off on this demo page. The chat assistant at the
+        bottom&#8209;right is live and does search the real catalog.
+      </p>
+    </div>
+  </div>
+
+  <main>
+    <div class="wrap cols">
+      <div>
+        <section class="card card--accent">
+          <h2>Ask the library assistant</h2>
+          <p>
+            Click <strong>Ask the Library</strong> in the bottom&#8209;right corner. The assistant
+            answers routine questions about hours, borrowing, textbooks, course reserves,
+            research databases, and what the library offers, and it hands research questions
+            off to a librarian. It is the same assistant the library would embed on their own
+            pages - this page just adds the one script tag.
+          </p>
+          <ul class="qs">
+            <li>What are the library hours?</li>
+            <li>How do I check out a book?</li>
+            <li>Do you have the textbook for ENGL 1A?</li>
+            <li>Can I borrow a laptop?</li>
+            <li>What research databases are available?</li>
+          </ul>
+        </section>
+
+        <section class="card">
+          <h2>How do I&hellip;?</h2>
+          <dl class="faq">
+            <dt>Get a library card</dt>
+            <dd>Currently enrolled students are set up with borrowing privileges; bring your GavID to the circulation desk.</dd>
+            <dt>Find my course textbook</dt>
+            <dd>Many textbooks are on course reserve or available online through the catalog. The bookstore sells and rents course materials.</dd>
+            <dt>Request something the library does not own</dt>
+            <dd>Interlibrary Loan borrows books and articles from other libraries on your behalf.</dd>
+            <dt>Get research help</dt>
+            <dd>Reference librarians are available in person, by phone, and by email during open hours.</dd>
+          </dl>
+        </section>
+      </div>
+
+      <aside>
+        <section class="card">
+          <h2>Hours</h2>
+          <p class="note">
+            Library hours change by term and around holidays. This demo page deliberately
+            does not print a schedule that could go stale - ask the assistant instead. It
+            answers from the library's own pages and cites the page it used.
+          </p>
+        </section>
+
+        <section class="card">
+          <h2>Quick links</h2>
+          <ul class="stack">
+            <li><a href="https://www.gavilan.edu/library/databases.php" target="_blank" rel="noopener">Research databases (A&ndash;Z)</a></li>
+            <li><a href="https://gavilan.libguides.com/" target="_blank" rel="noopener">Subject research guides</a></li>
+            <li><a href="https://www.gavilan.edu/library/ill.php" target="_blank" rel="noopener">Interlibrary Loan</a></li>
+            <li><a href="https://gavilan.bkstr.com/pages/courses-materials-results" target="_blank" rel="noopener">Bookstore course materials</a></li>
+            <li><a href="https://www.gavilan.edu/about/maps/main_map.php" target="_blank" rel="noopener">Campus map</a></li>
+          </ul>
+        </section>
+
+        <section class="askbox">
+          <h2>Talk to a librarian</h2>
+          <p>
+            The assistant is for routine questions. For help shaping a research topic,
+            picking sources, or citing them, a <strong>librarian</strong> is the right
+            person - the assistant will point you there.
+          </p>
+          <p><a href="https://www.gavilan.edu/library/contactus.php" target="_blank" rel="noopener">Contact the library</a></p>
+        </section>
+      </aside>
+    </div>
+  </main>
+
+  <footer>
+    <div class="wrap">
+      <p>
+        <strong>Demo build.</strong> A packaging demo of the Gavilan College Library chat
+        assistant, deployed by the project's own CDK stack. Not an official Gavilan College
+        page, and not indexed by search engines.
+      </p>
+      <p>Built with Cal Poly DxHub. The real library site is
+        <a href="https://www.gavilan.edu/library/" target="_blank" rel="noopener">gavilan.edu/library</a>.</p>
+      <!-- Both values are stamped at deploy time, so this footer doubles as proof that the
+           page discovered its own backend rather than carrying a hardcoded endpoint. -->
+      <p class="footer__meta">
+        Assistant endpoint: <code>__API_URL__</code><br />
+        Widget served from: <code>__WIDGET_SRC__</code>
+      </p>
+    </div>
+  </footer>
+
+  <!--
+    ============================================================
+    COST METER + ESTIMATOR.
+
+    Runs BEFORE the widget below, so the usage listener is attached
+    before any answer can arrive. That is what lets the meter accrue
+    from the very first message instead of from when the panel is
+    opened - by the time somebody asks "what does this cost", the
+    answer for the conversation they just had is already sitting here.
+
+    The cost model itself is a THIRD deploy-time placeholder, stamped
+    from config.yaml's cost_model block exactly like the API and
+    widget URLs above (its spelling lives in infra_stack.py; writing
+    it out in this comment would get it substituted too). Rates and
+    measured constants therefore live in config, never here.
+    ============================================================
+  -->
+  <script>
+    (function () {
+      "use strict";
+      var M = __COST_MODEL__;
+      if (!M || !M.rates) return; // no model stamped: leave the page as-is
+
+      var $ = function (id) { return document.getElementById(id); };
+      var R = M.rates, Q = M.measured, B = M.baseline;
+
+      // ---- formatting ---------------------------------------------------
+      function money(n, dp) {
+        return "$" + n.toLocaleString("en-US", {
+          minimumFractionDigits: dp, maximumFractionDigits: dp
+        });
+      }
+      // A conversation costs fractions of a cent, a month costs dollars. One
+      // format cannot show both without either lying by rounding to $0.00 or
+      // printing a monthly figure to four decimals. The "<" case matters: some
+      // real line items round to $0.0000 at four decimals, and printing zero for
+      // something that is not zero is the one rounding error worth avoiding here.
+      function smallMoney(n) {
+        if (n === 0) return "$0";
+        if (n < 0.0001) return "<$0.0001";
+        return n >= 0.01 ? money(n, 2) : money(n, 4);
+      }
+      function num(n) { return Math.round(n).toLocaleString("en-US"); }
+
+      // ---- the model ----------------------------------------------------
+      //
+      // Per question, at a given conversation length. The depth term is the
+      // history the client resends: averaged over a conversation of length L,
+      // a question sits at position (L+1)/2, so it carries (L-1)/2 prior turns.
+      function perQuestion(convLen) {
+        var priorTurns = Math.max(0, (convLen - 1) / 2);
+        var ctxPerCall = Q.context_tokens_per_call_base +
+                         Q.context_tokens_per_call_per_prior_turn * priorTurns;
+        var inTok = Q.model_calls_avg * ctxPerCall;
+        var outTok = Q.output_tokens_avg;
+        var model = inTok / 1e6 * R.generation_input_per_1m +
+                    outTok / 1e6 * R.generation_output_per_1m;
+        var guard = Q.guardrail_content_units_avg / 1000 * R.guardrail_content_per_1k_units +
+                    Q.guardrail_pii_units_avg / 1000 * R.guardrail_pii_per_1k_units;
+        var retrieval = Q.retrievals_avg *
+                        (R.vector_query_per_1m / 1e6 +
+                         Q.retrieval_query_tokens / 1e6 * R.embedding_per_1m);
+        var plumbing = R.api_requests_per_1m / 1e6 +
+                       R.lambda_per_1m_requests / 1e6 +
+                       Q.query_lambda_gb_seconds * R.lambda_per_gb_second;
+        return {
+          inputTokens: inTok, outputTokens: outTok,
+          model: model, guard: guard, retrieval: retrieval, plumbing: plumbing,
+          total: model + guard + retrieval + plumbing
+        };
+      }
+
+      // What exists at zero traffic. Every line is rate x measured quantity.
+      function fixedMonthly() {
+        var ingests = B.scrapes_per_month + B.deploys_per_month;
+        // S3 Vectors bills a 128 KB minimum per PUT, so a small index costs more
+        // to rewrite than its byte count suggests.
+        var putBytes = B.vector_count * Math.max(131072, B.vector_bytes_each);
+        var storage = (B.s3_stored_bytes / 1e9) * R.s3_storage_per_gb_month +
+                      (B.vector_count * B.vector_bytes_each / 1e9) * R.vector_storage_per_gb_month;
+        var reindex = ingests * ((B.ingest_embedded_tokens / 1e6) * R.embedding_per_1m +
+                                 (putBytes / 1e9) * R.vector_put_per_gb);
+        var scraper = ingests * (B.scraper_seconds_per_run * B.scraper_memory_gb *
+                                 R.lambda_per_gb_second + R.lambda_per_1m_requests / 1e6);
+        var logs = B.log_gb_per_month * R.logs_ingest_per_gb;
+        return {
+          storage: storage, reindex: reindex, scraper: scraper, logs: logs,
+          ingests: ingests, total: storage + reindex + scraper + logs
+        };
+      }
+
+      // ---- live session meter -------------------------------------------
+      //
+      // Accrues from the widget's usage events, which the embed below opts
+      // into. Priced with the SAME rate table as the estimator, so the two
+      // halves of this panel can never disagree.
+      var sess = { q: 0, calls: 0, inTok: 0, outTok: 0, grContent: 0, grPii: 0, retr: 0 };
+
+      function sessionCost() {
+        return sess.inTok / 1e6 * R.generation_input_per_1m +
+               sess.outTok / 1e6 * R.generation_output_per_1m +
+               sess.grContent / 1000 * R.guardrail_content_per_1k_units +
+               sess.grPii / 1000 * R.guardrail_pii_per_1k_units +
+               sess.retr * (R.vector_query_per_1m / 1e6 +
+                            Q.retrieval_query_tokens / 1e6 * R.embedding_per_1m) +
+               sess.q * (R.api_requests_per_1m / 1e6 + R.lambda_per_1m_requests / 1e6 +
+                         Q.query_lambda_gb_seconds * R.lambda_per_gb_second);
+      }
+
+      function renderSession() {
+        var total = sessionCost();
+        $("sess-total").textContent = money(total, 4);
+        $("sess-q").textContent = num(sess.q);
+        $("sess-calls").textContent = num(sess.calls);
+        $("sess-in").textContent = num(sess.inTok);
+        $("sess-out").textContent = num(sess.outTok);
+        $("sess-gr").textContent = num(sess.grContent + sess.grPii);
+        $("sess-per").textContent = sess.q ? money(total / sess.q, 4) : "-";
+        if (sess.q) {
+          $("sess-sub").textContent =
+            sess.q + (sess.q === 1 ? " question" : " questions") + " so far, " +
+            sess.calls + " model " + (sess.calls === 1 ? "call" : "calls") + ".";
+        }
+        if (sess.q && sess.calls > sess.q) {
+          $("sess-note").innerHTML =
+            "One question is not one model call. These " + sess.q + " questions took <strong>" +
+            sess.calls + " model calls</strong>, because the assistant re-calls the model " +
+            "after a tool result and each call resends the whole context.";
+        }
+      }
+
+      window.addEventListener("gavilan-widget:usage", function (ev) {
+        var u = (ev && ev.detail && ev.detail.usage) || null;
+        if (!u) return;
+        var g = u.guardrail_units || {};
+        sess.q += 1;
+        sess.calls += u.model_calls || 0;
+        sess.inTok += u.input_tokens || 0;
+        sess.outTok += u.output_tokens || 0;
+        sess.retr += u.retrievals || 0;
+        sess.grContent += g.content_policy_units || 0;
+        sess.grPii += Math.max(
+          (g.sensitive_information_policy_units || 0) -
+          (g.sensitive_information_policy_free_units || 0), 0);
+        renderSession();
+      });
+
+      // ---- estimator ------------------------------------------------------
+      var fixed = fixedMonthly();
+
+      function renderEstimate() {
+        var users = +$("s-users").value;
+        var qper = +$("s-q").value;
+        var len = +$("s-len").value;
+        $("v-users").textContent = num(users);
+        $("v-q").textContent = num(qper);
+        $("v-len").textContent = len === 1 ? "1 question" : len + " questions";
+
+        var questions = users * qper;
+        var per = perQuestion(len);
+        var variable = questions * per.total;
+
+        $("fixed-total").textContent = money(fixed.total, 2);
+        $("var-total").textContent = money(variable, 2);
+        // Name the SOURCE of the per-question price. The meter on the left prices the
+        // conversation actually in front of you and will usually read lower (a short,
+        // friendly conversation is mostly one-call questions), so without this the two
+        // halves of the panel look like they contradict each other.
+        $("var-sub").textContent = num(questions) + " questions/month at " +
+                                   money(per.total, 4) + " each (" +
+                                   Q.sample_questions +
+                                   "-question average, not this conversation)";
+
+        // The depth term, stated rather than buried: it is much smaller than a
+        // reader expects, and hiding that would make the slider look like it is
+        // doing more work than it is.
+        var flat = perQuestion(1);
+        var delta = per.total - flat.total;
+        $("len-hint").textContent = len === 1
+          ? "Single questions, no follow-ups."
+          : "Adds " + money(delta, 5) + " per question versus a one-question " +
+            "conversation (history is resent each turn).";
+      }
+
+      function renderFixed() {
+        $("f-storage").textContent = smallMoney(fixed.storage);
+        $("f-reindex").textContent = smallMoney(fixed.reindex);
+        $("f-scraper").textContent = smallMoney(fixed.scraper);
+        $("f-logs").textContent = smallMoney(fixed.logs);
+        $("floor-note").innerHTML =
+          "The floor is what runs whether or not anyone asks anything: stored bytes, the " +
+          "weekly re-scrape, and " + B.deploys_per_month + " assumed deploys a month (each " +
+          "one re-runs the scraper and re-indexes) &mdash; <strong>" +
+          fixed.ingests.toFixed(2) + " re-indexes a month</strong> in total. CloudFront, " +
+          "API Gateway and Lambda bill per use, so they contribute nothing at zero traffic.";
+      }
+
+      function renderRates() {
+        var rows = [
+          ["Claude Sonnet 4.6 input", money(R.generation_input_per_1m, 2) + " / 1M tokens"],
+          ["Claude Sonnet 4.6 output", money(R.generation_output_per_1m, 2) + " / 1M tokens"],
+          ["Titan Text Embeddings V2", money(R.embedding_per_1m, 2) + " / 1M tokens"],
+          ["Guardrails, content filters", money(R.guardrail_content_per_1k_units, 2) + " / 1k units"],
+          ["S3 Vectors queries", money(R.vector_query_per_1m, 2) + " / 1M"],
+          ["S3 Vectors storage", money(R.vector_storage_per_gb_month, 2) + " / GB-month"],
+          ["HTTP API requests", money(R.api_requests_per_1m, 2) + " / 1M"],
+          ["Lambda compute", "$" + R.lambda_per_gb_second + " / GB-second"],
+          ["CloudWatch Logs", money(R.logs_ingest_per_gb, 2) + " / GB"]
+        ];
+        var html = "";
+        for (var i = 0; i < rows.length; i++) {
+          html += "<tr><td>" + rows[i][0] + "</td><td>" + rows[i][1] + "</td></tr>";
+        }
+        $("rate-rows").innerHTML = html;
+        $("rates-summary").textContent =
+          "Rates used — AWS list prices, " + M.region + ", as of " + M.as_of +
+          " · usage measured over " + Q.sample_questions + " real questions on " + Q.at;
+      }
+
+      // ---- wiring ---------------------------------------------------------
+      var toggle = $("cost-toggle"), panel = $("cost-panel");
+      toggle.addEventListener("click", function () {
+        var open = panel.hasAttribute("hidden");
+        if (open) { panel.removeAttribute("hidden"); } else { panel.setAttribute("hidden", ""); }
+        toggle.setAttribute("aria-expanded", open ? "true" : "false");
+        if (open) panel.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      });
+
+      var ids = ["s-users", "s-q", "s-len"];
+      for (var i = 0; i < ids.length; i++) {
+        $(ids[i]).addEventListener("input", renderEstimate);
+      }
+
+      renderRates();
+      renderFixed();
+      renderEstimate();
+      renderSession();
+    })();
+  </script>
+
+  <!--
+    ============================================================
+    THE PRODUCTION EMBED. Exactly the tag the library would paste
+    onto their own site: the same widget.js, from the same
+    CloudFront distribution, pointed at the same /query endpoint.
+    No mock.js, no forked copy, no inlined widget code.
+
+    The ONE addition is data-usage-events, the widget's opt-in for
+    the token counts the meter above needs. The library's own embed
+    omits it, and without it the widget's request body and responses
+    are byte-identical to what they have always been.
+    ============================================================
+  -->
+  <script src="__WIDGET_SRC__" data-api-url="__API_URL__" data-usage-events="true" defer></script>
+</body>
+</html>

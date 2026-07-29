@@ -1,6 +1,8 @@
 import copy
 import json
+import pathlib
 import re
+from urllib.parse import urlparse
 
 import aws_cdk as core
 import aws_cdk.assertions as assertions
@@ -261,20 +263,42 @@ def test_generation_inference_and_query_limit_wired_to_lambda_env():
 
 
 def test_cors_allow_origins_locked_to_config_and_never_wildcard():
-    # Pre-launch hardening: the browser origin allowlist is the production library site plus a
-    # dev-only localhost entry, driven from config.yaml. A wildcard here would let any page on
-    # the internet drive this billable endpoint (Bedrock + Primo) from its visitors' browsers.
-    assert resolve_cors_allow_origins(CONFIG) == [
-        "https://www.gavilan.edu",
-        "http://localhost:8000",
-    ]
-    assert "*" not in resolve_cors_allow_origins(CONFIG)
+    # Pre-launch hardening: the browser origin allowlist is driven from config.yaml, and a
+    # wildcard would let any page on the internet drive this billable endpoint (Bedrock +
+    # Primo) from its visitors' browsers.
+    #
+    # These assert the INVARIANTS rather than a snapshot of today's list. A literal copy of the
+    # list only pins the entries that happen to be in config.yaml at the moment it was written,
+    # so it fails on every legitimate addition while catching none of the ways the allowlist
+    # actually breaks. What follows pins those ways instead, and keeps working at any length.
+    config_origins = resolve_cors_allow_origins(CONFIG)
+    assert "*" not in config_origins
 
-    # ...and that resolved list is what actually reaches the synthesized API.
+    # 1. The production library site is load-bearing: the widget is embedded on
+    #    https://www.gavilan.edu/library/, and losing this entry takes the real product down.
+    #    (Host-only Origin - the path is irrelevant to CORS - so no /library/ here.)
+    assert "https://www.gavilan.edu" in config_origins, config_origins
+
+    # 2. Every entry is a bare origin: scheme + host + optional port, with no trailing slash,
+    #    no path, no query and no fragment. API Gateway matches the FULL origin string exactly,
+    #    so a stray slash does not "mostly work" - it silently matches nothing, and the failure
+    #    looks like a backend outage from the browser rather than a typo in config.
+    for origin in config_origins:
+        parsed = urlparse(origin)
+        assert parsed.scheme in ("http", "https"), origin
+        assert parsed.netloc, origin
+        assert (parsed.path, parsed.query, parsed.fragment) == ("", "", ""), origin
+        assert origin == f"{parsed.scheme}://{parsed.netloc}", origin
+
+    # 3. That resolved list is what actually reaches the synthesized API - the stack passes
+    #    config through rather than hardcoding, dropping or reordering any of it. With the demo
+    #    site enabled the template also carries the demo distribution's own origin, which is a
+    #    deploy-time GetAtt (a dict), not a literal - see test_demo_site_origin_is_allowlisted.
     template = _template()
     api = _one(template, "AWS::ApiGatewayV2::Api")
     cors = api["Properties"]["CorsConfiguration"]
-    assert cors["AllowOrigins"] == ["https://www.gavilan.edu", "http://localhost:8000"], cors
+    literal_origins = [o for o in cors["AllowOrigins"] if isinstance(o, str)]
+    assert literal_origins == config_origins, cors
     assert "*" not in cors["AllowOrigins"], cors
     # Methods must cover the real routes (POST /query, GET /warm) plus the OPTIONS preflight
     # the gateway answers itself; only Content-Type is allowed through.
@@ -472,9 +496,10 @@ def test_bare_on_demand_model_id_falls_back_to_single_foundation_model_grant():
 
 def test_widget_bucket_is_private_and_oac_ready():
     template = _template()
-    # Three S3 buckets now (widget + KB source + catalog), all fully private: public access blocked
-    # and ACLs disabled via bucket-owner-enforced ownership (the ownership OAC requires).
-    template.resource_count_is("AWS::S3::Bucket", 3)
+    # Four S3 buckets now (widget + KB source + catalog + demo site), all fully private: public
+    # access blocked and ACLs disabled via bucket-owner-enforced ownership (which OAC requires).
+    # Both public-facing buckets are read ONLY through their CloudFront OAC, never directly.
+    template.resource_count_is("AWS::S3::Bucket", 4)
     template.has_resource_properties(
         "AWS::S3::Bucket",
         {
@@ -496,8 +521,8 @@ def test_kb_source_bucket_blocks_public_access():
     # library content, never served publicly (the KB reads it, CloudFront does not).
     template = _template()
     buckets = template.find_resources("AWS::S3::Bucket")
-    # KB source bucket + widget bucket + catalog bucket (Phase 2b).
-    assert len(buckets) == 3, list(buckets)
+    # KB source bucket + widget bucket + catalog bucket (Phase 2b) + demo site bucket.
+    assert len(buckets) == 4, list(buckets)
     for logical_id, res in buckets.items():
         assert res["Properties"]["PublicAccessBlockConfiguration"] == {
             "BlockPublicAcls": True,
@@ -689,25 +714,53 @@ def test_install_trigger_invoker_grant_is_scoped_to_the_scraper():
     assert any("ScraperFunction" in json.dumps(s["Resource"]) for s in invoke_stmts)
 
 
+def _distribution(template, root_object):
+    """The one CloudFront distribution serving `root_object` (widget.js vs the demo page)."""
+    dists = [
+        d
+        for d in template.find_resources("AWS::CloudFront::Distribution").values()
+        if d["Properties"]["DistributionConfig"].get("DefaultRootObject") == root_object
+    ]
+    assert len(dists) == 1, dists
+    return dists[0]
+
+
 def test_widget_distribution_uses_oac_not_oai():
     template = _template()
-    template.resource_count_is("AWS::CloudFront::Distribution", 1)
-    # OAC is the required mechanism: an OriginAccessControl resource must exist and there
-    # must be NO legacy Origin Access Identity.
-    template.resource_count_is("AWS::CloudFront::OriginAccessControl", 1)
+    # Two distributions: the production widget CDN and the demo site's own (see the demo tests).
+    template.resource_count_is("AWS::CloudFront::Distribution", 2)
+    # OAC is the required mechanism: an OriginAccessControl resource per distribution, and
+    # NO legacy Origin Access Identity anywhere.
+    template.resource_count_is("AWS::CloudFront::OriginAccessControl", 2)
     template.resource_count_is("AWS::CloudFront::CloudFrontOriginAccessIdentity", 0)
 
-    dist = _one(template, "AWS::CloudFront::Distribution")
-    origin = dist["Properties"]["DistributionConfig"]["Origins"][0]
-    # The origin references the OAC and does NOT use an OAI (empty OriginAccessIdentity).
-    assert "OriginAccessControlId" in origin, origin
-    assert origin.get("S3OriginConfig", {}).get("OriginAccessIdentity", "") == ""
+    for dist in template.find_resources("AWS::CloudFront::Distribution").values():
+        origin = dist["Properties"]["DistributionConfig"]["Origins"][0]
+        # The origin references the OAC and does NOT use an OAI (empty OriginAccessIdentity).
+        assert "OriginAccessControlId" in origin, origin
+        assert origin.get("S3OriginConfig", {}).get("OriginAccessIdentity", "") == ""
+
+    # The production widget CDN still serves widget.js from the root.
+    widget_dist = _distribution(template, "widget.js")
+    assert "OriginAccessControlId" in widget_dist["Properties"]["DistributionConfig"]["Origins"][0]
 
 
 def test_widget_bucket_deployment_uploads_the_widget():
     template = _template()
-    # The BucketDeployment renders as a CDK bucket-deployment custom resource.
-    template.resource_count_is("Custom::CDKBucketDeployment", 1)
+    # Two BucketDeployments, each rendering as a CDK bucket-deployment custom resource: the
+    # widget's and the demo site's. They MUST target different buckets - a BucketDeployment
+    # prunes (`aws s3 sync --delete`), so two of them sharing one bucket would delete each
+    # other's objects on deploy.
+    deployments = template.find_resources("Custom::CDKBucketDeployment")
+    assert len(deployments) == 2, list(deployments)
+    destinations = [d["Properties"]["DestinationBucketName"] for d in deployments.values()]
+    assert len(destinations) == len(
+        {json.dumps(d, sort_keys=True) for d in destinations}
+    ), destinations
+    # ...and neither of them was given a key prefix that would leave prune unscoped in a
+    # shared bucket - the separation is by bucket, which cannot be misconfigured away.
+    blob = json.dumps(destinations)
+    assert "WidgetBucket" in blob and "DemoSiteBucket" in blob, blob
 
 
 def test_stack_outputs_ready_to_paste_embed_tag():
@@ -728,6 +781,227 @@ def test_stack_outputs_ready_to_paste_embed_tag():
     assert 'data-api-url="' in literals
     assert "/query" in literals
     assert literals.endswith("defer></script>"), literals
+
+
+# --- Demo site: its own bucket + CDN, deploy-stamped page, noindex ---------------
+
+
+def _demo_deployment(template):
+    """The demo site's BucketDeployment custom resource (not the widget's)."""
+    deps = {
+        lid: r
+        for lid, r in template.find_resources("Custom::CDKBucketDeployment").items()
+        if "DemoSite" in lid
+    }
+    assert len(deps) == 1, list(deps)
+    return next(iter(deps.values()))
+
+
+def _config_without_demo():
+    off = copy.deepcopy(CONFIG)
+    off["demo_site"] = {"enabled": False}
+    return off
+
+
+def _template_from(config):
+    app = core.App(context={"aws:cdk:bundling-stacks": []})
+    stack = GavilanChatbotStack(app, "GavilanChatbotStack", config=config)
+    return assertions.Template.from_stack(stack)
+
+
+def test_demo_site_has_its_own_private_bucket_and_distribution():
+    # The demo gets a SEPARATE bucket and distribution from the widget on purpose: a
+    # BucketDeployment prunes with `aws s3 sync --delete`, so sharing the widget bucket would
+    # put production widget.js one misconfigured prefix away from deletion. Separate buckets
+    # make the interference impossible rather than merely configured against.
+    template = _template()
+    demo = _distribution(template, "index.html")
+    cfg = demo["Properties"]["DistributionConfig"]
+    # Served from a private bucket through OAC, HTTPS-only, like the widget.
+    assert cfg["DefaultCacheBehavior"]["ViewerProtocolPolicy"] == "redirect-to-https", cfg
+    origin = cfg["Origins"][0]
+    assert "OriginAccessControlId" in origin, origin
+    assert "DemoSiteBucket" in json.dumps(origin["DomainName"]), origin
+    # The shareable link is the bare domain, so CloudFront must map / to the page.
+    assert cfg["DefaultRootObject"] == "index.html", cfg
+
+
+def test_demo_page_is_stamped_with_the_deployed_api_and_widget_urls():
+    # The whole point: a hardcoded endpoint would break a fresh install in another account.
+    # Source.data stages the page with substitution markers and resolves them AT DEPLOY, so
+    # every placeholder occurrence must map to a deploy-time GetAtt - never a literal.
+    template = _template()
+    props = _demo_deployment(template)["Properties"]
+    (markers,) = props["SourceMarkers"]
+
+    page = (
+        pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
+    ).read_text(encoding="utf-8")
+    expected = page.count("__API_URL__") + page.count("__WIDGET_SRC__")
+    assert expected >= 2, "the demo page must carry both deploy-time placeholders"
+    assert len(markers) == expected, (len(markers), expected)
+
+    # Each marker resolves to either the HTTP API endpoint or the widget CDN domain.
+    resolved = {json.dumps(v, sort_keys=True) for v in markers.values()}
+    assert len(resolved) == 2, resolved
+    blob = json.dumps(sorted(resolved))
+    assert "ChatbotHttpApi" in blob and "ApiEndpoint" in blob, blob
+    assert "WidgetDistribution" in blob and "DomainName" in blob, blob
+
+    # It lands in the demo bucket, and the deploy invalidates the page so a redeploy is
+    # visible immediately instead of served from the edge cache.
+    assert "DemoSiteBucket" in json.dumps(props["DestinationBucketName"])
+    assert props["DistributionPaths"] == ["/*"], props
+    assert "DemoSiteDistribution" in json.dumps(props["DistributionId"])
+
+
+def test_demo_page_missing_a_placeholder_fails_synth():
+    # A renamed placeholder must break the build, not ship a page whose widget tag points at
+    # the literal string "__API_URL__" and silently never reaches the backend. Pointed at a
+    # real frontend file that carries no placeholders (the offline mock harness).
+    import infra.infra_stack as stack_module
+
+    original = stack_module._DEMO_PAGE_FILE
+    stack_module._DEMO_PAGE_FILE = "demo.html"
+    try:
+        with pytest.raises(ValueError, match=r"deploy-time placeholder"):
+            _template_from(CONFIG)
+    finally:
+        stack_module._DEMO_PAGE_FILE = original
+
+
+def test_demo_site_origin_is_allowlisted_at_deploy_time():
+    # The demo runs the REAL cross-origin embed, so the browser needs its origin on the API's
+    # CORS allowlist or every /query and /warm call from the page is blocked. It must be a
+    # deploy-time GetAtt on the demo distribution, not a hardcoded CloudFront domain.
+    template = _template()
+    (api,) = template.find_resources("AWS::ApiGatewayV2::Api").values()
+    origins = api["Properties"]["CorsConfiguration"]["AllowOrigins"]
+    tokens = [o for o in origins if not isinstance(o, str)]
+    assert len(tokens) == 1, origins
+    parts = tokens[0]["Fn::Join"][1]
+    assert parts[0] == "https://", parts
+    assert parts[1]["Fn::GetAtt"][1] == "DomainName", parts
+    assert "DemoSiteDistribution" in parts[1]["Fn::GetAtt"][0], parts
+    # Still an explicit allowlist, never a wildcard.
+    assert "*" not in origins, origins
+
+
+def test_demo_site_is_marked_as_a_demo_and_noindex():
+    template = _template()
+    # noindex at the edge: a crawler that never parses the HTML still gets the header, and the
+    # header cannot be lost to an edit of the page.
+    policies = template.find_resources("AWS::CloudFront::ResponseHeadersPolicy")
+    assert len(policies) == 1, list(policies)
+    (policy,) = policies.values()
+    headers = policy["Properties"]["ResponseHeadersPolicyConfig"]["CustomHeadersConfig"]["Items"]
+    robots = [h for h in headers if h["Header"] == "X-Robots-Tag"]
+    assert robots and "noindex" in robots[0]["Value"], headers
+    # ...and it is attached to the DEMO distribution only; the production widget CDN keeps
+    # its original behavior with no response-headers policy.
+    demo_behavior = _distribution(template, "index.html")["Properties"]["DistributionConfig"][
+        "DefaultCacheBehavior"
+    ]
+    assert "ResponseHeadersPolicyId" in demo_behavior, demo_behavior
+    widget_behavior = _distribution(template, "widget.js")["Properties"]["DistributionConfig"][
+        "DefaultCacheBehavior"
+    ]
+    assert "ResponseHeadersPolicyId" not in widget_behavior, widget_behavior
+
+    # The page itself says so in the markup and to a human reader.
+    page = (
+        pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
+    ).read_text(encoding="utf-8")
+    assert re.search(r'<meta\s+name="robots"\s+content="[^"]*noindex', page), "missing noindex"
+    assert "demo-banner" in page, "the page must carry a visible demo banner"
+    assert "Demo site" in page, "the banner must label the page as a demo"
+    assert "the Gavilan College Library website" in page, "the banner must disclaim the real site"
+
+
+def test_demo_page_embeds_the_production_widget_rather_than_a_copy():
+    # Requirement: the demo must exercise the SAME widget by the SAME delivery path, or it
+    # will drift from what the library actually embeds. So: exactly one script tag, pointing
+    # at the deploy-stamped CDN URL, and no mock and no inlined widget code anywhere.
+    page = (
+        pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
+    ).read_text(encoding="utf-8")
+    # EXACTLY ONE script with a src: the widget, from the deploy-stamped CDN URL. That is the
+    # invariant - one external dependency, fetched over the production delivery path.
+    external = re.findall(r"<script\b[^>]*\bsrc\s*=[^>]*>", page)
+    assert len(external) == 1, external
+    assert 'src="__WIDGET_SRC__"' in external[0], external
+    assert 'data-api-url="__API_URL__"' in external[0], external
+    # The dev-only offline mock must never be loaded here (demo.html is where that lives).
+    assert not re.search(r'src\s*=\s*"[^"]*mock\.js"', page), "the demo must not load the mock"
+
+    # Inline script is allowed for the page's OWN behavior (the cost panel), but it must not
+    # be a second copy of the widget. The original single-script rule was a proxy for that;
+    # this asserts the thing it was protecting directly, so the demo cannot grow a forked
+    # renderer, a canned-answer table, or its own call to /query.
+    inline = "\n".join(re.findall(r"<script(?![^>]*\bsrc\b)[^>]*>(.*?)</script>", page, re.S))
+    for forbidden in ("mount(", "normalizeResponse", "attachShadow", "trigger error"):
+        assert forbidden not in inline, f"inline script must not reimplement the widget: {forbidden}"
+    # The page must never talk to the backend itself; only the widget does.
+    assert "fetch(" not in inline, "the demo page must not call the API directly"
+    assert "__API_URL__" not in inline, "only the widget tag carries the endpoint"
+
+
+def test_demo_site_can_be_turned_off_in_config():
+    # Turning the knob off must take the whole demo with it - bucket, CDN, page, CORS origin
+    # and output - and leave the production widget path exactly as it was.
+    template = _template_from(_config_without_demo())
+    template.resource_count_is("AWS::S3::Bucket", 3)
+    template.resource_count_is("AWS::CloudFront::Distribution", 1)
+    template.resource_count_is("AWS::CloudFront::OriginAccessControl", 1)
+    template.resource_count_is("Custom::CDKBucketDeployment", 1)
+    template.resource_count_is("AWS::CloudFront::ResponseHeadersPolicy", 0)
+    assert "DemoSiteUrl" not in template.find_outputs("*")
+
+    # The allowlist falls back to exactly what config lists and nothing else: no leftover demo
+    # entry, and no deploy-time token (every element is a plain string, not an Fn::GetAtt).
+    # Asserted against config rather than a copied-out list so adding a real origin does not
+    # fail a test that is about the demo knob.
+    (api,) = template.find_resources("AWS::ApiGatewayV2::Api").values()
+    assert (
+        api["Properties"]["CorsConfiguration"]["AllowOrigins"]
+        == resolve_cors_allow_origins(CONFIG)
+    )
+    # The widget still ships from its own bucket at the same root object.
+    assert _distribution(template, "widget.js")
+
+
+def test_demo_site_does_not_change_widget_delivery():
+    # The main regression risk. Compare the production widget path with the demo enabled and
+    # disabled: the distribution config, the bucket deployment's target/prune/invalidation,
+    # and the paste-ready embed tag must be identical either way.
+    with_demo = _template()
+    without_demo = _template_from(_config_without_demo())
+
+    assert (
+        _distribution(with_demo, "widget.js")["Properties"]["DistributionConfig"]
+        == _distribution(without_demo, "widget.js")["Properties"]["DistributionConfig"]
+    )
+
+    def widget_deployment(template):
+        deps = {
+            lid: r
+            for lid, r in template.find_resources("Custom::CDKBucketDeployment").items()
+            if "DemoSite" not in lid
+        }
+        assert len(deps) == 1, list(deps)
+        return next(iter(deps.values()))["Properties"]
+
+    a, b = widget_deployment(with_demo), widget_deployment(without_demo)
+    for key in ("DestinationBucketName", "DistributionPaths", "Prune", "SourceObjectKeys"):
+        assert a.get(key) == b.get(key), (key, a.get(key), b.get(key))
+    # Still pruning its own bucket, still only widget.js, still invalidated on deploy.
+    assert a["Prune"] is True
+    assert a["DistributionPaths"] == ["/widget.js"]
+    assert "SourceMarkers" not in a, "the widget upload must stay a plain asset copy"
+
+    assert (
+        with_demo.find_outputs("WidgetEmbedTag") == without_demo.find_outputs("WidgetEmbedTag")
+    )
 
 
 # --- Bedrock Guardrails: input screen + output backstop -------------------------
@@ -958,3 +1232,99 @@ def test_query_role_can_read_catalog_object():
         and "CatalogBucket" in json.dumps(s.get("Resource"))
         for s in stmts
     )
+
+
+# --- demo-site cost model (rates + measured usage, stamped from config) ---------------------
+
+
+def _staged_demo_page(tmp_path):
+    """The demo page AS STAGED FOR DEPLOYMENT: synth to a temp cloud assembly and read the
+    index.html that Source.data wrote. This is the only place the substituted content is
+    observable - the CloudFormation template carries markers, not the file body."""
+    app = core.App(
+        outdir=str(tmp_path), context={"aws:cdk:bundling-stacks": []}
+    )
+    GavilanChatbotStack(app, "GavilanChatbotStack", config=CONFIG)
+    app.synth()
+    pages = [p for p in pathlib.Path(tmp_path).rglob("index.html")]
+    assert pages, "no staged demo page found in the cloud assembly"
+    # One demo page; if a second ever appears the assertion below would be ambiguous.
+    assert len(pages) == 1, pages
+    return pages[0].read_text(encoding="utf-8")
+
+
+def test_cost_model_is_stamped_into_the_page_at_synth_not_hardcoded(tmp_path):
+    # The page must never carry rates or measured constants of its own: config.yaml is the
+    # single source of truth, exactly as it is for every other knob. This asserts the JSON
+    # actually lands in the STAGED page and that the raw placeholder is gone.
+    staged = _staged_demo_page(tmp_path)
+    assert "__COST_MODEL__" not in staged, "the cost-model placeholder must be substituted"
+    # Values that can only have come from config.yaml's cost_model block.
+    rates = CONFIG["cost_model"]["rates"]
+    assert '"generation_input_per_1m": %s' % rates["generation_input_per_1m"] in staged
+    assert '"context_tokens_per_call_base"' in staged
+    assert '"sample_questions": %d' % CONFIG["cost_model"]["measured"]["sample_questions"] in staged
+    # The URL placeholders stay as deploy-time markers at this stage (resolved by the
+    # deployment custom resource, not by synth), so they must still be unresolved here.
+    assert "<<marker:" in staged, "URL placeholders must remain deploy-time markers"
+
+
+def test_demo_page_carries_no_hardcoded_rates_or_measured_constants():
+    # The page's own source must contain the placeholder and nothing that looks like a rate.
+    page = (
+        pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
+    ).read_text(encoding="utf-8")
+    assert "__COST_MODEL__" in page, "the page must read its cost model from the placeholder"
+    # The measured constants and rates live in config; none of them may be spelled here.
+    for leaked in ("10666", "generation_input_per_1m: 3", "3.00 / 1M", "$0.15 /"):
+        assert leaked not in page, f"rate/constant leaked into the page: {leaked}"
+
+
+def test_cost_panel_is_hidden_by_default_and_grouped_with_the_demo_banner():
+    # Requirement: the default experience says nothing about money anywhere, and the one
+    # control reads as demo scaffolding rather than something the college would ship.
+    page = (
+        pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
+    ).read_text(encoding="utf-8")
+    # The panel ships hidden.
+    assert re.search(r'<section class="costpanel" id="cost-panel" hidden', page), page[:200]
+    # The toggle lives INSIDE the demo banner, not in the library masthead/nav/footer.
+    banner = page.split('<div class="demo-banner"', 1)[1].split("</div>\n  </div>", 1)[0]
+    assert 'id="cost-toggle"' in banner, "the cost control must sit in the demo banner"
+    # ...and nowhere else.
+    assert page.count('id="cost-toggle"') == 1
+
+    # No cost wording in the library chrome: masthead, nav, search band, cards, footer.
+    library_chrome = page.split("</section>", 1)[1] if "</section>" in page else page
+    for chrome_tag in ("<header class=\"masthead\"", "<nav class=\"nav\"", "<footer>"):
+        assert chrome_tag in page
+    # The words only appear inside the demo banner + cost panel, never in the sample content.
+    main = page.split("<main>", 1)[1].split("</main>", 1)[0]
+    for word in ("cost", "$", "price", "pricing", "billing"):
+        assert word.lower() not in main.lower(), f"library content must not mention {word!r}"
+
+
+def test_demo_embed_opts_into_usage_events_and_production_embed_does_not():
+    # The demo page opts in explicitly; the tag the CDK output hands the library does not,
+    # so a production embed never asks for the debug payload.
+    page = (
+        pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
+    ).read_text(encoding="utf-8")
+    assert 'data-usage-events="true"' in page
+
+    template = _template()
+    embed = template.find_outputs("WidgetEmbedTag")["WidgetEmbedTag"]["Value"]
+    assert "data-usage-events" not in json.dumps(embed), embed
+
+
+def test_cost_model_reaches_the_page_for_a_fresh_install_in_another_account():
+    # The cost model is synth-time config, so unlike the URLs it must NOT become a marker.
+    # Markers still number exactly the URL placeholders; a regression that turned the JSON
+    # into a marker would break deployment substitution.
+    template = _template()
+    props = _demo_deployment(template)["Properties"]
+    (markers,) = props["SourceMarkers"]
+    page = (
+        pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
+    ).read_text(encoding="utf-8")
+    assert len(markers) == page.count("__API_URL__") + page.count("__WIDGET_SRC__")

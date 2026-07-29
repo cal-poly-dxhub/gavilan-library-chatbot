@@ -10,6 +10,7 @@ data source:
   S3 data source (type S3, FIXED_SIZE chunking) + scraper Lambda that fills it
   query-path Lambda (own role) + HTTP API (API Gateway v2), POST /query
   widget hosting: private S3 bucket + CloudFront (OAC) + BucketDeployment(widget.js)
+  demo site: its OWN private bucket + CloudFront (OAC) serving one deploy-stamped page
 
 All changeable knobs come from the repo-root config.yaml
 
@@ -53,9 +54,22 @@ from infra.config import resolve_cors_allow_origins
 # Repo-root app/ directory holding the Lambda handler source (app/handler.py).
 # infra_stack.py is <repo>/infra/infra/infra_stack.py, so parents[2] is the repo root.
 _APP_DIR = Path(__file__).resolve().parents[2] / "app"
-# Repo-root frontend/ directory. Only widget.js is uploaded (mock.js / demo.html are
-# dev-only and must never ship to production).
+# Repo-root frontend/ directory. The widget bucket takes ONLY widget.js (mock.js /
+# demo.html / demo-live.html are dev-only and must never ship). The demo site takes ONLY
+# demo-site.html, into a separate bucket of its own - see the Demo site sections below.
 _FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
+
+# The shipped demo page and the two placeholders the deploy stamps into it. Keeping the
+# names here (rather than inline) makes the synth-time assertion below the single place
+# that couples this stack to the page's markup.
+_DEMO_PAGE_FILE = "demo-site.html"
+_DEMO_API_URL_TOKEN = "__API_URL__"
+_DEMO_WIDGET_SRC_TOKEN = "__WIDGET_SRC__"
+# The demo page's cost meter/estimator reads its rates and measured constants from
+# config.yaml's cost_model block, stamped in here as a JSON literal. Unlike the two URLs
+# above this is a SYNTH-time value (no CDK token), but it goes through the same placeholder
+# mechanism so there is one way the page gets its deploy-time data, not two.
+_DEMO_COST_MODEL_TOKEN = "__COST_MODEL__"
 
 # Repo-root scraper/ directory: the scraper Lambda's source (scraper.py + lambda_function.py)
 # and its requirements.txt (the deps built into the Lambda layer below).
@@ -134,6 +148,11 @@ class GavilanChatbotStack(Stack):
         # BOTH the asset include and the handler env var, so a rename cannot leave the Lambda
         # bundling one file and reading another. Optional; the handler carries the same default.
         library_links_file = config.get("library_links", {}).get("data_file", "library_links.json")
+        # Shareable demo site. On by default so `cdk deploy` always hands back something the
+        # client can open; a launched install can turn it off in config.yaml and the next deploy
+        # removes the bucket, the distribution, and its CORS origin with it. Optional block so a
+        # config predating this feature still synths.
+        demo_site_enabled = bool(config.get("demo_site", {}).get("enabled", True))
 
         kb_name = kb_cfg["name"]
         # S3 Vectors store knobs (replaces the OpenSearch Serverless collection/index).
@@ -676,6 +695,78 @@ class GavilanChatbotStack(Stack):
             description=f"output config-{_config_hash(output_guardrail_def)}",
         )
 
+        # --- Demo site (1/2): its own private bucket + CloudFront ----------------------
+        #
+        # A public, shareable page that shows the widget sitting in a Gavilan-Library-looking
+        # site, so the deployment itself is the demo: one `cdk deploy` produces a link the
+        # client can open with no setup. The page is built here in TWO parts because the API's
+        # CORS allowlist has to name this distribution's domain, so the distribution must exist
+        # before the HTTP API; the page it serves needs the API URL, so its content is uploaded
+        # after both (part 2/2, below the widget hosting section).
+        #
+        # DELIBERATELY ITS OWN BUCKET AND ITS OWN DISTRIBUTION, not a second prefix on the
+        # widget's:
+        #   - BucketDeployment prunes by default (`aws s3 sync --delete`), so two deployments
+        #     into one bucket fight - whichever runs last deletes the other's objects unless
+        #     both are fenced with prefixes/excludes. Separate buckets make that impossible
+        #     rather than merely configured-correctly.
+        #   - Production widget delivery is the thing that must not regress. Nothing here
+        #     touches the widget bucket, its deployment, or its distribution, so the embed URL
+        #     the library pastes on their site is unaffected by anything the demo does.
+        #   - A separate distribution can carry demo-only response headers (noindex) without
+        #     putting them on the production widget.
+        # Cost is one extra CloudFront distribution and one small bucket.
+        demo_bucket = None
+        demo_distribution = None
+        demo_origins: list = []
+        if demo_site_enabled:
+            demo_bucket = s3.Bucket(
+                self,
+                "DemoSiteBucket",
+                block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+                object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
+                encryption=s3.BucketEncryption.S3_MANAGED,
+                enforce_ssl=True,
+                removal_policy=RemovalPolicy.DESTROY,
+                auto_delete_objects=True,
+            )
+
+            # noindex at the EDGE, alongside the page's own <meta name="robots">. A crawler that
+            # never parses the HTML still gets the header, and the header cannot be lost by an
+            # edit to the page. Scoped to this distribution, so the production widget is untouched.
+            demo_headers = cloudfront.ResponseHeadersPolicy(
+                self,
+                "DemoSiteHeadersPolicy",
+                comment="Keeps the Gavilan chatbot demo page out of search indexes.",
+                custom_headers_behavior=cloudfront.ResponseCustomHeadersBehavior(
+                    custom_headers=[
+                        cloudfront.ResponseCustomHeader(
+                            header="X-Robots-Tag", value="noindex, nofollow", override=True
+                        )
+                    ]
+                ),
+            )
+
+            demo_distribution = cloudfront.Distribution(
+                self,
+                "DemoSiteDistribution",
+                comment="Gavilan Library chatbot DEMO site (not the real library site).",
+                # The shareable link is the bare domain; CloudFront maps / to this object.
+                default_root_object="index.html",
+                default_behavior=cloudfront.BehaviorOptions(
+                    origin=origins.S3BucketOrigin.with_origin_access_control(demo_bucket),
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                    cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED,
+                    response_headers_policy=demo_headers,
+                ),
+            )
+            # The browser Origin for this page. The demo runs the REAL embed - a cross-origin
+            # POST from the page to the HTTP API - so it is subject to the same CORS allowlist
+            # as the library's site, and has to be listed like any other real origin. Resolved
+            # at deploy from the distribution (never hardcoded), so a fresh install in another
+            # account allowlists its own demo domain automatically.
+            demo_origins = [f"https://{demo_distribution.distribution_domain_name}"]
+
         # --- Query path: Lambda + HTTP API --------------------------------------------
 
         generation_model_id = generation_cfg["model_id"]
@@ -863,6 +954,12 @@ class GavilanChatbotStack(Stack):
         # stage throttling below remains the real cost cap. It does stop a third-party page
         # from driving this billable endpoint from its visitors' browsers.
         #
+        # The demo site's own CloudFront origin is appended when it is enabled: it runs the real
+        # cross-origin embed, so without it the browser blocks every /query and /warm call from
+        # the demo page. It is a deploy-time token (Fn::GetAtt on the distribution), NOT a
+        # hardcoded domain, and it disappears from the allowlist when demo_site.enabled is false.
+        # This is "add the real origin", not a widening: still an explicit list, still never "*".
+        #
         # Methods cover the real routes: POST (/query), GET (/warm), and OPTIONS (the preflight
         # the gateway answers itself). Only Content-Type is allowed through; AllowCredentials is
         # deliberately left off - we send no cookies or auth headers.
@@ -871,7 +968,7 @@ class GavilanChatbotStack(Stack):
             "ChatbotHttpApi",
             api_name="gavilan-library-chatbot",
             cors_preflight=apigwv2.CorsPreflightOptions(
-                allow_origins=cors_allow_origins,
+                allow_origins=cors_allow_origins + demo_origins,
                 allow_methods=[
                     apigwv2.CorsHttpMethod.GET,
                     apigwv2.CorsHttpMethod.POST,
@@ -970,12 +1067,69 @@ class GavilanChatbotStack(Stack):
             distribution_paths=["/widget.js"],
         )
 
-        # --- Outputs: ready-to-paste embed tag + raw domain / API URL ------------------
+        # --- Shared URLs (outputs + the demo page below) -------------------------------
 
         # http_api.api_endpoint has NO trailing slash; the POST route is /query. The
         # CloudFront domain has no scheme, so widget.js is served at https://<domain>/widget.js.
         widget_src = f"https://{widget_distribution.distribution_domain_name}/widget.js"
         query_url = f"{http_api.api_endpoint}/query"
+
+        # --- Demo site (2/2): the page, stamped with both URLs at deploy time ----------
+
+        # frontend/demo-site.html carries two placeholders; they are replaced with CDK tokens
+        # here, and s3deploy.Source.data resolves those tokens DURING DEPLOYMENT (it stages the
+        # file with substitution markers and the deployment custom resource fills them in). That
+        # is what makes the demo endpoint-discovering rather than hand-stamped: nothing in the
+        # committed HTML names an account, a region, an API id, or a CloudFront domain.
+        #
+        # The page then loads the PRODUCTION widget.js from the PRODUCTION CloudFront domain and
+        # POSTs to the same /query - it is the real embed, not a copy, so it cannot drift from
+        # what the library would paste on their own page.
+        if demo_site_enabled:
+            demo_html = (_FRONTEND_DIR / _DEMO_PAGE_FILE).read_text(encoding="utf-8")
+            missing = [
+                token
+                for token in (
+                    _DEMO_API_URL_TOKEN,
+                    _DEMO_WIDGET_SRC_TOKEN,
+                    _DEMO_COST_MODEL_TOKEN,
+                )
+                if token not in demo_html
+            ]
+            if missing:
+                # Fail the synth rather than ship a demo page whose widget tag points at a
+                # literal "__API_URL__" and silently does nothing.
+                raise ValueError(
+                    f"frontend/{_DEMO_PAGE_FILE} is missing the deploy-time placeholder(s) "
+                    f"{missing}. The stack stamps the API and widget URLs into those exact "
+                    "strings; renaming them here without updating infra_stack.py would deploy "
+                    "a demo page that cannot reach the backend."
+                )
+            # The cost model goes in first: it is a JSON literal that legitimately contains
+            # dollar-sign-free numbers only, but substituting it last would risk a rate value
+            # ever containing one of the other placeholders' text. json.dumps with sorted keys
+            # keeps the stamped page byte-stable across synths, so an unchanged config does not
+            # produce a spurious asset diff.
+            demo_html = demo_html.replace(
+                _DEMO_COST_MODEL_TOKEN,
+                json.dumps(config.get("cost_model", {}), sort_keys=True),
+            )
+            demo_html = demo_html.replace(_DEMO_WIDGET_SRC_TOKEN, widget_src).replace(
+                _DEMO_API_URL_TOKEN, query_url
+            )
+            # Its own bucket, so the default prune (`aws s3 sync --delete`) is scoped to the demo
+            # and can never reach widget.js. distribution_paths invalidates the page (and only
+            # this distribution) so a redeploy is visible immediately instead of edge-cached.
+            s3deploy.BucketDeployment(
+                self,
+                "DemoSiteDeployment",
+                destination_bucket=demo_bucket,
+                sources=[s3deploy.Source.data("index.html", demo_html)],
+                distribution=demo_distribution,
+                distribution_paths=["/*"],
+            )
+
+        # --- Outputs: ready-to-paste embed tag + raw domain / API URL ------------------
         embed_tag = (
             f'<script src="{widget_src}" data-api-url="{query_url}" defer></script>'
         )
@@ -1004,3 +1158,10 @@ class GavilanChatbotStack(Stack):
             value=knowledge_base.attr_knowledge_base_id,
             description="Bedrock Knowledge Base id (for eval/eval_config.yaml).",
         )
+        if demo_site_enabled:
+            CfnOutput(
+                self,
+                "DemoSiteUrl",
+                value=f"https://{demo_distribution.distribution_domain_name}/",
+                description="Shareable demo page: the widget embedded in a sample library site.",
+            )

@@ -71,17 +71,71 @@
   var CURRENT_SCRIPT =
     (typeof document !== "undefined" && document.currentScript) || null;
 
-  /** The configured backend endpoint, or null if `data-api-url` is unset. */
-  function apiUrl() {
+  /** This widget's own <script> tag, or null. */
+  function scriptEl() {
     // The fallback query is scoped to this widget's own script tag (its src ends in
     // widget.js), so it can never bind to another embed's data-api-url tag on the host page.
-    var el =
+    return (
       CURRENT_SCRIPT ||
       (typeof document !== "undefined"
         ? document.querySelector('script[data-api-url][src*="widget.js"]')
-        : null);
+        : null)
+    );
+  }
+
+  /** The configured backend endpoint, or null if `data-api-url` is unset. */
+  function apiUrl() {
+    var el = scriptEl();
     var url = el && el.getAttribute ? el.getAttribute("data-api-url") : null;
     return url && url.trim() ? url.trim() : null;
+  }
+
+  // ---- usage events: opt-in, off by default -------------------------------
+  //
+  // The demo site shows what a conversation cost, which needs the token counts
+  // the backend reports behind its `include_usage` flag. The widget is the only
+  // thing that makes the request, so it has to be the thing that asks - but a
+  // library page must not pay for a payload it never reads, and its responses
+  // must stay exactly { answer, sources }.
+  //
+  // So this is a SECOND opt-in attribute on the same script tag, absent from the
+  // production embed. With it unset (the library's tag, and the tag in the CDK
+  // output), the request body and every response path are byte-identical to what
+  // they were before this existed. With it set, the widget adds the flag and
+  // re-broadcasts what came back as a DOM event. Nothing about rendering changes
+  // either way: the answer is drawn from { answer, sources } exactly as before.
+  var USAGE_ATTR = "data-usage-events";
+  var USAGE_EVENT = "gavilan-widget:usage";
+
+  /** Whether this embed asked for usage events. Any non-"false" value counts. */
+  function usageEventsEnabled() {
+    var el = scriptEl();
+    if (!el || !el.getAttribute) return false;
+    var raw = el.getAttribute(USAGE_ATTR);
+    if (raw === null) return false;
+    return String(raw).trim().toLowerCase() !== "false";
+  }
+
+  /**
+   * Re-broadcast a response's `usage` object as a window CustomEvent so a host
+   * page can meter it. Swallows everything: a page with no listener, an old
+   * browser with no CustomEvent constructor, or a backend that returned no
+   * usage must all be no-ops, never an error in the answer path.
+   */
+  function emitUsage(data) {
+    // Gate on the embed's own opt-in, not just on the payload. A backend that
+    // volunteered a usage block must not make a page that never asked start
+    // emitting events - opting in is the host page's decision, not the server's.
+    if (!usageEventsEnabled()) return;
+    if (!data || typeof data.usage !== "object" || data.usage === null) return;
+    try {
+      if (typeof window === "undefined" || typeof CustomEvent !== "function") return;
+      window.dispatchEvent(
+        new CustomEvent(USAGE_EVENT, { detail: { usage: data.usage } })
+      );
+    } catch (e) {
+      /* ignore: metering is never allowed to break a reply */
+    }
   }
 
   /**
@@ -116,10 +170,17 @@
         controller.abort();
       }, CONFIG.requestTimeoutMs);
     }
+    // Two bodies, written out side by side rather than one object mutated by a
+    // conditional: the production request stays the literal { messages } shape,
+    // visible as such in the source and pinned by the contract test. The flag is
+    // added only for an embed that set data-usage-events.
+    var body = usageEventsEnabled()
+      ? JSON.stringify({ messages: messages, include_usage: true })
+      : JSON.stringify({ messages: messages });
     return fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ messages: messages }),
+      body: body,
       signal: controller ? controller.signal : undefined
     })
       .then(function (res) {
@@ -128,7 +189,12 @@
         }
         return res.json();
       })
-      .then(normalizeResponse)
+      .then(function (data) {
+        // Broadcast before normalizing: normalizeResponse deliberately narrows the
+        // payload to { answer, sources }, so `usage` is gone by the time the UI sees it.
+        emitUsage(data);
+        return normalizeResponse(data);
+      })
       .finally(function () {
         if (timer) clearTimeout(timer);
       });
@@ -1353,6 +1419,9 @@
       renderMarkdown: renderMarkdown,
       trimUrlEnd: trimUrlEnd,
       splitTableRow: splitTableRow,
+      usageEventsEnabled: usageEventsEnabled,
+      USAGE_ATTR: USAGE_ATTR,
+      USAGE_EVENT: USAGE_EVENT,
       CONFIG: CONFIG,
       HOST_ID: HOST_ID
     };

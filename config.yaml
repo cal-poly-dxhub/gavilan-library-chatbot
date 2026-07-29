@@ -159,10 +159,143 @@ http_api:
 #
 # Never set this to "*" - the stack rejects a wildcard at synth. We send no cookies or auth
 # headers, so AllowCredentials stays off and the wildcard-with-credentials rules do not apply.
+# Entries are matched as EXACT, FULL origin strings by API Gateway, so each one is scheme +
+# host (+ port), with no trailing slash and no path. A stray slash does not "mostly work" - it
+# never matches, and the browser blocks every call from that origin.
 cors:
   allow_origins:
     - https://www.gavilan.edu       # production: the library site hosting the widget
     - http://localhost:8000         # DEV ONLY (frontend/demo.html) - safe to delete for final launch
+    # The demo site's custom hostname. The stack already appends the demo distribution's own
+    # *.cloudfront.net origin at deploy time, but that is a DIFFERENT origin string: a browser
+    # on the friendly hostname sends this one, matches nothing, and the chat dies while the
+    # page itself loads fine. Listed here rather than derived because the hostname is a DNS +
+    # certificate decision made outside this stack (the distribution carries no alternate
+    # domain name), so nothing in the template knows it exists.
+    - https://gavbot-demo.calpoly.io
+
+# --- Shareable demo site ---
+#
+# A public page (its own S3 bucket + CloudFront distribution) that embeds the production widget
+# in a Gavilan-Library-looking sample site, so one `cdk deploy` hands back a link the client can
+# open with no setup. The page is frontend/demo-site.html; the stack stamps the deployed API URL
+# and widget CDN URL into it at deploy time, so nothing about it is account- or region-specific.
+#
+# Two things follow from enabling it, both handled by the stack:
+#   - its CloudFront origin is appended to the CORS allowlist above (the demo runs the REAL
+#     cross-origin embed, so the browser needs the origin listed - it is resolved from the
+#     distribution at deploy, never hardcoded)
+#   - the page is served with a noindex meta tag AND an X-Robots-Tag response header
+#
+# Set to false for a launched install that no longer needs a showcase; the next deploy removes
+# the bucket, the distribution, and the extra CORS origin. Removing the widget/production path
+# is NOT affected either way - the demo has its own bucket and CDN.
+demo_site:
+  enabled: true
+
+# --- Cost model (the demo page's session meter + monthly estimator) ---------------------
+#
+# Feeds frontend/demo-site.html, which the stack stamps at deploy time exactly like the API
+# and widget URLs. Nothing here reaches a Lambda, and nothing here reads a bill: it is
+# published list rates multiplied by MEASURED usage. No Cost Explorer call, no account
+# spend, no billing API - the page says "estimate" everywhere for that reason.
+#
+# TWO HALVES, deliberately kept apart:
+#   rates     - published AWS list prices. Change when AWS changes them, and move `as_of`.
+#   measured  - what one real question actually consumed, from eval/measure_usage.py against
+#               the deployed endpoint. Re-run that script and paste its output after any
+#               change that moves token usage (retrieval.number_of_results, chunking,
+#               the system prompt, the link table, generation.max_tokens).
+#
+# WHY MEASURED AND NOT DERIVED. Three things make the obvious estimate wrong, and all three
+# are invisible from the outside:
+#   - one question is not one model call (agentic loop, and each call resends everything);
+#   - the retrieved passages ride in the input tokens and dominate them;
+#   - the guardrails bill per text unit on every turn, not once per question.
+cost_model:
+  # Shown on the page. Rates move; a figure with no date is not checkable.
+  as_of: "2026-07-29"
+  region: us-west-2
+  currency: USD
+
+  # Published AWS list prices for us-west-2, verified 2026-07-29.
+  # Sources: Claude Sonnet 4.6 on Bedrock ($3/$15 per million tokens, aws.amazon.com/bedrock/pricing);
+  # everything else from the AWS Price List API for us-west-2 (Titan Embed V2, the guardrail
+  # policy unit rates) and the S3 / Lambda / API Gateway / CloudFront pricing pages.
+  # NOTE: the Price List API does not publish the newer Bedrock Anthropic models, so the
+  # generation rates come from the pricing page rather than the API. Recheck both on update.
+  rates:
+    generation_input_per_1m: 3.00        # Claude Sonnet 4.6 input
+    generation_output_per_1m: 15.00      # Claude Sonnet 4.6 output
+    embedding_per_1m: 0.02               # Titan Text Embeddings V2
+    guardrail_content_per_1k_units: 0.15 # content filters, per 1,000 text units
+    guardrail_pii_per_1k_units: 0.10     # sensitive-information filters, per 1,000 text units
+    vector_query_per_1m: 2.50            # S3 Vectors queries
+    vector_storage_per_gb_month: 0.06    # S3 Vectors storage
+    vector_put_per_gb: 0.20              # S3 Vectors writes (128 KB minimum per PUT)
+    s3_storage_per_gb_month: 0.0265      # S3 Standard, first 50 TB
+    lambda_per_1m_requests: 0.20
+    lambda_per_gb_second: 0.0000166667
+    api_requests_per_1m: 1.00            # HTTP API (API Gateway v2), first 300M
+    cloudfront_per_1m_requests: 1.00     # HTTPS requests, North America
+    logs_ingest_per_gb: 0.50
+
+  # What ONE question actually consumed, measured live. See eval/measure_usage.py.
+  measured:
+    at: "2026-07-29"
+    # 20 single-turn questions spanning all four tools, plus 5 conversations run 8 turns deep.
+    sample_questions: 60
+    # Converse invocations per question. Above 1 because the loop re-calls the model after a
+    # tool result; first questions need a second call far more often than follow-ups do.
+    model_calls_avg: 1.23
+    # Input tokens for ONE model call: system prompt + link table + history + the retrieved
+    # passages. Measured PER CALL rather than per question so the loop-length effect and the
+    # history-depth effect stay separable - the estimator multiplies them back together.
+    context_tokens_per_call_base: 10666
+    # The depth effect, isolated. Small on purpose: _seed_messages rebuilds history from TEXT
+    # turns only, so a prior turn adds a question and an answer, NOT the passages behind them.
+    # It also stops growing once MAX_HISTORY_MESSAGES trims, around the fifth exchange.
+    context_tokens_per_call_per_prior_turn: 54
+    output_tokens_avg: 230
+    retrievals_avg: 1.08
+    # Content-filter text units per question (input screen + output backstop on each turn).
+    # A unit covers 1,000 characters, so a long answer spends an extra one; hence a measured
+    # average rather than the tidy "1 + model_calls".
+    guardrail_content_units_avg: 2.22
+    # Zero in practice: the PII policy is on the INPUT screen only, and student questions
+    # contain no PII. Kept as a field so a deployment that does see PII can price it.
+    guardrail_pii_units_avg: 0.0
+    # Query Lambda compute per question: measured mean billed duration 6.58s at 256 MB.
+    # Small (well under a tenth of a cent) but it is the one per-question cost that is not
+    # Bedrock, so leaving it out would make the model look tidier than it is.
+    query_lambda_gb_seconds: 1.64
+    # Tokens embedded per retrieval (the priming query is capped at 400 characters).
+    retrieval_query_tokens: 100
+
+  # What exists when nobody is asking anything. Inputs, not answers: the page multiplies
+  # these by the rates above and shows the itemization, so the floor can be checked rather
+  # than trusted. All measured against the deployed stack on 2026-07-29.
+  baseline:
+    # S3 Standard across all four buckets (KB source, catalog, widget, demo page).
+    s3_stored_bytes: 135177
+    # S3 Vectors: 24 vectors in the live index; 1024 float32 dims plus the chunk text and
+    # Bedrock's metadata keys.
+    vector_count: 24
+    vector_bytes_each: 7000
+    # Tokens embedded by ONE full re-ingestion: the 18 indexed documents (~7,500 tokens)
+    # plus the 20% chunk overlap.
+    ingest_embedded_tokens: 9000
+    # Scraper Lambda: 512 MB, measured billed durations of 25s and 67s.
+    scraper_seconds_per_run: 46
+    scraper_memory_gb: 0.5
+    # Weekly EventBridge schedule.
+    scrapes_per_month: 4.33
+    # Every `cdk deploy` re-runs the scraper and re-ingests the corpus, so deploy frequency
+    # is a real (if small) driver of the floor. Assumption, not a measurement - it is the one
+    # number here nobody can measure for you. Shown as a line item on the page.
+    deploys_per_month: 4
+    # CloudWatch Logs across the stack's log groups, at rest.
+    log_gb_per_month: 0.02
 
 request:
   # Max characters accepted for a user query. Over this, the handler returns HTTP 400 BEFORE

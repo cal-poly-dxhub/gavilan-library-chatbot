@@ -175,6 +175,135 @@ test("source sends the request shape the handler reads: JSON body { messages }",
   assert.ok(/method:\s*"POST"/.test(SOURCE), "must POST");
 });
 
+// --- usage events: opt-in, and invisible to the production embed --------
+//
+// The demo site meters what a conversation costs, which needs the backend's opt-in
+// `include_usage` payload. The widget is what makes the request, so it has to ask -
+// and these tests are the guarantee that asking is strictly opt-in: with the attribute
+// absent (the library's embed, and the tag the CDK output prints) the request body and
+// the rendered result are exactly what they were before the feature existed.
+
+// Like withNetwork, but lets a test control what each script-tag attribute returns, so
+// the presence of data-usage-events can actually be varied. `attrs` maps attribute name
+// to value; anything unlisted reads as absent (null), which is the production case.
+function withNetworkAttrs(fetchImpl, attrs) {
+  var priorDoc = global.document;
+  var priorFetch = global.fetch;
+  var priorWindow = global.window;
+  var priorCustomEvent = global.CustomEvent;
+  var priorErr = console.error;
+  var seen = [];
+  global.document = {
+    querySelector: function () {
+      return {
+        getAttribute: function (name) {
+          return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null;
+        }
+      };
+    }
+  };
+  global.fetch = fetchImpl;
+  global.CustomEvent = function (type, init) {
+    this.type = type;
+    this.detail = init && init.detail;
+  };
+  global.window = {
+    dispatchEvent: function (ev) { seen.push(ev); return true; }
+  };
+  console.error = function () {};
+  return {
+    events: seen,
+    restore: function () {
+      global.document = priorDoc;
+      global.fetch = priorFetch;
+      global.window = priorWindow;
+      global.CustomEvent = priorCustomEvent;
+      console.error = priorErr;
+    }
+  };
+}
+
+// NOTE the name: there is a second, simpler okJson() further down this file, and a plain
+// `function okJson` here would be hoisted over by it (last declaration wins), silently
+// dropping the capture argument and leaving every assertion below reading an empty array.
+function okJsonCapturing(payload, capture) {
+  return function (url, opts) {
+    if (capture) capture.push(JSON.parse(opts.body));
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve(payload); } });
+  };
+}
+
+test("usage events are off unless the embed opts in", () => {
+  // No document at all (the plain-Node case) must not throw and must read as off.
+  assert.strictEqual(widget.usageEventsEnabled(), false);
+  assert.strictEqual(widget.USAGE_ATTR, "data-usage-events");
+});
+
+test("the production embed sends no include_usage flag and emits no event", async () => {
+  var bodies = [];
+  var h = withNetworkAttrs(
+    okJsonCapturing({ answer: "hi", sources: [], usage: { model_calls: 2 } }, bodies),
+    { "data-api-url": "https://api.test/query" } // no data-usage-events
+  );
+  try {
+    var res = await widget.sendQuery([{ role: "user", content: "hours?" }]);
+    assert.deepStrictEqual(bodies, [{ messages: [{ role: "user", content: "hours?" }] }]);
+    assert.ok(!("include_usage" in bodies[0]), "production body must not carry the flag");
+    assert.strictEqual(h.events.length, 0, "production embed must emit no usage event");
+    // Even when the backend volunteers usage, the rendered contract is unchanged.
+    assert.deepStrictEqual(res, { answer: "hi", sources: [] });
+  } finally {
+    h.restore();
+  }
+});
+
+test("an embed with data-usage-events sends the flag and re-broadcasts usage", async () => {
+  var bodies = [];
+  var usage = { model_calls: 3, input_tokens: 41000, output_tokens: 260 };
+  var h = withNetworkAttrs(
+    okJsonCapturing({ answer: "hi", sources: [], usage: usage }, bodies),
+    { "data-api-url": "https://api.test/query", "data-usage-events": "true" }
+  );
+  try {
+    var res = await widget.sendQuery([{ role: "user", content: "hours?" }]);
+    assert.strictEqual(bodies[0].include_usage, true, "opted-in body must carry the flag");
+    assert.strictEqual(h.events.length, 1, "one usage event per answer");
+    assert.strictEqual(h.events[0].type, widget.USAGE_EVENT);
+    assert.deepStrictEqual(h.events[0].detail.usage, usage);
+    // Opting in must not change what the UI renders.
+    assert.deepStrictEqual(res, { answer: "hi", sources: [] });
+  } finally {
+    h.restore();
+  }
+});
+
+test("a response with no usage block emits nothing rather than an empty event", async () => {
+  var h = withNetworkAttrs(
+    okJsonCapturing({ answer: "hi", sources: [] }),
+    { "data-api-url": "https://api.test/query", "data-usage-events": "true" }
+  );
+  try {
+    await widget.sendQuery([{ role: "user", content: "hours?" }]);
+    assert.strictEqual(h.events.length, 0, "no usage in the payload means no event");
+  } finally {
+    h.restore();
+  }
+});
+
+test("data-usage-events=\"false\" reads as off", async () => {
+  var bodies = [];
+  var h = withNetworkAttrs(
+    okJsonCapturing({ answer: "hi", sources: [] }, bodies),
+    { "data-api-url": "https://api.test/query", "data-usage-events": "false" }
+  );
+  try {
+    await widget.sendQuery([{ role: "user", content: "hours?" }]);
+    assert.ok(!("include_usage" in bodies[0]), "explicit false must not opt in");
+  } finally {
+    h.restore();
+  }
+});
+
 test("source builds the messages array from the in-memory transcript (role + content)", () => {
   // The transcript is mapped to { role, content } turns and the whole thing is sent on each
   // send - that IS the single-session memory (no storage).
