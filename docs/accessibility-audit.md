@@ -5,7 +5,9 @@ shareable demo page (`frontend/demo-site.html`).
 **Standard:** WCAG 2.1 Level AA, which is what Section 508 incorporates by reference (36 CFR 1194.1,
 E205.4). Level A and AA criteria are in scope; AAA items are marked as such and are advisory only.
 **Audited:** 2026-07-29, against commit `6c07630` on `fix/accessibility`.
-**Status:** audit only. No code, config, infra, or test was changed by this document.
+**Status:** audited, then remediated in the same branch - see
+[Remediation](#remediation) for what was fixed, what was deferred, and the re-measured numbers.
+The findings below are left exactly as first written, as the dated record of what was found.
 **Result:** 22 findings - 18 in the widget, 4 in the demo page. No blockers: 4 serious, 7 moderate,
 11 minor. All text contrast already passes; the real gaps are screen-reader semantics and focus
 containment.
@@ -49,6 +51,100 @@ Ordered so each fix is independent and the cheapest high-value work comes first.
 Next two, if there is appetite: [F3](#f3) (the greeting and the four starter questions are never
 presented to a screen-reader user when the panel opens) and [F7](#f7) (the error bubble's red styling
 has never applied - a CSS specificity bug, verified in the browser).
+
+---
+
+<a id="remediation"></a>
+## Remediation
+
+**Done:** 2026-07-29, on `fix/accessibility`, in `frontend/widget.js` only. No dependency, no build
+step, no change to the system prompt, no infra or handler change, nothing deployed.
+**Re-measured the same way this audit was:** Chrome 150 headless over the DevTools Protocol, key
+presses through `Input.dispatchKeyEvent`, colours read with `getComputedStyle` and ratios computed
+with the WCAG relative-luminance formula. **Still no screen reader was run** - every claim below is a
+DOM or accessibility-tree fact, and the announcement itself remains unverified.
+
+**14 of 18 widget findings fixed. 4 deferred, plus all 4 demo-page findings** (this pass was scoped
+to the widget). All five failing success criteria are addressed.
+
+| # | SC | Status | Re-measured result |
+|---|---|---|---|
+| [F1](#f1) | 1.3.1 | **fixed** | An `.sr-only` speaker label is the FIRST child of every turn. Chrome's tree now carries non-ignored `StaticText "You said:"` / `StaticText "Library assistant said:"` for every message across a 5-turn conversation (was: `role: null, ariaLabel: null` on all seven). Label geometry verified `position: absolute; 1px; 1px; clip: rect(0,0,0,0)`; the bubble's own text is unchanged. |
+| [F2](#f2) | 4.1.3 | **fixed** | `role="status"` moved from the dots row to the typing BUBBLE, its `aria-label` dropped and the message put in the content: `textContent` is now 19 chars, was `""`. The dots stay `aria-hidden`. The slow-response note is CREATED and appended into that same region when the timer fires (`hintIsInsideTheStatusNode: false -> true`, `hidden: false`), so it is an insertion and a text change inside a live region rather than an un-hiding outside one. AX: `role=status live=polite atomic=true`. |
+| [F3](#f3) | 2.4.3 | **fixed** | The composer carries `aria-describedby` -> the greeting bubble's id on first launch (verified it resolves, both ends inside the shadow root), and it is dropped with the starter chips on the first message (`null`), so later turns are not prefixed by a stale description. Focus still lands in the composer, which is what a keyboard user wants. |
+| [F4](#f4) | 2.4.3 | **fixed** | `aria-modal="true"` + Tab/Shift+Tab wrapping in the panel's existing handler. Measured: **0 of 14 consecutive Tab stops and 0 of 8 Shift+Tab stops left the widget** (was: 5 consecutive stops outside, with the panel open). Edges are recomputed per keypress, so a collapsed sources list's hidden links are skipped and a disabled Send moves the last edge. **Escape now closes the panel from a host-page control** and returns focus to the launcher (was: nothing happened). Escape from inside still `stopPropagation()`s - a host-page bubble-phase Escape listener fired 0 times. |
+| [F5](#f5) | 1.4.11 | **fixed** | Two-tone ring, not a flat colour: `outline: 3px solid #1a1d21; outline-offset: 2px` plus `box-shadow: 0 0 0 2px #ffffff` filling the offset gap. Per-background numbers below. |
+| [F6](#f6) | 1.4.11 | **partly fixed** | The three that matter now clear 3:1 with one token, `--line: #7d8894`: typing dots **3.25:1** on the bot bubble (was 2.27:1), composer border **3.61:1** on white (was 1.57:1), suggestion chip border **3.48:1** on the thread and 3.61:1 on its own fill (was 1.31:1). The four decorative rules (table cell borders, sources rule, panel border) are deliberately unchanged - see the deferred list. |
+| [F7](#f7) | none | **fixed** | Selector deepened to `.msg--bot .bubble.bubble--error` (0,2,1 beats 0,2,0). It now renders `#fdecea` / `#8a1c12` at **8.14:1**, and `identicalToNormalBubble` is `false` where it used to be byte-identical. |
+| [F8](#f8) | 3.1.2 | **partly fixed** | `root.lang = "en"`, so the widget's own chrome declares its language instead of inheriting the host page's (1 `lang` attribute inside the shadow root, was 0). The ANSWERS are still unmarked - that needs a language field on the `/query` response, which is a contract change and belongs to the Spanish work. |
+| [F9](#f9) | 1.3.1 | **fixed** | Markdown headings emit real `h3`-`h6` (`#` -> h3, offset by two because the host page owns h1/h2, clamped at h6). Verified `## Fall hours` -> `H4`, and `.md-heading` now pins `font-size: 1em` so a real h5/h6 does not render smaller than body text: measured 15px / weight 700, identical to the old `<p>`. |
+| [F10](#f10) | 1.3.1 | **fixed** | `scope="col"` on header cells: `["col","col"]` where it was `[null,null]`. Data cells get none. |
+| [F11](#f11) | none | deferred | See below. |
+| [F12](#f12) | none | deferred | See below. |
+| [F13](#f13) | none | **fixed** | `aria-haspopup="dialog"` on the launcher; AX reports `hasPopup="dialog"`. |
+| [F14](#f14) | 2.5.3 | **fixed** | The `aria-label` is gone, so the accessible name is the button's own text: Chrome computes `button "Ask the Library"` from contents, which contains the visible label exactly. "Open the library chat" no longer exists in the file - one fewer string for the Spanish pass, and what it hinted at is carried by [F13](#f13)'s attribute instead. |
+| [F15](#f15) | none | deferred | See below. |
+| [F16](#f16) | 2.4.3 | **fixed** | A failed send focuses the retry button instead of the composer, verified through a fully keyboard-driven send: focus lands on `button.retry "Try again"`. |
+| [F17](#f17) | none | **fixed** | `.retry:focus-visible` added with the same two-tone treatment; measured `:focus-visible` matching, `2px solid #1a1d21` at offset 2px + white halo, **14.79:1** against the error bubble. No longer dependent on the browser's default. |
+| [F18](#f18) | none | deferred | See below. |
+| [D1](#d1)-[D4](#d4) | mixed | deferred | Demo page; this pass was scoped to the widget. |
+
+### F5, the focus ring: the four backgrounds, measured
+
+The audit's own candidate table showed no single flat colour clears 3:1 against all four surfaces the
+ring can land on, so the fix is a two-tone ring: a dark outline with a light halo filling the
+`outline-offset` gap. Whichever surface it lands on, one of the two halves carries the contrast, and
+the two contrast with **each other** at 16.91:1 - which is what makes it robust on a host page whose
+background the widget cannot know, including a dark one.
+
+| Background | Dark outline `#1a1d21` | Light halo `#ffffff` | Ring vs background | Verdict |
+|---|---|---|---|---|
+| White host page `#ffffff` | **16.91:1** | 1:1 | **16.91:1** | pass |
+| Demo page `#f6f4f2` | **15.42:1** | 1.1:1 | **15.42:1** | pass |
+| Widget thread `#fafbfc` | **16.32:1** | 1.04:1 | **16.32:1** | pass |
+| Maroon launcher/Send fill `#8a1c30` | 1.84:1 | **9.17:1** | **9.17:1** | pass |
+
+Read the maroon row the way 1.4.11 intends: the fill is the colour ADJACENT to the ring on the
+inside, and there the halo is the half doing the work; on the outside it is always the dark outline.
+Confirmed in rendered pixels rather than only from CSS values - a scan across the focused launcher's
+left edge reads
+`#f4f4f4 | #1f2226 #1a1d21 #1a1d21 | #f8f9f9 #ffffff | #90293c #8a1c30`, i.e. page, then the 3px dark
+outline, then the 2px white halo, then the maroon fill (the odd values at each boundary are
+antialiasing on the pill's curve). The same scan on a `#f6f4f2` page is identical apart from the page
+pixels.
+
+Applied to all five controls whose rings were failing or unstyled: launcher, Send, the composer text
+box, the suggestion chips, and retry. Rings that already passed are untouched - Close and Expand keep
+their white ring on the maroon header (9.17:1), and the sources toggle, source links and answer links
+keep the brand ring on the bot bubble (8.25:1).
+
+**Brand look:** the composer keeps its brand-tinted `border-color` on focus (3.09:1, already passing),
+which is what still makes a focused field read as this widget. The ring itself is now ink rather than
+a brand tint, because a tint of `#8a1c30` cannot reach 3:1 against a light page at any opacity that
+still looks like a tint.
+
+### Deliberately not fixed
+
+- **[F6](#f6), the four decorative boundaries** (`.md-table` cell borders and `.sources` top rule at 1.16:1, `.panel` border at 1.35:1). 1.4.11 does not apply to purely decorative boundaries; the panel additionally has a strong drop shadow doing the separating work, and darkening table gridlines to 3:1 would make a hours table read as a spreadsheet. The audit's own recommendation was to leave them.
+- **[F6](#f6) caveat, honestly stated:** the typing dots pass at **3.25:1 at full opacity**, but the blink animation dips them to 30% opacity, where no dot colour can reach 3:1 against the bubble (the arithmetic ceiling at that opacity is about 2.2:1). The keyframes were left alone rather than flattened, because reduced-motion users see the static full-opacity colour and the pending state is now also carried as TEXT ([F2](#f2)), which is the more reliable channel.
+- **[F11](#f11), `aria-controls` on the sources disclosure.** No criterion fails - 4.1.2 is satisfied by `aria-expanded` alone, and `aria-controls` is an APG recommendation with inconsistent screen-reader support. It needs a unique id minted per message plus id plumbing on both ends, which is more machinery than a non-failing recommendation earns while a second branch is concurrently rewriting this file.
+- **[F12](#f12), feedback at the 1000-character cap.** No criterion clearly fails. A counter is a new visible UI element and a copy decision (when it appears, whether it goes assertive), which is a product call rather than a conformance fix.
+- **[F15](#f15), a persistent visible label on the composer.** The audit's own position was that it would not necessarily change this: the accessible name is solid, so 4.1.2 passes, and for a chat box next to a Send button the purpose stays obvious. Adding a visible label changes the design; leaving it is a stated position, not an oversight.
+- **[F18](#f18), `px` -> `rem`/`em`.** 1.4.4 passes as measured, so this is a preference-honouring improvement, not a fix. It also does not stop at CSS: `autosize()` hardcodes the same 120px ceiling as `max-height`, so converting the CSS alone would desynchronise the textarea's growth from its clamp.
+- **[D1](#d1)-[D4](#d4), the demo page.** Out of scope for this pass, which was widget-only. D1 (two `<h2>`s before the `<h1>`) is the one with a real Level A/AA mapping and is the one to do next; D2 is arguably N/A on a single-page demo, D3 is minor, D4 is Level AAA.
+
+### Test coverage
+
+`frontend/test/widget.contract.test.js` grew from 65 to 80 tests, one per behaviour changed above,
+including the WCAG arithmetic recomputed from the colour values actually in the file - so a later
+"just lighten it a bit" edit fails in CI rather than in someone else's audit.
+
+**One existing test was deliberately changed:** the test that pinned the composer's softened
+brand-tinted focus outline (`widget.contract.test.js:1136` at the time of the audit, flagged under
+[F5](#f5)). That outline was the 2.09:1 failure, so the test asserting it had to go; it is replaced by
+one asserting the two-tone treatment across all five controls, that the failing `#9ec5ff` is gone from
+the file, that the launcher keeps its drop shadow while focused, and that the composer keeps its
+brand-tinted border. No other test was modified, weakened, or deleted.
 
 ---
 
@@ -808,11 +904,21 @@ inline, so every number above can be re-derived from `widget.js` and `demo-site.
 
 ## Conformance summary
 
+**As audited** (commit `6c07630`):
+
 | | Level A | Level AA |
 |---|---|---|
 | **Failed** | 1.3.1, 2.4.3, 2.5.3 | 1.4.11, 4.1.3 |
 | **Passed (verified)** | 1.4.1, 2.1.1, 2.1.2, 3.1.1, 3.3.1, 3.3.2, 4.1.2 | 1.4.3, 1.4.4, 1.4.10, 2.4.6 (widget), 2.4.7, 3.1.2 (English only) |
 | **Not assessed** | criteria needing a screen reader, real AT, or media (none of the widget's content is time-based) | as left |
+
+**After [remediation](#remediation)** (widget only; the demo page's D1 is unchanged):
+
+| | Level A | Level AA |
+|---|---|---|
+| **Failed** | none in the widget; 1.3.1 + 2.4.6 still failed on the demo page ([D1](#d1)) | none in the widget |
+| **Addressed, re-measured** | 1.3.1, 2.4.3, 2.5.3 | 1.4.11, 4.1.3 |
+| **Still not assessed** | anything that depends on what a screen reader SAYS - [F1](#f1), [F2](#f2) and [F3](#f3) fixed the structural preconditions and were re-measured in the accessibility tree, but no NVDA/JAWS/VoiceOver run has happened. That is the one check standing between this and a written conformance claim. | as left |
 
 Five distinct success criteria are failed, none of them by a blocker, and the top five fixes above
 clear four of the five (1.3.1, 2.4.3, 2.5.3, and 1.4.11 partially; 4.1.3 is fix #2). All five fixes are
@@ -827,3 +933,13 @@ the foundation is sound and there is no accessibility blocker to deployment. Fiv
 the largest being that screen-reader users cannot currently tell who said what in the conversation.
 All of it is a day or two of work in a single file. The honest gap in this audit is that no screen
 reader was run, and that should be scheduled before any conformance claim is made in writing.
+
+**What to tell the client now that the work is done.** All five criteria have been fixed in the widget
+and re-measured in a browser: the conversation now says who spoke, the panel keeps keyboard focus and
+closes on Escape from anywhere, the focus indicator clears the 3:1 requirement on every background it
+can land on, the pending state carries text instead of only animated dots, and the launcher can be
+activated by the words printed on it. The demo page has one remaining heading-order issue, which is
+demo scaffolding rather than anything the library embeds. One caveat is unchanged and should be said
+plainly: **no screen reader has been run.** Everything above is verified in the DOM and in Chrome's
+accessibility tree, which is where these defects live, but a session with NVDA or VoiceOver is still
+the thing to do before putting a conformance statement in writing.
