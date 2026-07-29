@@ -159,10 +159,20 @@ http_api:
 #
 # Never set this to "*" - the stack rejects a wildcard at synth. We send no cookies or auth
 # headers, so AllowCredentials stays off and the wildcard-with-credentials rules do not apply.
+# Entries are matched as EXACT, FULL origin strings by API Gateway, so each one is scheme +
+# host (+ port), with no trailing slash and no path. A stray slash does not "mostly work" - it
+# never matches, and the browser blocks every call from that origin.
 cors:
   allow_origins:
     - https://www.gavilan.edu       # production: the library site hosting the widget
     - http://localhost:8000         # DEV ONLY (frontend/demo.html) - safe to delete for final launch
+    # The demo site's custom hostname. The stack already appends the demo distribution's own
+    # *.cloudfront.net origin at deploy time, but that is a DIFFERENT origin string: a browser
+    # on the friendly hostname sends this one, matches nothing, and the chat dies while the
+    # page itself loads fine. Listed here rather than derived because the hostname is a DNS +
+    # certificate decision made outside this stack (the distribution carries no alternate
+    # domain name), so nothing in the template knows it exists.
+    - https://gavbot-demo.calpoly.io
 
 # --- Shareable demo site ---
 #

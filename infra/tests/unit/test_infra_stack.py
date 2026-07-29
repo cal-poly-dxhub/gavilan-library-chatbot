@@ -2,6 +2,7 @@ import copy
 import json
 import pathlib
 import re
+from urllib.parse import urlparse
 
 import aws_cdk as core
 import aws_cdk.assertions as assertions
@@ -262,23 +263,42 @@ def test_generation_inference_and_query_limit_wired_to_lambda_env():
 
 
 def test_cors_allow_origins_locked_to_config_and_never_wildcard():
-    # Pre-launch hardening: the browser origin allowlist is the production library site plus a
-    # dev-only localhost entry, driven from config.yaml. A wildcard here would let any page on
-    # the internet drive this billable endpoint (Bedrock + Primo) from its visitors' browsers.
-    assert resolve_cors_allow_origins(CONFIG) == [
-        "https://www.gavilan.edu",
-        "http://localhost:8000",
-    ]
-    assert "*" not in resolve_cors_allow_origins(CONFIG)
+    # Pre-launch hardening: the browser origin allowlist is driven from config.yaml, and a
+    # wildcard would let any page on the internet drive this billable endpoint (Bedrock +
+    # Primo) from its visitors' browsers.
+    #
+    # These assert the INVARIANTS rather than a snapshot of today's list. A literal copy of the
+    # list only pins the entries that happen to be in config.yaml at the moment it was written,
+    # so it fails on every legitimate addition while catching none of the ways the allowlist
+    # actually breaks. What follows pins those ways instead, and keeps working at any length.
+    config_origins = resolve_cors_allow_origins(CONFIG)
+    assert "*" not in config_origins
 
-    # ...and that resolved list is what actually reaches the synthesized API. With the demo site
-    # enabled the list is the config origins PLUS the demo distribution's own origin, which is a
-    # deploy-time GetAtt (a dict), not a literal - see test_demo_site_origin_is_allowlisted.
+    # 1. The production library site is load-bearing: the widget is embedded on
+    #    https://www.gavilan.edu/library/, and losing this entry takes the real product down.
+    #    (Host-only Origin - the path is irrelevant to CORS - so no /library/ here.)
+    assert "https://www.gavilan.edu" in config_origins, config_origins
+
+    # 2. Every entry is a bare origin: scheme + host + optional port, with no trailing slash,
+    #    no path, no query and no fragment. API Gateway matches the FULL origin string exactly,
+    #    so a stray slash does not "mostly work" - it silently matches nothing, and the failure
+    #    looks like a backend outage from the browser rather than a typo in config.
+    for origin in config_origins:
+        parsed = urlparse(origin)
+        assert parsed.scheme in ("http", "https"), origin
+        assert parsed.netloc, origin
+        assert (parsed.path, parsed.query, parsed.fragment) == ("", "", ""), origin
+        assert origin == f"{parsed.scheme}://{parsed.netloc}", origin
+
+    # 3. That resolved list is what actually reaches the synthesized API - the stack passes
+    #    config through rather than hardcoding, dropping or reordering any of it. With the demo
+    #    site enabled the template also carries the demo distribution's own origin, which is a
+    #    deploy-time GetAtt (a dict), not a literal - see test_demo_site_origin_is_allowlisted.
     template = _template()
     api = _one(template, "AWS::ApiGatewayV2::Api")
     cors = api["Properties"]["CorsConfiguration"]
     literal_origins = [o for o in cors["AllowOrigins"] if isinstance(o, str)]
-    assert literal_origins == ["https://www.gavilan.edu", "http://localhost:8000"], cors
+    assert literal_origins == config_origins, cors
     assert "*" not in cors["AllowOrigins"], cors
     # Methods must cover the real routes (POST /query, GET /warm) plus the OPTIONS preflight
     # the gateway answers itself; only Content-Type is allowed through.
@@ -937,11 +957,15 @@ def test_demo_site_can_be_turned_off_in_config():
     template.resource_count_is("AWS::CloudFront::ResponseHeadersPolicy", 0)
     assert "DemoSiteUrl" not in template.find_outputs("*")
 
+    # The allowlist falls back to exactly what config lists and nothing else: no leftover demo
+    # entry, and no deploy-time token (every element is a plain string, not an Fn::GetAtt).
+    # Asserted against config rather than a copied-out list so adding a real origin does not
+    # fail a test that is about the demo knob.
     (api,) = template.find_resources("AWS::ApiGatewayV2::Api").values()
-    assert api["Properties"]["CorsConfiguration"]["AllowOrigins"] == [
-        "https://www.gavilan.edu",
-        "http://localhost:8000",
-    ]
+    assert (
+        api["Properties"]["CorsConfiguration"]["AllowOrigins"]
+        == resolve_cors_allow_origins(CONFIG)
+    )
     # The widget still ships from its own bucket at the same root object.
     assert _distribution(template, "widget.js")
 
