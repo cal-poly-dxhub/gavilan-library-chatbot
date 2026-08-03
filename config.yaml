@@ -308,7 +308,7 @@ feedback:
 # are invisible from the outside:
 #   - one question is not one model call (agentic loop, and each call resends everything);
 #   - the retrieved passages ride in the input tokens and dominate them;
-#   - the guardrails bill per text unit on every turn, not once per question.
+#   - the guardrail bills per 1,000-character text unit, not per question.
 cost_model:
   # Shown on the page. Rates move; a figure with no date is not checkable.
   as_of: "2026-07-29"
@@ -326,7 +326,8 @@ cost_model:
     generation_output_per_1m: 15.00      # Claude Sonnet 4.6 output
     embedding_per_1m: 0.02               # Titan Text Embeddings V2
     guardrail_content_per_1k_units: 0.15 # content filters, per 1,000 text units
-    guardrail_pii_per_1k_units: 0.10     # sensitive-information filters, per 1,000 text units
+    # NO sensitive-information (PII) rate: the PII policy was removed with the rest of the
+    # guardrail scope-down, so there is no line for it to price.
     vector_query_per_1m: 2.50            # S3 Vectors queries
     vector_storage_per_gb_month: 0.06    # S3 Vectors storage
     vector_put_per_gb: 0.20              # S3 Vectors writes (128 KB minimum per PUT)
@@ -355,13 +356,14 @@ cost_model:
     context_tokens_per_call_per_prior_turn: 54
     output_tokens_avg: 230
     retrievals_avg: 1.08
-    # Content-filter text units per question (input screen + output backstop on each turn).
-    # A unit covers 1,000 characters, so a long answer spends an extra one; hence a measured
-    # average rather than the tidy "1 + model_calls".
-    guardrail_content_units_avg: 2.22
-    # Zero in practice: the PII policy is on the INPUT screen only, and student questions
-    # contain no PII. Kept as a field so a deployment that does see PII can price it.
-    guardrail_pii_units_avg: 0.0
+    # Content-filter text units per question. NOT re-measured since the guardrail scope-down -
+    # the old 2.22 measured a shape that no longer exists (an input screen PLUS an output
+    # backstop billing on every Converse turn). With only the input screen left there is
+    # exactly ONE ApplyGuardrail call per question, over the student's question alone, and a
+    # text unit covers 1,000 characters - so 1.0 for anything under that, and the server-side
+    # cap (request.max_query_chars) makes 2 the ceiling. Re-run eval/measure_usage.py to
+    # replace this with a measured figure.
+    guardrail_content_units_avg: 1.0
     # Query Lambda compute per question: measured mean billed duration 6.58s at 256 MB.
     # Small (well under a tenth of a cent) but it is the one per-question cost that is not
     # Bedrock, so leaving it out would make the model look tidier than it is.
@@ -510,77 +512,55 @@ primo:
 
 # --- Bedrock Guardrails ---
 #
-# TWO guardrails are built from this config:
+# ONE guardrail, screening ONE category: PROMPT_ATTACK, on the INPUT side only.
 #
-#   INPUT screen  - run via the standalone ApplyGuardrail API (source=INPUT) on the BARE
-#                   user query, BEFORE retrieval. Content filters + PROMPT_ATTACK BLOCK the
-#                   request; PII is ANONYMIZE (mask) so the query is masked-and-proceeds
-#                   silently rather than blocked. Blocked queries never reach retrieval or
-#                   generation (no Bedrock spend on abuse).
-#   OUTPUT backstop - attached to the Converse call. Screens the generated ANSWER only:
-#                   content filters on the output side (input strengths forced to NONE so
-#                   the retrieved <context> is never screened), and NO PII policy at all
-#                   (retrieved library info is public; masking the answer would re-break
-#                   contact/hours/location answers).
+# It runs via the standalone ApplyGuardrail API (source=INPUT) on the BARE user query,
+# BEFORE the Converse loop. A block returns blocked_input_messaging and never reaches
+# retrieval or generation, so an injection attempt costs one guardrail call and no
+# generation spend.
+#
+# WHY NOTHING ELSE IS SCREENED. The input screen runs AHEAD of the system prompt, so
+# anything it decides pre-empts the prompt's <priority_responses> crisis handling. A
+# content filter blocking a message about self-harm answers a student in trouble with
+# canned decline copy instead of the hand-written referral; PII anonymization silently
+# rewrites their message before the model reads it, so a name and a street arrive as
+# {NAME} and {ADDRESS}. The system prompt owns safety instead: it sees the whole
+# question, it can tell a request for a book about suicide prevention from a person in
+# crisis, and unlike a filter it can RESPOND rather than only refuse.
+#
+# PROMPT_ATTACK is the exception because it is the one thing the prompt cannot own - it
+# is an attack ON the prompt - it is input-only by definition, and nothing else defends a
+# public, unauthenticated endpoint.
+#
+# THE OUTPUT GUARDRAIL IS GONE. Not disabled - deleted. Nothing is attached to the
+# Converse call, and there is no output-side policy anywhere in this file.
 
 guardrail:
-  # Two distinct guardrail resources are created with these names.
-  input_name: gavilan-library-input-guardrail
-  output_name: gavilan-library-output-guardrail
-  # Converse guardrail trace behavior for the OUTPUT backstop: enabled | disabled | enabled_full.
-  trace: enabled
-  # Content filters. strength: NONE | LOW | MEDIUM | HIGH.
-  #   - INPUT guardrail uses these strengths as written (only its input side is exercised).
-  #   - OUTPUT guardrail uses output_strength with input forced to NONE, and drops
-  #     PROMPT_ATTACK (which is input-only; AWS requires its output strength to be NONE).
+  # The single guardrail resource. Still named for what it is: the input screen.
+  name: gavilan-library-input-guardrail
+  # Content filters for the input screen. strength: NONE | LOW | MEDIUM | HIGH.
+  # PROMPT_ATTACK only, per the decision above - re-adding a category here re-creates
+  # exactly the pre-emption problem, so treat this list as closed rather than a knob.
+  # Everything here is INPUT-side: the stack sets output strength NONE on every filter
+  # (this guardrail is never applied to output, and AWS requires NONE for PROMPT_ATTACK
+  # anyway), so there is no output_strength to set.
   content_filters:
-    - type: HATE
-      input_strength: HIGH
-      output_strength: HIGH
-    - type: SEXUAL
-      input_strength: HIGH
-      output_strength: HIGH
-    - type: INSULTS
-      input_strength: MEDIUM
-      output_strength: MEDIUM
-    - type: VIOLENCE
-      input_strength: MEDIUM
-      output_strength: MEDIUM
-    - type: MISCONDUCT
-      input_strength: MEDIUM
-      output_strength: MEDIUM
     - type: PROMPT_ATTACK
       input_strength: HIGH
-      output_strength: NONE   # INPUT only
-  # Sensitive information (PII) for the INPUT screen. ALL entities ANONYMIZE (mask/redact,
-  # e.g. an email becomes {EMAIL}); none BLOCK, so a masked query always proceeds. The
-  # OUTPUT guardrail carries no PII policy.
-  pii_anonymize_entities:
-    - EMAIL
-    - PHONE
-    - NAME
-    - ADDRESS
-    - USERNAME
-    - AGE
-    - PASSWORD
-    - US_SOCIAL_SECURITY_NUMBER
-    - CREDIT_DEBIT_CARD_NUMBER
-    - CREDIT_DEBIT_CARD_CVV
-    - PIN
-    - INTERNATIONAL_BANK_ACCOUNT_NUMBER
-    - SWIFT_CODE
-    - DRIVER_ID
-  # Friendly, student-facing blocked messages (match the bot's tone). The INPUT screen
-  # returns blocked_input_messaging; the Converse OUTPUT backstop returns blocked_outputs_messaging.
+  # Friendly, student-facing blocked message (matches the bot's tone), returned by the
+  # input screen. A detected prompt injection is now the only thing that can trigger it.
   #
   # BILINGUAL (English then Spanish, one blank line between them, rendered as two paragraphs
-  # by the widget). These are STATIC guardrail configuration, returned by Bedrock instead of a
-  # model reply: nothing translates them at runtime, and the widget's language control cannot
-  # reach them either, so a Spanish-speaking student who trips a guardrail would otherwise hit
-  # an English wall. Carrying both languages in the one string is the only way to serve both.
-  # Bedrock caps each of these at 500 characters - keep the pair under it.
-  # NOTE: guardrail policy text is baked into a published guardrail VERSION, so editing these
+  # by the widget). This is STATIC guardrail configuration, returned by Bedrock instead of a
+  # model reply: nothing translates it at runtime, and the widget's language control cannot
+  # reach it either, so a Spanish-speaking student who trips it would otherwise hit an
+  # English wall. Carrying both languages in the one string is the only way to serve both.
+  # Bedrock caps this at 500 characters - keep the pair under it.
+  # NOTE: guardrail policy text is baked into a published guardrail VERSION, so editing this
   # only takes effect on the next `cdk deploy` (which publishes a new version and repins the
   # Lambda). The Spanish copy has NOT had native review yet.
+  #
+  # CloudFormation requires a blocked-OUTPUTS message on every guardrail resource, so the
+  # stack passes this same string for it. It is unreachable by construction (nothing applies
+  # this guardrail to output), which is why there is no second message to maintain here.
   blocked_input_messaging: "I can't help with that request. I'm here for questions about the Gavilan College Library, like hours, checkouts, and finding materials.\n\nNo puedo ayudarte con esa solicitud. Estoy aquí para responder preguntas sobre la Biblioteca de Gavilan College, como horarios, préstamos y cómo encontrar materiales."
-  blocked_outputs_messaging: "I'm not able to provide a response to that. Try asking about library hours, services, or materials, or reach out to a librarian for more help.\n\nNo puedo responder a eso. Puedes preguntar sobre los horarios, los servicios o los materiales de la biblioteca, o pedir ayuda a un bibliotecario."

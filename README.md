@@ -14,7 +14,7 @@ AWS-native:
 - **Backend:** Lambda + API Gateway (Python)
 - **Feedback:** `POST /feedback` emails a librarian, via SNS, when someone reports a wrong answer - carrying the pages that answer cited, because fixing the page fixes the bot. Set `feedback.notify_email` in `config.yaml` to switch it on
 - **Infrastructure:** AWS CDK (Python)
-- **Guardrails:** Bedrock Guardrails (content filtering + PII redaction)
+- **Guardrails:** one Bedrock Guardrail, screening the input for prompt injection only (no other content filter, no PII policy, nothing on the output)
 - **Frontend:** embeddable JS widget, plus a deployed demo page that embeds it
 
 ## Structure
@@ -66,7 +66,7 @@ python -m pytest   # unit tests (boto3 stubbed, no live AWS)
 cdk deploy     # needs AWS credentials + a bootstrapped account
 ```
 
-`cdk deploy` provisions everything (KB, S3 Vectors store, scraper, catalog bucket, query Lambda, HTTP API, guardrails, the CloudFront-fronted widget, and the demo site) and outputs a paste-ready embed tag, the CloudFront domain, the `/query` URL, and the demo site URL. CloudFront is slow to create and destroy (~15-30 min each), so the first deploy takes a while. Tear down with `cdk destroy`.
+`cdk deploy` provisions everything (KB, S3 Vectors store, scraper, catalog bucket, query Lambda, HTTP API, the guardrail, the CloudFront-fronted widget, and the demo site) and outputs a paste-ready embed tag, the CloudFront domain, the `/query` URL, and the demo site URL. CloudFront is slow to create and destroy (~15-30 min each), so the first deploy takes a while. Tear down with `cdk destroy`.
 
 ## Demo site
 

@@ -29,7 +29,8 @@ and whether publishing it worked - and carries no comment, question, answer, add
 log is not the record and must not become one by accident.
 
 WHAT SCREENS THE TEXT: nothing but the caps below. Feedback text is never sent to a model, so the
-Bedrock guardrails that screen /query do not apply here. The controls that exist are the
+Bedrock guardrail that screens /query does not apply here (and it only screens that path's input
+for prompt injection anyway - it was never a content filter on free text). The controls that exist are the
 configured length caps, the body-size cap, plain-text-only rendering, and a subject line built
 from a constant.
 """

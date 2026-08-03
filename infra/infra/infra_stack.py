@@ -648,52 +648,36 @@ class GavilanChatbotStack(Stack):
             execute_on_handler_change=True,
         )
 
-        # --- Bedrock Guardrails: input screen + output backstop -----------------------
+        # --- Bedrock Guardrail: the input screen, and nothing else --------------------
+        #
+        # ONE guardrail, screening PROMPT_ATTACK on the input side. It is applied via
+        # ApplyGuardrail(source=INPUT) on the bare query in the handler, before the loop;
+        # nothing is attached to Converse, so there is no output guardrail here to find.
+        #
+        # Everything else came out deliberately (see the guardrail block in config.yaml):
+        # the screen runs ahead of the system prompt, so a content-filter block or a silent
+        # PII rewrite pre-empts the prompt's crisis handling. The prompt owns safety;
+        # PROMPT_ATTACK stays because it is an attack on the prompt itself.
 
-        # Two guardrails:
-        #   INPUT guardrail  - applied via ApplyGuardrail(source=INPUT) on the bare query in
-        #                      the handler, before retrieval. Content filters + prompt-attack
-        #                      BLOCK; all PII ANONYMIZE (mask-and-proceed).
-        #   OUTPUT guardrail - attached to Converse. Content filters on the answer only
-        #                      (input strengths NONE so the <context> is untouched), no PII.
-
-        # Canonical definitions of each guardrail. These drive BOTH the CfnGuardrail props
-        # and the version-description hash, so the hash covers exactly what is deployed and
-        # any config change forces a new published version.
-        input_filters_def = [
+        # Canonical definition of the guardrail. It drives BOTH the CfnGuardrail props and
+        # the version-description hash, so the hash covers exactly what is deployed and any
+        # config change forces a new published version.
+        #
+        # Output strength is NONE on every filter and is NOT a config knob: this guardrail is
+        # only ever applied to input, and AWS requires NONE for PROMPT_ATTACK regardless.
+        filters_def = [
             {
                 "type": f["type"],
                 "inputStrength": f["input_strength"],
-                "outputStrength": f["output_strength"],
+                "outputStrength": "NONE",
             }
             for f in guardrail_cfg["content_filters"]
         ]
-        # Output guardrail: input side OFF (NONE) so the <context> in the user message is
-        # never screened; PROMPT_ATTACK is input-only and is dropped entirely.
-        output_filters_def = [
-            {"type": f["type"], "inputStrength": "NONE", "outputStrength": f["output_strength"]}
-            for f in guardrail_cfg["content_filters"]
-            if f["type"] != "PROMPT_ATTACK"
-        ]
-        # Input screen PII: every entity ANONYMIZE (mask), so a masked query always proceeds
-        # and the mask-vs-block decision is unambiguous.
-        input_pii_def = [
-            {"type": entity, "action": "ANONYMIZE"}
-            for entity in guardrail_cfg["pii_anonymize_entities"]
-        ]
 
-        input_guardrail_def = {
-            "name": guardrail_cfg["input_name"],
-            "contentFilters": input_filters_def,
-            "piiEntities": input_pii_def,
+        guardrail_def = {
+            "name": guardrail_cfg["name"],
+            "contentFilters": filters_def,
             "blockedInputMessaging": guardrail_cfg["blocked_input_messaging"],
-            "blockedOutputsMessaging": guardrail_cfg["blocked_outputs_messaging"],
-        }
-        output_guardrail_def = {
-            "name": guardrail_cfg["output_name"],
-            "contentFilters": output_filters_def,
-            "blockedInputMessaging": guardrail_cfg["blocked_input_messaging"],
-            "blockedOutputsMessaging": guardrail_cfg["blocked_outputs_messaging"],
         }
 
         def _config_hash(payload: Dict[str, Any]) -> str:
@@ -701,60 +685,36 @@ class GavilanChatbotStack(Stack):
                 json.dumps(payload, sort_keys=True).encode("utf-8")
             ).hexdigest()[:12]
 
-        def _content_filters(defs):
-            return [
-                bedrock.CfnGuardrail.ContentFilterConfigProperty(
-                    type=f["type"],
-                    input_strength=f["inputStrength"],
-                    output_strength=f["outputStrength"],
-                )
-                for f in defs
-            ]
-
         input_guardrail = bedrock.CfnGuardrail(
             self,
             "InputGuardrail",
-            name=input_guardrail_def["name"],
+            name=guardrail_def["name"],
             description=(
                 "Input screen for the Gavilan Library chatbot, applied via "
-                "ApplyGuardrail(source=INPUT) on the bare user query before retrieval: "
-                "content filters + prompt-attack BLOCK, all PII ANONYMIZE."
+                "ApplyGuardrail(source=INPUT) on the bare user query before the agent loop: "
+                "PROMPT_ATTACK only. No other content filter and no PII policy - the system "
+                "prompt owns safety, because a screen that runs first pre-empts it."
             ),
-            blocked_input_messaging=input_guardrail_def["blockedInputMessaging"],
-            blocked_outputs_messaging=input_guardrail_def["blockedOutputsMessaging"],
+            blocked_input_messaging=guardrail_def["blockedInputMessaging"],
+            # CloudFormation requires a blocked-outputs message on every guardrail. This one
+            # is unreachable by construction - the guardrail is never applied to output - so
+            # it reuses the input message rather than carrying a second string to maintain.
+            blocked_outputs_messaging=guardrail_def["blockedInputMessaging"],
             content_policy_config=bedrock.CfnGuardrail.ContentPolicyConfigProperty(
-                filters_config=_content_filters(input_guardrail_def["contentFilters"]),
+                filters_config=[
+                    bedrock.CfnGuardrail.ContentFilterConfigProperty(
+                        type=f["type"],
+                        input_strength=f["inputStrength"],
+                        output_strength=f["outputStrength"],
+                    )
+                    for f in guardrail_def["contentFilters"]
+                ],
             ),
-            sensitive_information_policy_config=(
-                bedrock.CfnGuardrail.SensitiveInformationPolicyConfigProperty(
-                    pii_entities_config=[
-                        bedrock.CfnGuardrail.PiiEntityConfigProperty(
-                            type=e["type"], action=e["action"]
-                        )
-                        for e in input_guardrail_def["piiEntities"]
-                    ],
-                )
-            ),
+            # NO sensitive_information_policy_config: PII anonymization would rewrite the
+            # student's message before the model ever reads it.
         )
 
-        # Output backstop: content filters ONLY, output side. No sensitive-information policy
-        # (retrieved library info is public; masking the answer would re-break contact answers).
-        output_guardrail = bedrock.CfnGuardrail(
-            self,
-            "OutputGuardrail",
-            name=output_guardrail_def["name"],
-            description=(
-                "Output backstop for the Gavilan Library chatbot, attached to Converse: "
-                "content filters on the generated answer only (input strengths NONE, no PII)."
-            ),
-            blocked_input_messaging=output_guardrail_def["blockedInputMessaging"],
-            blocked_outputs_messaging=output_guardrail_def["blockedOutputsMessaging"],
-            content_policy_config=bedrock.CfnGuardrail.ContentPolicyConfigProperty(
-                filters_config=_content_filters(output_guardrail_def["contentFilters"]),
-            ),
-        )
-
-        # Numbered, immutable versions the Lambda pins to. The description carries a content
+        # Numbered, immutable version the Lambda pins to. The description carries a content
         # hash of the resolved guardrail config: CfnGuardrailVersion has no other property
         # that changes when config.yaml changes, so without this a guardrail edit updates the
         # DRAFT but never publishes a new version and the Lambda stays on the stale one.
@@ -764,13 +724,7 @@ class GavilanChatbotStack(Stack):
             self,
             "InputGuardrailVersion",
             guardrail_identifier=input_guardrail.attr_guardrail_id,
-            description=f"input config-{_config_hash(input_guardrail_def)}",
-        )
-        output_guardrail_version = bedrock.CfnGuardrailVersion(
-            self,
-            "OutputGuardrailVersion",
-            guardrail_identifier=output_guardrail.attr_guardrail_id,
-            description=f"output config-{_config_hash(output_guardrail_def)}",
+            description=f"input config-{_config_hash(guardrail_def)}",
         )
 
         # --- Demo site (1/2): its own private bucket + CloudFront ----------------------
@@ -932,15 +886,12 @@ class GavilanChatbotStack(Stack):
                     resources=[generation_model_arn],
                 )
             )
-        # ApplyGuardrail on BOTH guardrails: the standalone input screen (source=INPUT) and
-        # the guardrail attached to the Converse call both require this action on their ARN.
+        # ApplyGuardrail on the ONE guardrail: the standalone input screen (source=INPUT).
+        # Nothing is attached to Converse, so there is no second ARN to grant.
         query_lambda_role.add_to_policy(
             iam.PolicyStatement(
                 actions=["bedrock:ApplyGuardrail"],
-                resources=[
-                    input_guardrail.attr_guardrail_arn,
-                    output_guardrail.attr_guardrail_arn,
-                ],
+                resources=[input_guardrail.attr_guardrail_arn],
             )
         )
         # Read the self-updating database catalog the scraper writes (Phase 2b). Read-only, scoped
@@ -996,13 +947,12 @@ class GavilanChatbotStack(Stack):
                 "GENERATION_MAX_TOKENS": str(generation_cfg["max_tokens"]),
                 "GENERATION_TEMPERATURE": str(generation_cfg["temperature"]),
                 "MAX_QUERY_CHARS": str(request_cfg["max_query_chars"]),
-                # Input screen (ApplyGuardrail source=INPUT, pre-retrieval) + output backstop
-                # (attached to Converse). Each pins to its own published numbered version.
+                # The input screen (ApplyGuardrail source=INPUT, pre-loop), pinned to its
+                # published numbered version. There is no OUTPUT_GUARDRAIL_* pair and no
+                # GUARDRAIL_TRACE: nothing is attached to Converse, so there is no trace
+                # to configure.
                 "INPUT_GUARDRAIL_ID": input_guardrail.attr_guardrail_id,
                 "INPUT_GUARDRAIL_VERSION": input_guardrail_version.attr_version,
-                "OUTPUT_GUARDRAIL_ID": output_guardrail.attr_guardrail_id,
-                "OUTPUT_GUARDRAIL_VERSION": output_guardrail_version.attr_version,
-                "GUARDRAIL_TRACE": guardrail_cfg.get("trace", "enabled"),
                 # Phase 2b: read the self-updating held catalog from S3 (bundled JSON is the seed +
                 # not-held source + fallback). Cache TTL bounds per-container staleness.
                 "CATALOG_BUCKET": catalog_bucket.bucket_name,

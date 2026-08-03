@@ -1,6 +1,6 @@
 # Infrastructure (CDK)
 
-AWS CDK (Python) app that provisions the entire Gavilan Library Chatbot: the Bedrock Knowledge Base and its Amazon S3 Vectors store, the scraper Lambda (plus its weekly schedule and one-click deploy trigger), the catalog bucket, the query Lambda and HTTP API, the feedback path (an SNS topic with one email subscription plus its own small Lambda, created only when `feedback.notify_email` is set), the Bedrock guardrails, and the CloudFront-fronted widget bucket. Everything is L1 `Cfn*` constructs (see the architecture doc for why).
+AWS CDK (Python) app that provisions the entire Gavilan Library Chatbot: the Bedrock Knowledge Base and its Amazon S3 Vectors store, the scraper Lambda (plus its weekly schedule and one-click deploy trigger), the catalog bucket, the query Lambda and HTTP API, the feedback path (an SNS topic with one email subscription plus its own small Lambda, created only when `feedback.notify_email` is set), the Bedrock guardrail (one input screen), and the CloudFront-fronted widget bucket. Everything is L1 `Cfn*` constructs (see the architecture doc for why).
 
 The app reads all changeable settings from the repo-root `config.yaml` at synth time; edit values there, not in the stack.
 
