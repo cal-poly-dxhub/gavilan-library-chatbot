@@ -13,16 +13,21 @@
  * locked response contract:
  *     { "answer": "<text>", "sources": [ { "uri": "...", "excerpt": "..." } ] }
  *
- * No browser storage is used; conversation state is kept in memory for the
- * session only. On every send it posts the WHOLE in-memory transcript as a
- * `messages` array ({ role: "user"|"assistant", content }) so the bot remembers
- * earlier turns within the session; closing the tab discards it. The server caps
- * and trims the history, so the widget just sends what it has.
+ * Conversation state is kept in memory for the session only - no storage of any
+ * kind. On every send it posts the WHOLE in-memory transcript as a `messages`
+ * array ({ role: "user"|"assistant", content }) so the bot remembers earlier
+ * turns within the session; closing the tab discards it. The server caps and
+ * trims the history, so the widget just sends what it has.
  *
  * The UI is bilingual (English + Spanish). Every user-visible string lives in the
  * STRINGS table below, keyed by language code, and a control in the panel header
  * switches between them. The language choice is session-only too, for the same
- * reason as the transcript: this widget stores nothing in the browser.
+ * reason as the transcript: nothing about a conversation is written down.
+ *
+ * The ONE exception is the TEMPORARY sign-in gate's access token, which is kept
+ * in `sessionStorage` so a reload does not throw away a session that is still
+ * valid. That key leaves with the gate at go-live - see the gate block below for
+ * why it is sessionStorage and nothing else.
  * ===========================================================================
  */
 (function () {
@@ -336,18 +341,31 @@
   // pre-gate embeds, and the post-go-live tag all carry neither, and for them every path below
   // is a no-op - which is the same opt-in-by-attribute shape as data-usage-events.
   //
-  // NOTHING IS STORED. The token lives in the closure variable below and nowhere else - no
-  // browser storage of any kind, no cookie - and the refresh token Cognito hands back is
-  // dropped unread. A reload signs in again, deliberately: this is one password shared by
-  // link, and a tab that stays signed in forever is a password that leaks with a borrowed
-  // laptop.
+  // WHAT IS STORED, AND WHERE. Exactly one thing: { clientId, accessToken, expiresAt } under
+  // one sessionStorage key. Not the password, not the username, and not the refresh token -
+  // that last one is fetched and dropped unread, so the stored record cannot outlive the one
+  // day Cognito gave the access token.
+  //
+  // sessionStorage AND NOT localStorage, deliberately. Gavilan has shared library terminals,
+  // and a day-long bearer token that survives a browser restart on a public machine is a
+  // password left on the desk. sessionStorage is scoped to the tab and dies with it, which
+  // buys back the reload (the thing people actually hit) without buying the borrowed laptop.
+  // Do not "improve" the persistence here.
+  //
+  // The record is READ BACK through the same expiry check a live token goes through, so a
+  // stored token past its expiry raises the overlay instead of sending a request the widget
+  // already knows is doomed - and it is removed on sign-out, on a readable 401, on expiry, and
+  // on a failed sign-in.
   var AUTH_POOL_ATTR = "data-user-pool-id";
   var AUTH_CLIENT_ATTR = "data-client-id";
   // The one Cognito operation this widget calls. Unsigned and public: it is what every browser
   // sign-in does, and it is why the app client must have no secret.
   var AUTH_TARGET = "AWSCognitoIdentityProviderService.InitiateAuth";
+  // Namespaced, because sessionStorage is shared with whatever else the host page runs.
+  var AUTH_STORAGE_KEY = "gavilan-chatbot-session";
 
-  // { accessToken, expiresAt } while signed in, null otherwise.
+  // { accessToken, expiresAt } while signed in, null otherwise. The in-memory copy of what
+  // sessionStorage holds; currentSession() below is what keeps the two in step.
   var session = null;
 
   function trimmedAttr(el, name) {
@@ -376,14 +394,106 @@
     return authConfig() !== null;
   }
 
-  /** The held access token if it is still valid, else null (dropping the dead session). */
-  function accessToken() {
-    if (!session) return null;
-    if (session.expiresAt <= Date.now()) {
-      session = null;
+  /**
+   * sessionStorage, or null if it cannot be used. Access itself can THROW (a sandboxed iframe,
+   * or a browser set to block site data), which is why this is a function with a try around the
+   * lookup rather than a variable read once. Null means the gate degrades to exactly what it
+   * did before: a token held in memory, and a reload that signs in again.
+   */
+  function sessionStore() {
+    try {
+      return typeof sessionStorage !== "undefined" && sessionStorage ? sessionStorage : null;
+    } catch (e) {
       return null;
     }
-    return session.accessToken;
+  }
+
+  /**
+   * The stored session, if there is a usable one. Anything else - absent, unparseable, the
+   * wrong shape, a token minted for a DIFFERENT app client (the embed was repointed), or one
+   * already past its expiry - is removed rather than trusted, so a bad record cannot wedge a
+   * tab into a state the sign-in form is hidden behind.
+   */
+  function readStoredSession() {
+    var cfg = authConfig();
+    var store = sessionStore();
+    // An ungated embed never reads a token: its request has to stay byte-identical to the
+    // pre-gate one, header and all.
+    if (!cfg || !store) return null;
+    var raw = null;
+    try {
+      raw = store.getItem(AUTH_STORAGE_KEY);
+    } catch (e) {
+      return null;
+    }
+    if (!raw) return null;
+    var saved = null;
+    try {
+      saved = JSON.parse(raw);
+    } catch (e) {
+      saved = null;
+    }
+    var usable =
+      saved &&
+      typeof saved.accessToken === "string" && saved.accessToken &&
+      typeof saved.expiresAt === "number" && isFinite(saved.expiresAt) &&
+      saved.clientId === cfg.clientId &&
+      saved.expiresAt > Date.now();
+    if (!usable) {
+      setSession(null);
+      return null;
+    }
+    return { accessToken: saved.accessToken, expiresAt: saved.expiresAt };
+  }
+
+  /**
+   * The one writer. Memory and storage move together here and nowhere else, so there is no path
+   * that drops the token but leaves the record - which is the failure that would matter, a tab
+   * showing the sign-in form while a readable token sits in storage.
+   */
+  function setSession(next) {
+    session = next;
+    var store = sessionStore();
+    if (!store) return;
+    try {
+      if (!next) {
+        store.removeItem(AUTH_STORAGE_KEY);
+        return;
+      }
+      var cfg = authConfig();
+      if (!cfg) return;
+      store.setItem(
+        AUTH_STORAGE_KEY,
+        JSON.stringify({
+          clientId: cfg.clientId,
+          accessToken: next.accessToken,
+          expiresAt: next.expiresAt
+        })
+      );
+    } catch (e) {
+      /* blocked or full: memory-only, which is where this feature started */
+    }
+  }
+
+  /**
+   * The live session, or null. Restores from storage when memory has none, which is the whole
+   * reload story: a fresh page has an empty `session` and a stored record that is still good.
+   * Expiry is applied on the way out, so a restored token gets the same check a freshly minted
+   * one does and no caller has to know where the session came from.
+   */
+  function currentSession() {
+    if (!session) session = readStoredSession();
+    if (session && session.expiresAt <= Date.now()) {
+      setSession(null);
+      return null;
+    }
+    return session;
+  }
+
+  /** The held access token if it is still valid, else null (dropping the dead session). */
+  function accessToken() {
+    var live = currentSession();
+    return live ? live.accessToken : null;
   }
 
   function signedIn() {
@@ -391,7 +501,7 @@
   }
 
   function signOut() {
-    session = null;
+    setSession(null);
   }
 
   /** A rejection the UI can branch on without matching message text. */
@@ -469,13 +579,16 @@
         // treated as gone BEFORE the request rather than as an unreadable failure after it -
         // see the 401 note in realQuery for why after is not a usable signal.
         var ttl = typeof result.ExpiresIn === "number" ? result.ExpiresIn : 3600;
-        session = {
+        setSession({
           accessToken: token,
           expiresAt: Date.now() + Math.max(0, ttl - 60) * 1000
-        };
+        });
         return true;
       })
       .catch(function (err) {
+        // A failed attempt leaves nothing behind, including anything an earlier attempt in this
+        // tab stored: whoever is at the keyboard now could not prove they are the same person.
+        setSession(null);
         if (err && err.reason) throw err;
         throw authError("unavailable");
       })
@@ -558,6 +671,8 @@
           // opaque network failure before any status is readable here. That is why expiry is
           // caught BEFORE the request (see sendQuery) rather than from the response. Kept
           // anyway: it is correct wherever the response IS readable, and costs one comparison.
+          // signOut clears the stored record too, so a reload cannot resurrect a token the
+          // authorizer has already refused.
           signOut();
           throw authError("expired");
         }
@@ -1617,8 +1732,9 @@
       field.className = "signin__input";
       field.setAttribute("id", id);
       field.setAttribute("type", type);
-      // Let a password manager fill this. The widget stores nothing itself; whether the
-      // BROWSER remembers a credential is the person's own decision, not ours to block.
+      // Let a password manager fill this. The widget never keeps a credential itself (the
+      // stored session record holds a token and nothing else); whether the BROWSER remembers
+      // one is the person's own decision, not ours to block.
       field.setAttribute("autocomplete", autocomplete);
       field.setAttribute("required", "required");
       wrap.appendChild(label);
@@ -2462,6 +2578,9 @@
       signOut: signOut,
       AUTH_POOL_ATTR: AUTH_POOL_ATTR,
       AUTH_CLIENT_ATTR: AUTH_CLIENT_ATTR,
+      // The storage key, so a test can seed a "previous page load" and inspect what was left
+      // behind without hardcoding the string. Still no way to read the token through the API.
+      AUTH_STORAGE_KEY: AUTH_STORAGE_KEY,
       CONFIG: CONFIG,
       HOST_ID: HOST_ID,
       // Localization surface. setLanguage/resetLanguage exist for test isolation: the module
