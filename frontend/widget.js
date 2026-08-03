@@ -103,13 +103,13 @@
       // library page; "this preview is private" is the honest version and sets expectations.
       signInHeading: "Sign in to try the assistant",
       signInIntro: "This preview is private. Use the account you were given.",
-      signInEmailLabel: "Email",
+      signInUsernameLabel: "Username",
       signInPasswordLabel: "Password",
       signInSubmit: "Sign in",
       signInPending: "Signing in…",
-      // Cognito is configured not to distinguish a wrong address from a wrong password, and
+      // Cognito is configured not to distinguish a wrong name from a wrong password, and
       // neither does this copy.
-      signInFailed: "That email and password didn't work. Please check them and try again.",
+      signInFailed: "That username and password didn't work. Please check them and try again.",
       signInUnavailable:
         "Sorry, sign-in isn't reachable just now. Please try again in a moment.",
       signInExpired: "Your session ended. Please sign in again."
@@ -154,12 +154,12 @@
         "El asistente de la biblioteca aún no está conectado. Vuelve a intentarlo más tarde.",
       signInHeading: "Inicia sesión para probar el asistente",
       signInIntro: "Esta versión de prueba es privada. Usa la cuenta que te dieron.",
-      signInEmailLabel: "Correo electrónico",
+      signInUsernameLabel: "Nombre de usuario",
       signInPasswordLabel: "Contraseña",
       signInSubmit: "Iniciar sesión",
       signInPending: "Iniciando sesión…",
       signInFailed:
-        "Ese correo electrónico y esa contraseña no funcionaron. Revísalos e inténtalo de nuevo.",
+        "Ese nombre de usuario y esa contraseña no funcionaron. Revísalos e inténtalo de nuevo.",
       signInUnavailable:
         "Lo siento, ahora mismo no se puede iniciar sesión. Vuelve a intentarlo en unos momentos.",
       signInExpired: "Tu sesión terminó. Vuelve a iniciar sesión."
@@ -402,7 +402,7 @@
   }
 
   /**
-   * Exchange an email and password for an access token: ONE unsigned fetch to Cognito's public
+   * Exchange a username and password for an access token: ONE unsigned fetch to Cognito's public
    * InitiateAuth, no SDK and no build step.
    *
    * USER_PASSWORD_AUTH rather than SRP because SRP needs big-integer crypto no dependency-free
@@ -415,7 +415,7 @@
    *   "credentials"  - Cognito said no, or answered with a challenge instead of a token
    *   "unavailable"  - the call never completed (network, DNS, CORS, timeout)
    */
-  function signIn(email, password) {
+  function signIn(username, password) {
     var cfg = authConfig();
     if (!cfg || typeof fetch === "undefined") {
       return Promise.reject(authError("unavailable"));
@@ -437,14 +437,14 @@
       body: JSON.stringify({
         AuthFlow: "USER_PASSWORD_AUTH",
         ClientId: cfg.clientId,
-        AuthParameters: { USERNAME: email, PASSWORD: password }
+        AuthParameters: { USERNAME: username, PASSWORD: password }
       }),
       signal: controller ? controller.signal : undefined
     })
       .then(function (res) {
         // Cognito reports a bad password as a 4xx with a typed JSON body, so the body is worth
         // reading either way - but its `message` is never surfaced. It is AWS's wording, in
-        // AWS's language, and the pool is configured not to distinguish a wrong address from a
+        // AWS's language, and the pool is configured not to distinguish a wrong name from a
         // wrong password, which is only worth doing if the UI does not undo it.
         return res.json().then(
           function (data) { return { ok: res.ok, data: data }; },
@@ -1410,7 +1410,7 @@
   var GREETING_ID = "gavilan-chatbot-greeting";
   // Same rule for the sign-in fields: a <label for> resolves only inside the shadow root that
   // holds both ends of it. TEMPORARY, with the rest of the gate.
-  var SIGNIN_EMAIL_ID = "gavilan-chatbot-signin-email";
+  var SIGNIN_USERNAME_ID = "gavilan-chatbot-signin-username";
   var SIGNIN_PASSWORD_ID = "gavilan-chatbot-signin-password";
 
   // Everything that can hold focus inside the panel, in DOM order. `:not([disabled])`
@@ -1613,9 +1613,12 @@
 
     signInForm.appendChild(siHeading);
     signInForm.appendChild(siIntro);
-    var siEmailPair = signInField(SIGNIN_EMAIL_ID, "email", "username");
+    // type=text, not type=email: the pool signs in by plain username, and `type=email` plus the
+    // `required` above is browser-enforced constraint validation - it would refuse to submit
+    // "gavtesting" before any of this code ran, with a bubble nobody here wrote.
+    var siUserPair = signInField(SIGNIN_USERNAME_ID, "text", "username");
     var siPasswordPair = signInField(SIGNIN_PASSWORD_ID, "password", "current-password");
-    var siEmail = siEmailPair.field;
+    var siUser = siUserPair.field;
     var siPassword = siPasswordPair.field;
     signInForm.appendChild(siError);
     signInForm.appendChild(siSubmit);
@@ -1676,7 +1679,7 @@
       // a half-translated form behind, and the cost of a few textContent writes is nothing.
       siHeading.textContent = t("signInHeading");
       siIntro.textContent = t("signInIntro");
-      siEmailPair.label.textContent = t("signInEmailLabel");
+      siUserPair.label.textContent = t("signInUsernameLabel");
       siPasswordPair.label.textContent = t("signInPasswordLabel");
       siSubmit.textContent = state.signingIn ? t("signInPending") : t("signInSubmit");
     }
@@ -1729,14 +1732,14 @@
     function setSigningIn(pending) {
       state.signingIn = pending;
       siSubmit.disabled = pending;
-      siEmail.disabled = pending;
+      siUser.disabled = pending;
       siPassword.disabled = pending;
       // The button says which of the two things it is doing, rather than just greying out.
       siSubmit.textContent = pending ? t("signInPending") : t("signInSubmit");
     }
 
     function focusSignIn() {
-      var target = siEmail.value ? siPassword : siEmail;
+      var target = siUser.value ? siPassword : siUser;
       if (typeof target.focus === "function") {
         try { target.focus(); } catch (e) { /* ignore */ }
       }
@@ -1746,19 +1749,19 @@
      * Hand the two field values to signIn() and act on the outcome. The password is read here,
      * passed once, and cleared from the field on BOTH paths - it is never held anywhere else,
      * and a failed attempt must not leave it sitting in a form for the next person at the
-     * machine. The email stays, because retyping it is the wrong thing to make someone do.
+     * machine. The username stays, because retyping it is the wrong thing to make someone do.
      */
     function submitSignIn() {
       if (state.signingIn) return;
-      var email = String(siEmail.value == null ? "" : siEmail.value).trim();
+      var username = String(siUser.value == null ? "" : siUser.value).trim();
       var password = String(siPassword.value == null ? "" : siPassword.value);
-      if (!email || !password) {
+      if (!username || !password) {
         focusSignIn();
         return;
       }
       showSignInError("");
       setSigningIn(true);
-      signIn(email, password).then(
+      signIn(username, password).then(
         function () {
           siPassword.value = "";
           setSigningIn(false);
@@ -2222,7 +2225,7 @@
       state.open = true;
       panel.hidden = false;
       launcher.hidden = true;
-      // Focus the control that is actually on screen. With the gate up that is the email field,
+      // Focus the control that is on screen. With the gate up that is the username field,
       // and focusing a hidden composer would drop focus to nowhere. (TEMPORARY, with the gate.)
       if (authRequired() && !signedIn()) focusSignIn();
       else focusInput();

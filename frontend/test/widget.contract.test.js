@@ -2312,7 +2312,7 @@ test("signIn posts InitiateAuth to the pool's region, and the password goes nowh
   var seen = [];
   var g = withGate(GATE_ATTRS, routeGate(cognitoOk("ACCESS-TOKEN-1"), { answer: "hi", sources: [] }, seen));
   try {
-    var ok = await widget.signIn("someone@example.com", "hunter2-correct-horse");
+    var ok = await widget.signIn("gavtesting", "hunter2-correct-horse");
     assert.strictEqual(ok, true);
     assert.strictEqual(widget.signedIn(), true);
 
@@ -2327,7 +2327,7 @@ test("signIn posts InitiateAuth to the pool's region, and the password goes nowh
     var body = JSON.parse(call.opts.body);
     assert.strictEqual(body.AuthFlow, "USER_PASSWORD_AUTH");
     assert.strictEqual(body.ClientId, "testclientid123");
-    assert.strictEqual(body.AuthParameters.USERNAME, "someone@example.com");
+    assert.strictEqual(body.AuthParameters.USERNAME, "gavtesting");
 
     // ...and now the question. The password must appear in the sign-in call and NOWHERE else.
     await widget.sendQuery([{ role: "user", content: "hours?" }]);
@@ -2356,7 +2356,7 @@ test("bad credentials reject as 'credentials' and leave the widget signed out", 
   try {
     var err = null;
     try {
-      await widget.signIn("someone@example.com", "wrong");
+      await widget.signIn("gavtesting", "wrong");
     } catch (e) {
       err = e;
     }
@@ -2382,7 +2382,7 @@ test("a challenge instead of a token is a failed sign-in, not a half-signed-in w
   try {
     var err = null;
     try {
-      await widget.signIn("someone@example.com", "temp-password");
+      await widget.signIn("gavtesting", "temp-password");
     } catch (e) {
       err = e;
     }
@@ -2401,7 +2401,7 @@ test("an unreachable Cognito is 'unavailable', a distinct outcome from a wrong p
   try {
     var err = null;
     try {
-      await widget.signIn("someone@example.com", "whatever");
+      await widget.signIn("gavtesting", "whatever");
     } catch (e) {
       err = e;
     }
@@ -2417,7 +2417,7 @@ test("an expired token is caught before the request, not read off a 401", async 
   // from ExpiresIn, which is what makes "your session ended" distinguishable at all.
   var g = withGate(GATE_ATTRS, routeGate(cognitoOk("SHORT-LIVED", 1), { answer: "hi", sources: [] }, []));
   try {
-    await widget.signIn("someone@example.com", "pw");
+    await widget.signIn("gavtesting", "pw");
     // ExpiresIn 1s, minus the 60s safety margin, is already in the past.
     assert.strictEqual(widget.signedIn(), false, "a token inside its safety margin is already gone");
     var err = null;
@@ -2479,7 +2479,10 @@ test("the sign-in fields are real labelled inputs, typed, and reachable by keybo
       // for/id resolves only because both ends are in this shadow root.
       assert.strictEqual(l.getAttribute("for"), fields[i].getAttribute("id"));
     });
-    assert.strictEqual(fields[0].getAttribute("type"), "email");
+    // type=text, NOT type=email. The pool signs in by plain username, and `type=email` alongside
+    // the `required` attribute is browser-enforced validation: it would refuse to submit
+    // "gavtesting" before any widget code ran, and the message would be the browser's, not ours.
+    assert.strictEqual(fields[0].getAttribute("type"), "text");
     assert.strictEqual(fields[1].getAttribute("type"), "password");
     assert.strictEqual(fields[0].getAttribute("autocomplete"), "username");
     assert.strictEqual(fields[1].getAttribute("autocomplete"), "current-password");
@@ -2498,7 +2501,7 @@ test("signing in swaps the form for the composer and releases the starter questi
     var doc = makeDoc();
     var handle = widget.mount(doc);
     var fields = findAll(handle.shadow, "signin__input");
-    fields[0].value = "someone@example.com";
+    fields[0].value = "gavtesting";
     fields[1].value = "a-password";
     handle.signInForm.fire("submit");
     await new Promise(function (r) { setTimeout(r, 0); });
@@ -2509,7 +2512,7 @@ test("signing in swaps the form for the composer and releases the starter questi
     assert.ok(findByClass(handle.shadow, "suggestions"), "the starter questions arrive with the session");
     // The password is cleared from the DOM the moment it is no longer needed.
     assert.strictEqual(fields[1].value, "", "the password field is emptied");
-    assert.strictEqual(fields[0].value, "someone@example.com", "the email is not, so nobody retypes it");
+    assert.strictEqual(fields[0].value, "gavtesting", "the username is not, so nobody retypes it");
   } finally {
     g.restore();
   }
@@ -2522,7 +2525,7 @@ test("a rejected sign-in says so, clears the password, and stays gated", async (
     var doc = makeDoc();
     var handle = widget.mount(doc);
     var fields = findAll(handle.shadow, "signin__input");
-    fields[0].value = "someone@example.com";
+    fields[0].value = "gavtesting";
     fields[1].value = "wrong";
     handle.signInForm.fire("submit");
     await new Promise(function (r) { setTimeout(r, 0); });
@@ -2572,7 +2575,7 @@ test("the sign-in form is localized, and a switch does not strand it in the othe
       widget.STRINGS.es.signInIntro
     );
     var labels = findAll(handle.shadow, "signin__label");
-    assert.strictEqual(labels[0].textContent, widget.STRINGS.es.signInEmailLabel);
+    assert.strictEqual(labels[0].textContent, widget.STRINGS.es.signInUsernameLabel);
     assert.strictEqual(labels[1].textContent, widget.STRINGS.es.signInPasswordLabel);
   } finally {
     widget.resetLanguage();

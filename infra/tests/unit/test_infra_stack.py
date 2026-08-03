@@ -1938,20 +1938,47 @@ def test_the_app_client_is_public_password_auth_and_expires_in_a_day():
     assert props["PreventUserExistenceErrors"] == "ENABLED", props
 
 
-def test_the_pool_holds_one_admin_created_account_keyed_by_email():
+def test_the_pool_signs_in_by_plain_username_not_email():
     template = _template()
     (pool,) = template.find_resources("AWS::Cognito::UserPool").values()
     props = pool["Properties"]
 
-    # UsernameAttributes, NOT AliasAttributes, and the distinction is load-bearing for the CLI
-    # step: in ALIAS mode Cognito rejects a username of email format, so the documented
-    # `admin-create-user --username someone@example.com` would fail outright.
-    assert props["UsernameAttributes"] == ["email"], props
+    # NEITHER UsernameAttributes NOR AliasAttributes: that is what a plain-username pool looks
+    # like, and it is what makes `admin-create-user --username gavtesting` valid. Set
+    # UsernameAttributes: ["email"] and Cognito requires the name to BE an address; set
+    # AliasAttributes and it rejects one that looks like an address. The captain hands the
+    # client a word, not a fake mailbox, so the pool takes a word.
+    #
+    # Sign-in options are immutable after creation - changing this later replaces the pool and
+    # the pool id the widget is built with - so it is pinned here rather than left to a deploy.
+    assert "UsernameAttributes" not in props, props
     assert "AliasAttributes" not in props, props
+    # No standard attribute is required either, or step 1 would need --user-attributes.
+    assert "Schema" not in props, props
+    # No self-service recovery: nothing verified to send a code to, and the deployer's CLI is
+    # the only thing that should be able to move this password.
+    assert props["AccountRecoverySetting"]["RecoveryMechanisms"] == [
+        {"Name": "admin_only", "Priority": 1}
+    ], props
     # Nobody signs themselves up.
     assert props["AdminCreateUserConfig"]["AllowAdminCreateUserOnly"] is True, props
     # The gate leaves with `cdk destroy`, and with the code deletion at go-live.
     assert pool.get("DeletionPolicy") == "Delete", pool
+
+
+def test_the_printed_setup_commands_create_a_plain_username_account():
+    # These two strings ARE the handoff: if they do not run as printed, the demo has no login.
+    template = _template()
+    outputs = template.find_outputs("*")
+    create = json.dumps(outputs["DemoAuthCreateUserCommand"]["Value"])
+    set_pw = json.dumps(outputs["DemoAuthSetPasswordCommand"]["Value"])
+
+    assert "--username gavtesting" in create, create
+    assert "--username gavtesting" in set_pw, set_pw
+    # No email attribute: the pool asks for none, and passing one to a plain-username pool is
+    # noise the person running this would have to understand and edit.
+    assert "email" not in create, create
+    assert "@" not in create, create
 
 
 def test_the_gate_ships_no_credentials_and_takes_no_password_parameter():

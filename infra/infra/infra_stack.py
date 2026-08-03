@@ -78,6 +78,11 @@ _DEMO_WIDGET_SRC_TOKEN = "__WIDGET_SRC__"
 # Same mechanism as the two URLs above: placeholders here, CDK tokens resolved at deploy.
 _DEMO_USER_POOL_ID_TOKEN = "__USER_POOL_ID__"
 _DEMO_CLIENT_ID_TOKEN = "__CLIENT_ID__"
+# The one shared demo login, spelled into the two setup commands the stack prints so they are
+# copy-paste runnable rather than a template to fill in. It is a NAME, not a credential - the
+# password is chosen by the deployer at step 2 and never appears here or anywhere in the repo.
+# The pool signs in by plain username, so this needs no @ and carries no email attribute.
+_DEMO_AUTH_USERNAME = "gavtesting"
 # The demo page's cost meter/estimator reads its rates and measured constants from
 # config.yaml's cost_model block, stamped in here as a JSON literal. Unlike the two URLs
 # above this is a SYNTH-time value (no CDK token), but it goes through the same placeholder
@@ -1003,12 +1008,22 @@ class GavilanChatbotStack(Stack):
             user_pool_name="gavilan-library-demo-access",
             # Nobody signs themselves up: the captain creates the one account with the CLI.
             self_sign_up_enabled=False,
-            # Email-as-username (SignInAliases without `username` synthesizes UsernameAttributes,
-            # not AliasAttributes). That distinction is load-bearing for the CLI step: in ALIAS
-            # mode Cognito rejects a username of email format, so `admin-create-user --username
-            # someone@example.com` would fail. In this mode the email IS the username.
-            sign_in_aliases=cognito.SignInAliases(email=True),
-            account_recovery=cognito.AccountRecovery.EMAIL_ONLY,
+            # PLAIN USERNAME. `username=True` alone emits neither UsernameAttributes nor
+            # AliasAttributes (verified against aws-cdk-lib 2.260.0), which is what lets
+            # `admin-create-user --username gavtesting` succeed: an email-only pool would reject
+            # a name that is not an address, and would need an email attribute alongside it.
+            # This is a shared demo login handed over in a sentence, not a person's account, so
+            # a fake address is one more thing to explain and get wrong.
+            #
+            # SIGN-IN OPTIONS CANNOT BE CHANGED AFTER THE POOL IS CREATED. Switching this later
+            # replaces the pool, which changes the pool id the widget and the demo page are
+            # built with - so it is settled here, before the first deploy, or not cheaply at all.
+            sign_in_aliases=cognito.SignInAliases(username=True),
+            # No self-service recovery, deliberately: there is no verified email or phone on this
+            # account to send a code to, and nobody but the deployer should be able to move its
+            # password. NONE synthesizes RecoveryMechanisms `admin_only` - the same CLI path that
+            # created the account is the only way to reset it.
+            account_recovery=cognito.AccountRecovery.NONE,
             password_policy=cognito.PasswordPolicy(
                 min_length=12,
                 require_lowercase=True,
@@ -1016,7 +1031,6 @@ class GavilanChatbotStack(Stack):
                 require_digits=True,
                 require_symbols=True,
             ),
-            # Wrong email and wrong password return the same generic failure.
             # One-click uninstall: the whole gate disappears with `cdk destroy`, and with the
             # code deletion at go-live.
             removal_policy=RemovalPolicy.DESTROY,
@@ -1432,14 +1446,13 @@ class GavilanChatbotStack(Stack):
                 "aws cognito-idp admin-create-user"
                 f" --region {self.region}"
                 f" --user-pool-id {demo_auth_pool.user_pool_id}"
-                " --username YOU@EXAMPLE.COM"
-                " --user-attributes Name=email,Value=YOU@EXAMPLE.COM"
-                " Name=email_verified,Value=true"
+                f" --username {_DEMO_AUTH_USERNAME}"
                 " --message-action SUPPRESS"
             ),
             description=(
                 "Step 1 of 2, run once after deploy with your own AWS credentials. "
-                "SUPPRESS skips the invite email; step 2 sets the password."
+                "The pool signs in by plain username, so no email attribute is needed and "
+                "the name can be anything. SUPPRESS skips the invite; step 2 sets the password."
             ),
         )
         CfnOutput(
@@ -1449,7 +1462,7 @@ class GavilanChatbotStack(Stack):
                 "aws cognito-idp admin-set-user-password"
                 f" --region {self.region}"
                 f" --user-pool-id {demo_auth_pool.user_pool_id}"
-                " --username YOU@EXAMPLE.COM"
+                f" --username {_DEMO_AUTH_USERNAME}"
                 " --password 'CHOOSE-A-PASSWORD' --permanent"
             ),
             description=(
