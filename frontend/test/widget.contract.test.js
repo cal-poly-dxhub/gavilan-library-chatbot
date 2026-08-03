@@ -456,6 +456,7 @@ function makeEl(tagName) {
     return c;
   };
   el.setAttribute = function (k, v) { el.attrs[k] = String(v); };
+  el.removeAttribute = function (k) { delete el.attrs[k]; };
   el.getAttribute = function (k) {
     return Object.prototype.hasOwnProperty.call(el.attrs, k) ? el.attrs[k] : null;
   };
@@ -1699,9 +1700,9 @@ test("suggestions disappear after a typed message and do not come back", async (
 // the tree, text inside the status region, focus that cannot leave an open panel.
 
 // The shared DOM fake predates these behaviours: focus containment needs
-// querySelectorAll + closest, the document-level Escape needs addEventListener on the
-// document, and the first-launch description needs removeAttribute. This augments a
-// fake doc for the tests below rather than changing the fake the rest of the file uses.
+// querySelectorAll + closest, and the document-level Escape needs addEventListener on the
+// document. This augments a fake doc for the tests below rather than changing the fake the
+// rest of the file uses.
 function matchesFocusable(el, sel) {
   var tag = String(el.tagName || "").toLowerCase();
   var m = /^([a-z]+):not\(\[disabled\]\)$/.exec(sel);
@@ -1715,7 +1716,6 @@ function matchesFocusable(el, sel) {
 }
 
 function augmentEl(el, doc) {
-  el.removeAttribute = function (k) { delete el.attrs[k]; };
   el.focus = function () { doc.focused = el; };
   el.querySelectorAll = function (selector) {
     var parts = selector.split(",").map(function (s) { return s.trim(); });
@@ -2445,20 +2445,107 @@ test("the widget keeps no token or password anywhere a reload could find it", ()
 
 // --- the panel while gated ----------------------------------------------
 
-test("a gated, signed-out panel shows sign-in in the composer's place and offers no dead buttons", () => {
+test("a gated, signed-out panel puts the overlay over its own body and offers no dead buttons", () => {
   var g = withGate(GATE_ATTRS, function () { return Promise.reject(new Error("x")); });
   try {
     var doc = makeDoc();
     var handle = widget.mount(doc);
-    var signin = findByClass(handle.shadow, "signin");
+    var overlay = findByClass(handle.shadow, "signin-overlay");
     var composer = findByClass(handle.shadow, "composer");
-    assert.ok(signin, "the sign-in form is in the panel");
-    assert.strictEqual(signin.hidden, false, "and it is the one on screen");
-    assert.strictEqual(composer.hidden, true, "the composer is not");
-    // The greeting still shows - it is what says WHAT you are signing in for - but the starter
-    // questions do not, because each is a button that would submit nothing.
-    assert.ok(/Gavilan College Library assistant/.test(allText(handle.shadow)), "greeting is present");
+    var thread = findByClass(handle.shadow, "thread");
+    assert.ok(overlay, "the overlay is up");
+    assert.ok(findByClass(overlay, "signin"), "and it carries the sign-in form");
+    // Over the PANEL'S BODY and nothing wider. This widget is a guest on somebody else's
+    // page, so the covered region stops at the panel: no host-page scrim, ever.
+    assert.strictEqual(overlay.parentNode.className, "panel__body", "scoped to the panel body");
+    assert.strictEqual(composer.hidden, true, "the composer is out of reach beneath it");
+    // What the overlay covers cannot be read or acted on, so it is not narrated either.
+    assert.strictEqual(thread.getAttribute("aria-hidden"), "true");
+    // The starter questions do not show, because each is a button that would submit nothing.
     assert.strictEqual(findByClass(handle.shadow, "suggestions"), null, "no starter questions yet");
+  } finally {
+    g.restore();
+  }
+});
+
+test("hiding the composer actually hides it: its class display does not beat the attribute", () => {
+  // `hidden` is a UA `display: none`, which a class-level `display: flex` outranks. The panel
+  // and the launcher always carried the override; the composer did not, so `form.hidden = true`
+  // took it out of the tab order and left it painted - a dead text box under the gate.
+  var flat = SOURCE.replace(/\n/g, " ");
+  var m = /([^"]*)\[hidden\][^{]*\{ display: none !important; \}/.exec(flat);
+  assert.ok(m, "there is a [hidden] display override rule");
+  var rule = m[0];
+  ["\\.panel\\[hidden\\]", "\\.launcher\\[hidden\\]", "\\.composer\\[hidden\\]"].forEach(function (sel) {
+    assert.ok(new RegExp(sel).test(rule), sel.replace(/\\/g, "") + " is covered by it");
+  });
+});
+
+test("while the overlay is up, Tab reaches the header and the overlay and nothing else", async () => {
+  var g = withGate(GATE_ATTRS, routeGate(cognitoOk("TOKEN-TRAP"), { answer: "hi", sources: [] }, []));
+  try {
+    var doc = makeFocusDoc();
+    var handle = widget.mount(doc);
+    var panel = findByClass(handle.shadow, "panel");
+    var fields = findAll(handle.shadow, "signin__input");
+
+    // Opening puts focus INTO the overlay rather than on a composer nobody can use.
+    handle.open();
+    assert.strictEqual(doc.focused, fields[0], "focus lands in the username field");
+
+    // The last thing in the cycle is the overlay's submit button, and Tab there wraps back to
+    // the header's language control - it does not fall through to the composer or the thread.
+    var firstLang = findAll(handle.shadow, "header__lang-btn")[0];
+    var submit = findByClass(handle.shadow, "signin__submit");
+    function tab(shift) {
+      var ev = { key: "Tab", shiftKey: !!shift, preventDefault: function () { ev.prevented = true; } };
+      panel.fire("keydown", ev);
+      return ev;
+    }
+    handle.shadow.activeElement = submit;
+    doc.focused = null;
+    assert.ok(tab().prevented, "Tab at the submit button is intercepted");
+    assert.strictEqual(doc.focused, firstLang, "...and wraps to the language control");
+
+    // Shift+Tab from the header's first control wraps to the overlay's last, so the cycle is
+    // exactly [header, overlay]. The language buttons being IN it is the point: the sign-in
+    // prompt has to be readable in Spanish before anyone signs in.
+    handle.shadow.activeElement = firstLang;
+    doc.focused = null;
+    assert.ok(tab(true).prevented);
+    assert.strictEqual(doc.focused, submit, "the cycle ends at the overlay, not at Send");
+
+    // Signing in hands the whole panel back.
+    fields[0].value = "gavtesting";
+    fields[1].value = "pw";
+    handle.signInForm.fire("submit");
+    await new Promise(function (r) { setTimeout(r, 0); });
+    handle.shadow.activeElement = findByClass(handle.shadow, "composer__send");
+    doc.focused = null;
+    assert.ok(tab().prevented);
+    assert.strictEqual(doc.focused, firstLang, "Send is the last edge again");
+  } finally {
+    g.restore();
+  }
+});
+
+test("Escape does not dismiss the overlay - it closes the panel, and the gate is still there", () => {
+  var g = withGate(GATE_ATTRS, function () { return Promise.reject(new Error("x")); });
+  try {
+    var doc = makeFocusDoc();
+    var handle = widget.mount(doc);
+    var panel = findByClass(handle.shadow, "panel");
+    handle.open();
+    panel.fire("keydown", { key: "Escape" });
+    assert.strictEqual(panel.hidden, true, "Escape closes the panel");
+    // Nothing behind the overlay is usable, so there is no state where the panel is open and
+    // the overlay is gone. Reopening returns to the same gate, with focus back inside it.
+    assert.ok(findByClass(handle.shadow, "signin-overlay"), "the overlay was not dismissed");
+    doc.focused = null;
+    handle.open();
+    assert.strictEqual(panel.hidden, false);
+    assert.ok(findByClass(handle.shadow, "signin-overlay"), "still gated");
+    assert.strictEqual(doc.focused, findAll(handle.shadow, "signin__input")[0]);
   } finally {
     g.restore();
   }
@@ -2495,10 +2582,10 @@ test("the sign-in fields are real labelled inputs, typed, and reachable by keybo
   }
 });
 
-test("signing in swaps the form for the composer and releases the starter questions", async () => {
+test("signing in leaves no trace of the gate and puts focus in the composer", async () => {
   var g = withGate(GATE_ATTRS, routeGate(cognitoOk("TOKEN-A"), { answer: "hi", sources: [] }, []));
   try {
-    var doc = makeDoc();
+    var doc = makeFocusDoc();
     var handle = widget.mount(doc);
     var fields = findAll(handle.shadow, "signin__input");
     fields[0].value = "gavtesting";
@@ -2507,12 +2594,94 @@ test("signing in swaps the form for the composer and releases the starter questi
     await new Promise(function (r) { setTimeout(r, 0); });
 
     assert.strictEqual(widget.signedIn(), true);
-    assert.strictEqual(findByClass(handle.shadow, "signin").hidden, true);
+    // REMOVED, not hidden: nothing on screen and nothing in the tree says there was a gate.
+    assert.strictEqual(findByClass(handle.shadow, "signin-overlay"), null, "the overlay is gone");
+    assert.strictEqual(findByClass(handle.shadow, "signin"), null, "and so is the form inside it");
     assert.strictEqual(findByClass(handle.shadow, "composer").hidden, false);
+    assert.strictEqual(
+      findByClass(handle.shadow, "thread").getAttribute("aria-hidden"), null,
+      "the transcript is narrated again"
+    );
+    assert.strictEqual(doc.focused, findByClass(handle.shadow, "composer__input"), "focus lands on the composer");
     assert.ok(findByClass(handle.shadow, "suggestions"), "the starter questions arrive with the session");
     // The password is cleared from the DOM the moment it is no longer needed.
     assert.strictEqual(fields[1].value, "", "the password field is emptied");
     assert.strictEqual(fields[0].value, "gavtesting", "the username is not, so nobody retypes it");
+  } finally {
+    g.restore();
+  }
+});
+
+test("a 401 mid-conversation brings the overlay back, with a reason", async () => {
+  // The readable-401 path. In a browser it is mostly unreachable (an authorizer rejection
+  // carries no CORS headers), which is why the expiry check below exists too - but this is
+  // the branch that fires wherever the status IS readable.
+  var stage = { rejecting: false };
+  var g = withGate(GATE_ATTRS, function (url) {
+    if (/cognito-idp/.test(url)) return Promise.resolve(cognitoOk("TOKEN-401"));
+    if (stage.rejecting) return Promise.resolve({ ok: false, status: 401, json: function () { return Promise.resolve({}); } });
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ answer: "Open 9-5.", sources: [] }); } });
+  });
+  try {
+    var doc = makeFocusDoc();
+    var handle = widget.mount(doc);
+    var fields = findAll(handle.shadow, "signin__input");
+    fields[0].value = "gavtesting";
+    fields[1].value = "pw";
+    handle.signInForm.fire("submit");
+    await flush();
+    handle.submit("hours?");
+    await flush();
+    assert.strictEqual(findByClass(handle.shadow, "signin-overlay"), null, "signed in, no gate");
+
+    stage.rejecting = true;
+    doc.focused = null;
+    handle.submit("and tomorrow?");
+    await flush();
+
+    assert.strictEqual(widget.signedIn(), false, "the dead token was dropped");
+    var overlay = findByClass(handle.shadow, "signin-overlay");
+    assert.ok(overlay, "the overlay is back over the transcript");
+    assert.strictEqual(findByClass(handle.shadow, "composer").hidden, true);
+    assert.strictEqual(
+      findByClass(overlay, "signin__error").textContent, widget.STRINGS.en.signInExpired,
+      "and it says why, rather than reappearing unexplained"
+    );
+    // The password field, not the username: the name is still filled in from the first
+    // sign-in, and the password is the only thing this person has to type again.
+    assert.strictEqual(doc.focused, findAll(handle.shadow, "signin__input")[1], "focus is in the overlay");
+  } finally {
+    g.restore();
+  }
+});
+
+test("a token the widget already knows is expired brings the overlay back before any request", async () => {
+  var seen = [];
+  // 60.5s, minus the 60s safety margin, is half a second of validity: enough for the first
+  // question, gone by the second. Expiry is tracked locally precisely so the second question
+  // is never sent - a browser cannot read the 401 it would come back as.
+  var g = withGate(GATE_ATTRS, routeGate(cognitoOk("SHORT", 60.5), { answer: "Open 9-5.", sources: [] }, seen));
+  try {
+    var doc = makeFocusDoc();
+    var handle = widget.mount(doc);
+    var fields = findAll(handle.shadow, "signin__input");
+    fields[0].value = "gavtesting";
+    fields[1].value = "pw";
+    handle.signInForm.fire("submit");
+    await flush();
+    handle.submit("hours?");
+    await flush();
+    assert.strictEqual(seen.length, 1, "the first question went out");
+    assert.strictEqual(findByClass(handle.shadow, "signin-overlay"), null);
+
+    await sleep(700);
+    handle.submit("and tomorrow?");
+    await flush();
+
+    assert.strictEqual(seen.length, 1, "no doomed request was sent");
+    var overlay = findByClass(handle.shadow, "signin-overlay");
+    assert.ok(overlay, "the overlay is back");
+    assert.strictEqual(findByClass(overlay, "signin__error").textContent, widget.STRINGS.en.signInExpired);
   } finally {
     g.restore();
   }
@@ -2534,7 +2703,7 @@ test("a rejected sign-in says so, clears the password, and stays gated", async (
     assert.strictEqual(err.hidden, false, "the alert is shown");
     assert.strictEqual(err.textContent, widget.STRINGS.en.signInFailed);
     assert.strictEqual(fields[1].value, "", "the password does not sit in the form for the next person");
-    assert.strictEqual(findByClass(handle.shadow, "signin").hidden, false, "still gated");
+    assert.ok(findByClass(handle.shadow, "signin-overlay"), "still gated: the overlay stays up");
     assert.strictEqual(findByClass(handle.shadow, "composer").hidden, true);
     assert.strictEqual(findByClass(handle.shadow, "suggestions"), null, "still no dead buttons");
   } finally {

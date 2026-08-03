@@ -1157,7 +1157,21 @@
     "  width: min(720px, calc(100vw - 24px));",
     "  height: min(860px, calc(100vh - 32px));",
     "}",
-    ".panel[hidden], .launcher[hidden] { display: none !important; }",
+    // `hidden` is a UA-stylesheet `display: none`, and every one of these sets `display`
+    // from a class - which wins on specificity and paints the element anyway. That is why
+    // .panel and .launcher always carried this rule; .composer needs it for the same reason
+    // (its `display: flex` was beating its own `hidden` attribute, so hiding it behind the
+    // sign-in gate did nothing visible and the dead text box stayed on screen).
+    ".panel[hidden], .launcher[hidden], .composer[hidden] { display: none !important; }",
+    // Everything under the header, in one positioned box. Its only job is to be the
+    // containing block for the sign-in overlay, so the overlay covers the transcript and
+    // the composer and stops at the header - never the host page, which this widget is a
+    // guest on. (The wrapper outlives the gate; an absolutely-positioned child needs a
+    // positioned ancestor and `.panel` is the wrong one.)
+    ".panel__body {",
+    "  position: relative; flex: 1 1 auto; min-height: 0;",
+    "  display: flex; flex-direction: column;",
+    "}",
     // header
     //
     // WRAPS on purpose. The header now holds a title AND the language control, and a translated
@@ -1342,12 +1356,26 @@
     "  box-shadow: 0 0 0 2px var(--focus-halo);",
     "}",
     // sign-in gate (TEMPORARY - this block goes at go-live with the rest of the gate).
-    // Occupies the composer's slot, so the panel keeps one input area rather than growing a
-    // second one. Borrows the composer's tokens throughout: same border, same two-tone focus
-    // ring, same brand button, so it reads as part of the widget and not a bolted-on form.
+    // A gate you pass THROUGH, not furniture that stays: it covers the panel's body while it
+    // is up and the whole node leaves the DOM once you are through it. Scoped to `.panel__body`
+    // and nothing wider - this is a third-party embed, so darkening the page it sits on is not
+    // ours to do. The card borrows the composer's tokens throughout (same border, same two-tone
+    // focus ring, same brand button) so it reads as part of the widget, not a bolted-on form.
+    ".signin-overlay {",
+    "  position: absolute; inset: 0; z-index: 1;",
+    "  display: flex; align-items: center; justify-content: center;",
+    "  padding: 16px; overflow-y: auto;",
+    // Nearly opaque rather than a light wash: what is behind it cannot be read or reached, and
+    // saying so honestly beats a teasing 50% scrim. Every piece of text in here sits on the
+    // white card above, so the wash carries no contrast requirement of its own.
+    "  background: rgba(250,251,252,0.94);",
+    "}",
     ".signin {",
     "  display: flex; flex-direction: column; gap: 8px;",
-    "  padding: 12px; border-top: 1px solid var(--panel-border); background: #fff;",
+    "  width: 100%; max-width: 300px; margin: auto;",
+    "  padding: 16px; background: #fff;",
+    "  border: 1px solid var(--panel-border); border-radius: 12px;",
+    "  box-shadow: 0 6px 20px rgba(0,0,0,0.14);",
     "}",
     ".signin__heading { font-weight: 600; font-size: 14px; }",
     ".signin__intro { font-size: 12px; color: var(--muted); margin: 0; }",
@@ -1564,9 +1592,9 @@
 
     // ---- sign-in form (TEMPORARY: the whole block leaves at go-live) ----
     //
-    // It stands IN THE COMPOSER'S PLACE rather than beside it: exactly one of the two is ever
-    // in the panel, so there is never a text box on screen that silently cannot send. Both are
-    // real <form>s, so Enter submits whichever is showing without any key handling of ours.
+    // It sits in an OVERLAY across the panel's body, and the composer is hidden underneath it,
+    // so there is never a text box on screen that silently cannot send. Both are real <form>s,
+    // so Enter submits whichever is showing without any key handling of ours.
     //
     // Real <label for> pairs, not placeholder text: a placeholder disappears the moment someone
     // types, which is exactly when they most need to know which box they are in, and it is not
@@ -1622,12 +1650,21 @@
     var siPassword = siPasswordPair.field;
     signInForm.appendChild(siError);
     signInForm.appendChild(siSubmit);
-    signInForm.hidden = true;
+
+    // The overlay is the thing that comes and goes; the form inside it never changes. It starts
+    // DETACHED and applyAuthState() below attaches it if this embed is gated, so an ungated
+    // widget never has an overlay node at all. (TEMPORARY, with the gate.)
+    var signInOverlay = doc.createElement("div");
+    signInOverlay.className = "signin-overlay";
+    signInOverlay.appendChild(signInForm);
+
+    var panelBody = doc.createElement("div");
+    panelBody.className = "panel__body";
+    panelBody.appendChild(thread);
+    panelBody.appendChild(form);
 
     panel.appendChild(header);
-    panel.appendChild(thread);
-    panel.appendChild(form);
-    panel.appendChild(signInForm);
+    panel.appendChild(panelBody);
     root.appendChild(panel);
 
     // ---- language ----
@@ -1711,16 +1748,35 @@
 
     // ---- sign-in gate (TEMPORARY: this whole block leaves at go-live) ----
 
+    /** Whether the overlay is currently over the panel. */
+    function gateIsUp() {
+      return signInOverlay.parentNode === panelBody;
+    }
+
     /**
-     * Show exactly one of the composer and the sign-in form. For an UNGATED embed the gate is
-     * never true, so the composer is the only thing that has ever existed and every path here
-     * is inert. The focus trap already skips a `[hidden]` subtree, so hiding one form also
-     * takes its controls out of the Tab cycle.
+     * Raise or drop the overlay. For an UNGATED embed the gate is never true, so the composer is
+     * the only thing that has ever existed and every path here is inert.
+     *
+     * Dropping it REMOVES the node rather than hiding it: once you are through the gate, nothing
+     * on screen and nothing in the accessibility tree says there ever was one. Raising it puts
+     * the same node back, so a 401 or an expired token returns you to the form you left.
+     *
+     * Three things move together, and they have to. The composer is hidden (the focus trap
+     * already skips a `[hidden]` subtree, so that also takes it out of the Tab cycle), the
+     * transcript behind the wash is marked aria-hidden - it cannot be read or acted on, so it
+     * should not be narrated either - and focusablesInPanel() below rescopes the Tab cycle to
+     * the header and the overlay.
      */
     function applyAuthState() {
       var gated = authRequired() && !signedIn();
-      signInForm.hidden = !gated;
       form.hidden = gated;
+      if (gated) {
+        if (!gateIsUp()) panelBody.appendChild(signInOverlay);
+        thread.setAttribute("aria-hidden", "true");
+      } else {
+        if (signInOverlay.parentNode) signInOverlay.parentNode.removeChild(signInOverlay);
+        thread.removeAttribute("aria-hidden");
+      }
     }
 
     /** Say something went wrong, or clear it. Empty text removes the box entirely. */
@@ -2133,6 +2189,10 @@
       // that is going to come back 401.
       if (authRequired() && !signedIn()) {
         applyAuthState();
+        // A started conversation means there WAS a session, so the overlay coming back over the
+        // transcript needs a reason given. Before the first message there is nothing to explain:
+        // the gate simply never opened.
+        if (state.started) showSignInError(t("signInExpired"));
         focusSignIn();
         return;
       }
@@ -2209,13 +2269,22 @@
      */
     function focusablesInPanel() {
       if (typeof panel.querySelectorAll !== "function") return [];
-      var found = panel.querySelectorAll(FOCUSABLE_SELECTOR);
+      // While the sign-in overlay is up, the cycle is the header and the overlay - in that
+      // order, which is also the order they are stacked. Everything the overlay covers is
+      // behind it and unusable, and a sources link or a retry button left over from a
+      // conversation that outlived its token is exactly the thing Tab must not reach.
+      // The header stays IN, deliberately: the language control has to work before someone
+      // signs in, or the prompt cannot be read in Spanish. (TEMPORARY, with the gate.)
+      var scopes = gateIsUp() ? [header, signInOverlay] : [panel];
       var out = [];
-      for (var i = 0; i < found.length; i++) {
-        var el = found[i];
-        if (el.hidden) continue;
-        if (typeof el.closest === "function" && el.closest("[hidden]")) continue;
-        out.push(el);
+      for (var s = 0; s < scopes.length; s++) {
+        var found = scopes[s].querySelectorAll(FOCUSABLE_SELECTOR);
+        for (var i = 0; i < found.length; i++) {
+          var el = found[i];
+          if (el.hidden) continue;
+          if (typeof el.closest === "function" && el.closest("[hidden]")) continue;
+          out.push(el);
+        }
       }
       return out;
     }
