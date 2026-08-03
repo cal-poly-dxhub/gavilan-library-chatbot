@@ -1220,6 +1220,23 @@ def test_one_guardrail_version_wired_to_query_lambda_with_no_output_env():
     assert "GUARDRAIL_TRACE" not in env
 
 
+def test_guardrail_descriptions_fit_the_cloudformation_cap():
+    # AWS::Bedrock::Guardrail and ::GuardrailVersion both cap Description at 200 characters,
+    # and the L1 Cfn constructs do NOT enforce it - `cdk synth` is happy and the change set is
+    # rejected at deploy ("expected maxLength: 200"). Prose here is a deploy-time failure, so
+    # it gets pinned at synth instead: rationale belongs in code comments, not in this field.
+    template = _template()
+    descriptions = [
+        (logical_id, res["Properties"]["Description"])
+        for kind in ("AWS::Bedrock::Guardrail", "AWS::Bedrock::GuardrailVersion")
+        for logical_id, res in template.find_resources(kind).items()
+        if "Description" in res["Properties"]
+    ]
+    assert descriptions, "expected the guardrail resources to carry descriptions"
+    too_long = {lid: len(d) for lid, d in descriptions if len(d) > 200}
+    assert not too_long, too_long
+
+
 def test_guardrail_version_description_is_a_config_content_hash():
     # The version description must be a content hash of the resolved guardrail config, not a
     # fixed literal, so any config change publishes a new immutable version.

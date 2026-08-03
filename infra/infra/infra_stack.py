@@ -689,11 +689,13 @@ class GavilanChatbotStack(Stack):
             self,
             "InputGuardrail",
             name=guardrail_def["name"],
+            # CloudFormation caps this at 200 characters and rejects the change set at deploy
+            # time if it is longer (the L1 does not validate it at synth). The reasoning that
+            # does not fit lives in the comment block above, not here.
             description=(
-                "Input screen for the Gavilan Library chatbot, applied via "
-                "ApplyGuardrail(source=INPUT) on the bare user query before the agent loop: "
-                "PROMPT_ATTACK only. No other content filter and no PII policy - the system "
-                "prompt owns safety, because a screen that runs first pre-empts it."
+                "Input screen for the Gavilan Library chatbot: ApplyGuardrail(source=INPUT) "
+                "on the bare user query, PROMPT_ATTACK only. No other content filter and no "
+                "PII policy - the system prompt owns safety."
             ),
             blocked_input_messaging=guardrail_def["blockedInputMessaging"],
             # CloudFormation requires a blocked-outputs message on every guardrail. This one
