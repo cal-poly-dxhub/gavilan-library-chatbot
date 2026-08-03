@@ -149,10 +149,33 @@ test("mock: 'trigger error' rejects (drives the error state)", async () => {
 });
 
 // --- static source scan: enforce the hard rules -------------------------
-test("source uses NO browser storage (localStorage/sessionStorage)", () => {
-  assert.ok(!/\blocalStorage\b/.test(SOURCE), "must not use localStorage");
-  assert.ok(!/\bsessionStorage\b/.test(SOURCE), "must not use sessionStorage");
+test("source keeps nothing that outlives the tab: no localStorage, no indexedDB, no cookie", () => {
+  // sessionStorage is now allowed for ONE thing (the temporary gate's access token, so a reload
+  // does not throw away a session with most of a day left on it) - and these three are still
+  // banned outright, because each of them survives a browser restart on a shared library
+  // terminal. The next test pins that the allowance did not widen.
+  //
+  // localStorage is matched as USAGE (a property read, a call, an assignment), not as the word:
+  // the gate's comment has to be able to say what it deliberately did not use, and the same
+  // rule the innerHTML scan below follows applies here.
+  [
+    /\blocalStorage\s*[.[]/,     // localStorage.setItem(...) / localStorage["k"]
+    /[=(]\s*localStorage\b/,     // var s = localStorage / f(localStorage)
+    /\breturn\s+localStorage\b/  // handed back from a helper
+  ].forEach(function (pattern) {
+    assert.ok(!pattern.test(SOURCE), "must not use localStorage (" + pattern + ")");
+  });
   assert.ok(!/\bindexedDB\b/i.test(SOURCE), "must not use indexedDB");
+  assert.ok(!/document\s*\.\s*cookie/.test(SOURCE), "must not use cookies");
+});
+
+test("the only thing ever written to storage is the gate's session key", () => {
+  // The transcript and the language choice stay in memory: a widget that quietly started
+  // persisting a student's questions would pass every other test in this file.
+  var writes = SOURCE.match(/\.setItem\(\s*([A-Za-z_$][\w$]*|"[^"]*")/g) || [];
+  assert.strictEqual(writes.length, 1, "exactly one setItem call in the whole widget");
+  assert.ok(/AUTH_STORAGE_KEY/.test(writes[0]), "and it writes the auth session key");
+  assert.strictEqual(widget.AUTH_STORAGE_KEY, "gavilan-chatbot-session");
 });
 
 test("source never uses unsafe HTML sinks (innerHTML/outerHTML/document.write/insertAdjacentHTML)", () => {
@@ -456,6 +479,7 @@ function makeEl(tagName) {
     return c;
   };
   el.setAttribute = function (k, v) { el.attrs[k] = String(v); };
+  el.removeAttribute = function (k) { delete el.attrs[k]; };
   el.getAttribute = function (k) {
     return Object.prototype.hasOwnProperty.call(el.attrs, k) ? el.attrs[k] : null;
   };
@@ -1699,9 +1723,9 @@ test("suggestions disappear after a typed message and do not come back", async (
 // the tree, text inside the status region, focus that cannot leave an open panel.
 
 // The shared DOM fake predates these behaviours: focus containment needs
-// querySelectorAll + closest, the document-level Escape needs addEventListener on the
-// document, and the first-launch description needs removeAttribute. This augments a
-// fake doc for the tests below rather than changing the fake the rest of the file uses.
+// querySelectorAll + closest, and the document-level Escape needs addEventListener on the
+// document. This augments a fake doc for the tests below rather than changing the fake the
+// rest of the file uses.
 function matchesFocusable(el, sel) {
   var tag = String(el.tagName || "").toLowerCase();
   var m = /^([a-z]+):not\(\[disabled\]\)$/.exec(sel);
@@ -1715,7 +1739,6 @@ function matchesFocusable(el, sel) {
 }
 
 function augmentEl(el, doc) {
-  el.removeAttribute = function (k) { delete el.attrs[k]; };
   el.focus = function () { doc.focused = el; };
   el.querySelectorAll = function (selector) {
     var parts = selector.split(",").map(function (s) { return s.trim(); });
@@ -2149,13 +2172,46 @@ test("the error palette that now renders still passes 4.5:1 (1.4.3)", () => {
 // a body, that the password is never kept, and that a person who cannot send anything is not
 // shown controls that pretend otherwise.
 
-// Like withNetwork, but with a real attribute map on the script tag and a fetch that can tell
-// the Cognito call apart from the /query call.
-function withGate(attrs, fetchImpl) {
+// A sessionStorage stand-in. Node has no Web Storage, so the widget's `typeof sessionStorage`
+// guard reads as "unavailable" unless a test puts one here - which also means every test that
+// does NOT install one is exercising the storage-blocked path for free.
+function makeStore(seed) {
+  var data = {};
+  if (seed !== undefined && seed !== null) {
+    data[widget.AUTH_STORAGE_KEY] = typeof seed === "string" ? seed : JSON.stringify(seed);
+  }
+  return {
+    getItem: function (k) {
+      return Object.prototype.hasOwnProperty.call(data, k) ? data[k] : null;
+    },
+    setItem: function (k, v) { data[k] = String(v); },
+    removeItem: function (k) { delete data[k]; },
+    keys: function () { return Object.keys(data); },
+    dump: function () { return JSON.stringify(data); }
+  };
+}
+
+// What a previous page load in this tab would have left behind.
+function storedSession(token, msFromNow, clientId) {
+  return {
+    clientId: clientId === undefined ? GATE_ATTRS["data-client-id"] : clientId,
+    accessToken: token,
+    expiresAt: Date.now() + msFromNow
+  };
+}
+
+// Like withNetwork, but with a real attribute map on the script tag, a fetch that can tell the
+// Cognito call apart from the /query call, and a sessionStorage stub. `store` is the stub
+// itself when the caller wants a custom one (e.g. one that throws); anything else is seeded as
+// the stored session record, and `undefined` means an empty store.
+function withGate(attrs, fetchImpl, store) {
   var priorDoc = global.document;
   var priorFetch = global.fetch;
+  var priorStore = global.sessionStorage;
   var priorErr = console.error;
   var calls = [];
+  var storage = store && typeof store.getItem === "function" ? store : makeStore(store);
+  global.sessionStorage = storage;
   global.document = {
     querySelector: function () {
       return {
@@ -2172,6 +2228,7 @@ function withGate(attrs, fetchImpl) {
   console.error = function () {};
   return {
     calls: calls,
+    store: storage,
     cognito: function () {
       return calls.filter(function (c) { return /cognito-idp/.test(c.url); });
     },
@@ -2179,10 +2236,13 @@ function withGate(attrs, fetchImpl) {
       return calls.filter(function (c) { return /\/query$/.test(c.url); });
     },
     restore: function () {
+      // Sign out BEFORE the stubs come down, or the token stays in a store nobody can reach and
+      // the next test inherits a signed-in module.
+      widget.signOut();
       global.document = priorDoc;
       global.fetch = priorFetch;
+      global.sessionStorage = priorStore;
       console.error = priorErr;
-      widget.signOut();
     }
   };
 }
@@ -2433,32 +2493,347 @@ test("an expired token is caught before the request, not read off a 401", async 
   }
 });
 
-test("the widget keeps no token or password anywhere a reload could find it", () => {
-  // The storage scan above covers the API surface; this covers the handle. Nothing the widget
-  // exposes can read a token back out, so nothing downstream can persist one by accident.
+test("nothing exposed can read the token back out, and the refresh token is never read", () => {
+  // The API surface is deliberately actions only: sign in, ask whether we are signed in, sign
+  // out. Nothing downstream can copy the token somewhere longer-lived by accident.
   assert.ok(!("accessToken" in widget), "no token getter is exported");
   assert.ok(!("session" in widget), "no session object is exported");
   assert.ok(typeof widget.signedIn === "function" && typeof widget.signOut === "function");
-  // The refresh token is fetched and dropped: it appears nowhere in the source.
+  // Cognito hands back a refresh token; the widget never reads it, so the stored record cannot
+  // outlive the one day the access token was minted for.
   assert.ok(!/RefreshToken/.test(SOURCE), "the refresh token is never read");
+});
+
+// --- the session survives a reload (D-20260803-1) ------------------------
+//
+// "Reload" here is: memory empty, storage kept - which is exactly what a fresh page load looks
+// like to this module. Seeding the stub and NOT signing in is therefore the real thing, not an
+// approximation of it.
+
+test("signing in writes the token to sessionStorage - and only what a reload needs", async () => {
+  var g = withGate(GATE_ATTRS, routeGate(cognitoOk("STORED-TOKEN"), { answer: "hi", sources: [] }, []));
+  try {
+    await widget.signIn("gavtesting", "hunter2-correct-horse");
+    assert.deepStrictEqual(g.store.keys(), [widget.AUTH_STORAGE_KEY], "one key, namespaced");
+    var saved = JSON.parse(g.store.getItem(widget.AUTH_STORAGE_KEY));
+    assert.deepStrictEqual(
+      Object.keys(saved).sort(),
+      ["accessToken", "clientId", "expiresAt"],
+      "three fields and no more"
+    );
+    assert.strictEqual(saved.accessToken, "STORED-TOKEN");
+    assert.strictEqual(saved.clientId, "testclientid123");
+    assert.ok(saved.expiresAt > Date.now(), "with an absolute expiry, not a duration");
+    // The credentials are not part of "what a reload needs".
+    var dump = g.store.dump();
+    assert.ok(!/hunter2/.test(dump), "the password is not stored");
+    assert.ok(!/gavtesting/.test(dump), "nor the username");
+    assert.ok(!/refresh-token/.test(dump), "nor the refresh token");
+  } finally {
+    g.restore();
+  }
+});
+
+test("a reload with a live stored token goes straight to the composer, signing in again for nothing", async () => {
+  var seen = [];
+  widget.signOut(); // memory empty, as it is on a fresh page load
+  var g = withGate(
+    GATE_ATTRS,
+    routeGate(cognitoOk("SHOULD-NOT-BE-CALLED"), { answer: "Open 9-5.", sources: [] }, seen),
+    storedSession("RELOADED-TOKEN", 20 * 60 * 60 * 1000)
+  );
+  try {
+    assert.strictEqual(widget.signedIn(), true, "the stored session is picked up");
+
+    var doc = makeFocusDoc();
+    var handle = widget.mount(doc);
+    assert.strictEqual(findByClass(handle.shadow, "signin-overlay"), null, "no overlay");
+    assert.strictEqual(findByClass(handle.shadow, "composer").hidden, false, "the composer is live");
+    assert.ok(findByClass(handle.shadow, "suggestions"), "and the starter questions are real offers");
+
+    handle.submit("hours?");
+    await flush();
+    assert.strictEqual(seen.length, 1, "the question went out");
+    assert.strictEqual(seen[0].headers.Authorization, "Bearer RELOADED-TOKEN", "on the stored token");
+    assert.strictEqual(g.cognito().length, 0, "and nobody was made to sign in again");
+  } finally {
+    g.restore();
+  }
+});
+
+test("a stored token past its expiry draws the overlay, and is dropped rather than sent", async () => {
+  // The case nobody hits by hand: you signed in yesterday, the tab is still open, you reload.
+  // Restoring it blindly would send a request the widget already knows is doomed - and a
+  // browser cannot read the 401 that comes back (no CORS headers on an authorizer rejection),
+  // so it would surface as "couldn't reach the assistant" rather than "sign in again".
+  widget.signOut();
+  var g = withGate(
+    GATE_ATTRS,
+    function () { return Promise.reject(new Error("no call expected")); },
+    storedSession("YESTERDAYS-TOKEN", -1000)
+  );
+  try {
+    assert.strictEqual(widget.signedIn(), false, "an expired record is not a session");
+    assert.deepStrictEqual(g.store.keys(), [], "and it is removed, not left readable");
+
+    var doc = makeFocusDoc();
+    var handle = widget.mount(doc);
+    var overlay = findByClass(handle.shadow, "signin-overlay");
+    assert.ok(overlay, "the overlay draws");
+    assert.strictEqual(findByClass(handle.shadow, "composer").hidden, true);
+    assert.strictEqual(findByClass(handle.shadow, "suggestions"), null, "no dead buttons");
+
+    handle.submit("hours?");
+    await flush();
+    assert.strictEqual(g.calls.length, 0, "no request was fired on the dead token");
+  } finally {
+    g.restore();
+  }
+});
+
+test("a stored token that expires while the tab sits open stops being one, and clears itself", async () => {
+  widget.signOut();
+  var g = withGate(
+    GATE_ATTRS,
+    function () { return Promise.reject(new Error("no call expected")); },
+    storedSession("HALF-A-SECOND", 500)
+  );
+  try {
+    assert.strictEqual(widget.signedIn(), true);
+    await sleep(700);
+    assert.strictEqual(widget.signedIn(), false, "expiry is re-checked, not read once at load");
+    assert.deepStrictEqual(g.store.keys(), [], "and the dead record is removed");
+  } finally {
+    g.restore();
+  }
+});
+
+test("a record the widget cannot trust is dropped rather than used", () => {
+  // Each of these would otherwise wedge the tab: the sign-in form is hidden while `signedIn()`
+  // is true, so a bad record that reads as a session is a panel that can only fail.
+  var bad = {
+    "not JSON at all": "{{{",
+    "no token": JSON.stringify({ clientId: "testclientid123", expiresAt: Date.now() + 60000 }),
+    "a token that is not a string": JSON.stringify(
+      storedSession(12345, 60000)
+    ),
+    "an expiry that is not a number": JSON.stringify({
+      clientId: "testclientid123", accessToken: "T", expiresAt: "tomorrow"
+    }),
+    // The embed was repointed at a different app client: the old token cannot satisfy the new
+    // authorizer, so signing in again is the only correct outcome.
+    "a token for another app client": JSON.stringify(
+      storedSession("OTHER-POOLS-TOKEN", 60000, "some-other-client")
+    )
+  };
+  Object.keys(bad).forEach(function (label) {
+    widget.signOut();
+    var g = withGate(GATE_ATTRS, function () { return Promise.reject(new Error("x")); }, bad[label]);
+    try {
+      assert.strictEqual(widget.signedIn(), false, label + " must not read as a session");
+      assert.deepStrictEqual(g.store.keys(), [], label + " must be cleared out");
+    } finally {
+      g.restore();
+    }
+  });
+});
+
+test("a readable 401 clears storage too, so a reload cannot resurrect a refused token", async () => {
+  var g = withGate(GATE_ATTRS, function (url) {
+    if (/cognito-idp/.test(url)) return Promise.resolve(cognitoOk("DOOMED-TOKEN"));
+    return Promise.resolve({ ok: false, status: 401, json: function () { return Promise.resolve({}); } });
+  });
+  try {
+    await widget.signIn("gavtesting", "pw");
+    assert.deepStrictEqual(g.store.keys(), [widget.AUTH_STORAGE_KEY], "stored on the way in");
+    var err = null;
+    try {
+      await widget.sendQuery([{ role: "user", content: "hours?" }]);
+    } catch (e) {
+      err = e;
+    }
+    assert.strictEqual(err && err.reason, "expired");
+    assert.strictEqual(widget.signedIn(), false);
+    assert.deepStrictEqual(g.store.keys(), [], "nothing readable is left behind");
+  } finally {
+    g.restore();
+  }
+});
+
+test("a failed sign-in leaves nothing in storage, including from an earlier attempt", async () => {
+  var stage = { deny: false };
+  var g = withGate(GATE_ATTRS, function (url) {
+    if (!/cognito-idp/.test(url)) return Promise.reject(new Error("no query expected"));
+    if (stage.deny) {
+      return Promise.resolve({
+        ok: false,
+        json: function () { return Promise.resolve({ __type: "NotAuthorizedException" }); }
+      });
+    }
+    return Promise.resolve(cognitoOk("FIRST-TOKEN"));
+  });
+  try {
+    await widget.signIn("gavtesting", "right");
+    assert.deepStrictEqual(g.store.keys(), [widget.AUTH_STORAGE_KEY]);
+    stage.deny = true;
+    var err = null;
+    try {
+      await widget.signIn("gavtesting", "wrong");
+    } catch (e) {
+      err = e;
+    }
+    assert.strictEqual(err && err.reason, "credentials");
+    assert.strictEqual(widget.signedIn(), false);
+    assert.deepStrictEqual(g.store.keys(), [], "the earlier token does not survive a failed attempt");
+  } finally {
+    g.restore();
+  }
+});
+
+test("blocked storage degrades to the memory-only gate rather than failing to sign in", async () => {
+  // Safari's private mode and a sandboxed iframe both throw on the storage access itself, which
+  // is why the widget guards the lookup and not just the write. The cost of it is the old
+  // behaviour - a reload signs in again - and nothing worse.
+  var hostile = {
+    getItem: function () { throw new Error("SecurityError"); },
+    setItem: function () { throw new Error("QuotaExceededError"); },
+    removeItem: function () { throw new Error("SecurityError"); },
+    keys: function () { return []; }
+  };
+  var seen = [];
+  var g = withGate(GATE_ATTRS, routeGate(cognitoOk("MEMORY-ONLY"), { answer: "hi", sources: [] }, seen), hostile);
+  try {
+    var ok = await widget.signIn("gavtesting", "pw");
+    assert.strictEqual(ok, true, "the sign-in still succeeds");
+    assert.strictEqual(widget.signedIn(), true);
+    await widget.sendQuery([{ role: "user", content: "hours?" }]);
+    assert.strictEqual(seen[0].headers.Authorization, "Bearer MEMORY-ONLY");
+  } finally {
+    g.restore();
+  }
+});
+
+test("an ungated embed never touches storage: same request, header and all", async () => {
+  var seen = [];
+  widget.signOut();
+  var g = withGate(
+    { "data-api-url": "https://api.test/query" },
+    routeGate(null, { answer: "hi", sources: [] }, seen),
+    storedSession("LEFTOVER-FROM-A-GATED-EMBED", 60 * 60 * 1000, "testclientid123")
+  );
+  try {
+    assert.strictEqual(widget.signedIn(), false, "no gate means no session, whatever is stored");
+    await widget.sendQuery([{ role: "user", content: "hours?" }]);
+    assert.deepStrictEqual(seen[0].headers, { "Content-Type": "application/json" });
+    assert.deepStrictEqual(g.store.keys(), [widget.AUTH_STORAGE_KEY], "and it left the key alone");
+  } finally {
+    g.restore();
+  }
 });
 
 // --- the panel while gated ----------------------------------------------
 
-test("a gated, signed-out panel shows sign-in in the composer's place and offers no dead buttons", () => {
+test("a gated, signed-out panel puts the overlay over its own body and offers no dead buttons", () => {
   var g = withGate(GATE_ATTRS, function () { return Promise.reject(new Error("x")); });
   try {
     var doc = makeDoc();
     var handle = widget.mount(doc);
-    var signin = findByClass(handle.shadow, "signin");
+    var overlay = findByClass(handle.shadow, "signin-overlay");
     var composer = findByClass(handle.shadow, "composer");
-    assert.ok(signin, "the sign-in form is in the panel");
-    assert.strictEqual(signin.hidden, false, "and it is the one on screen");
-    assert.strictEqual(composer.hidden, true, "the composer is not");
-    // The greeting still shows - it is what says WHAT you are signing in for - but the starter
-    // questions do not, because each is a button that would submit nothing.
-    assert.ok(/Gavilan College Library assistant/.test(allText(handle.shadow)), "greeting is present");
+    var thread = findByClass(handle.shadow, "thread");
+    assert.ok(overlay, "the overlay is up");
+    assert.ok(findByClass(overlay, "signin"), "and it carries the sign-in form");
+    // Over the PANEL'S BODY and nothing wider. This widget is a guest on somebody else's
+    // page, so the covered region stops at the panel: no host-page scrim, ever.
+    assert.strictEqual(overlay.parentNode.className, "panel__body", "scoped to the panel body");
+    assert.strictEqual(composer.hidden, true, "the composer is out of reach beneath it");
+    // What the overlay covers cannot be read or acted on, so it is not narrated either.
+    assert.strictEqual(thread.getAttribute("aria-hidden"), "true");
+    // The starter questions do not show, because each is a button that would submit nothing.
     assert.strictEqual(findByClass(handle.shadow, "suggestions"), null, "no starter questions yet");
+  } finally {
+    g.restore();
+  }
+});
+
+test("hiding the composer actually hides it: its class display does not beat the attribute", () => {
+  // `hidden` is a UA `display: none`, which a class-level `display: flex` outranks. The panel
+  // and the launcher always carried the override; the composer did not, so `form.hidden = true`
+  // took it out of the tab order and left it painted - a dead text box under the gate.
+  var flat = SOURCE.replace(/\n/g, " ");
+  var m = /([^"]*)\[hidden\][^{]*\{ display: none !important; \}/.exec(flat);
+  assert.ok(m, "there is a [hidden] display override rule");
+  var rule = m[0];
+  ["\\.panel\\[hidden\\]", "\\.launcher\\[hidden\\]", "\\.composer\\[hidden\\]"].forEach(function (sel) {
+    assert.ok(new RegExp(sel).test(rule), sel.replace(/\\/g, "") + " is covered by it");
+  });
+});
+
+test("while the overlay is up, Tab reaches the header and the overlay and nothing else", async () => {
+  var g = withGate(GATE_ATTRS, routeGate(cognitoOk("TOKEN-TRAP"), { answer: "hi", sources: [] }, []));
+  try {
+    var doc = makeFocusDoc();
+    var handle = widget.mount(doc);
+    var panel = findByClass(handle.shadow, "panel");
+    var fields = findAll(handle.shadow, "signin__input");
+
+    // Opening puts focus INTO the overlay rather than on a composer nobody can use.
+    handle.open();
+    assert.strictEqual(doc.focused, fields[0], "focus lands in the username field");
+
+    // The last thing in the cycle is the overlay's submit button, and Tab there wraps back to
+    // the header's language control - it does not fall through to the composer or the thread.
+    var firstLang = findAll(handle.shadow, "header__lang-btn")[0];
+    var submit = findByClass(handle.shadow, "signin__submit");
+    function tab(shift) {
+      var ev = { key: "Tab", shiftKey: !!shift, preventDefault: function () { ev.prevented = true; } };
+      panel.fire("keydown", ev);
+      return ev;
+    }
+    handle.shadow.activeElement = submit;
+    doc.focused = null;
+    assert.ok(tab().prevented, "Tab at the submit button is intercepted");
+    assert.strictEqual(doc.focused, firstLang, "...and wraps to the language control");
+
+    // Shift+Tab from the header's first control wraps to the overlay's last, so the cycle is
+    // exactly [header, overlay]. The language buttons being IN it is the point: the sign-in
+    // prompt has to be readable in Spanish before anyone signs in.
+    handle.shadow.activeElement = firstLang;
+    doc.focused = null;
+    assert.ok(tab(true).prevented);
+    assert.strictEqual(doc.focused, submit, "the cycle ends at the overlay, not at Send");
+
+    // Signing in hands the whole panel back.
+    fields[0].value = "gavtesting";
+    fields[1].value = "pw";
+    handle.signInForm.fire("submit");
+    await new Promise(function (r) { setTimeout(r, 0); });
+    handle.shadow.activeElement = findByClass(handle.shadow, "composer__send");
+    doc.focused = null;
+    assert.ok(tab().prevented);
+    assert.strictEqual(doc.focused, firstLang, "Send is the last edge again");
+  } finally {
+    g.restore();
+  }
+});
+
+test("Escape does not dismiss the overlay - it closes the panel, and the gate is still there", () => {
+  var g = withGate(GATE_ATTRS, function () { return Promise.reject(new Error("x")); });
+  try {
+    var doc = makeFocusDoc();
+    var handle = widget.mount(doc);
+    var panel = findByClass(handle.shadow, "panel");
+    handle.open();
+    panel.fire("keydown", { key: "Escape" });
+    assert.strictEqual(panel.hidden, true, "Escape closes the panel");
+    // Nothing behind the overlay is usable, so there is no state where the panel is open and
+    // the overlay is gone. Reopening returns to the same gate, with focus back inside it.
+    assert.ok(findByClass(handle.shadow, "signin-overlay"), "the overlay was not dismissed");
+    doc.focused = null;
+    handle.open();
+    assert.strictEqual(panel.hidden, false);
+    assert.ok(findByClass(handle.shadow, "signin-overlay"), "still gated");
+    assert.strictEqual(doc.focused, findAll(handle.shadow, "signin__input")[0]);
   } finally {
     g.restore();
   }
@@ -2495,10 +2870,10 @@ test("the sign-in fields are real labelled inputs, typed, and reachable by keybo
   }
 });
 
-test("signing in swaps the form for the composer and releases the starter questions", async () => {
+test("signing in leaves no trace of the gate and puts focus in the composer", async () => {
   var g = withGate(GATE_ATTRS, routeGate(cognitoOk("TOKEN-A"), { answer: "hi", sources: [] }, []));
   try {
-    var doc = makeDoc();
+    var doc = makeFocusDoc();
     var handle = widget.mount(doc);
     var fields = findAll(handle.shadow, "signin__input");
     fields[0].value = "gavtesting";
@@ -2507,12 +2882,94 @@ test("signing in swaps the form for the composer and releases the starter questi
     await new Promise(function (r) { setTimeout(r, 0); });
 
     assert.strictEqual(widget.signedIn(), true);
-    assert.strictEqual(findByClass(handle.shadow, "signin").hidden, true);
+    // REMOVED, not hidden: nothing on screen and nothing in the tree says there was a gate.
+    assert.strictEqual(findByClass(handle.shadow, "signin-overlay"), null, "the overlay is gone");
+    assert.strictEqual(findByClass(handle.shadow, "signin"), null, "and so is the form inside it");
     assert.strictEqual(findByClass(handle.shadow, "composer").hidden, false);
+    assert.strictEqual(
+      findByClass(handle.shadow, "thread").getAttribute("aria-hidden"), null,
+      "the transcript is narrated again"
+    );
+    assert.strictEqual(doc.focused, findByClass(handle.shadow, "composer__input"), "focus lands on the composer");
     assert.ok(findByClass(handle.shadow, "suggestions"), "the starter questions arrive with the session");
     // The password is cleared from the DOM the moment it is no longer needed.
     assert.strictEqual(fields[1].value, "", "the password field is emptied");
     assert.strictEqual(fields[0].value, "gavtesting", "the username is not, so nobody retypes it");
+  } finally {
+    g.restore();
+  }
+});
+
+test("a 401 mid-conversation brings the overlay back, with a reason", async () => {
+  // The readable-401 path. In a browser it is mostly unreachable (an authorizer rejection
+  // carries no CORS headers), which is why the expiry check below exists too - but this is
+  // the branch that fires wherever the status IS readable.
+  var stage = { rejecting: false };
+  var g = withGate(GATE_ATTRS, function (url) {
+    if (/cognito-idp/.test(url)) return Promise.resolve(cognitoOk("TOKEN-401"));
+    if (stage.rejecting) return Promise.resolve({ ok: false, status: 401, json: function () { return Promise.resolve({}); } });
+    return Promise.resolve({ ok: true, json: function () { return Promise.resolve({ answer: "Open 9-5.", sources: [] }); } });
+  });
+  try {
+    var doc = makeFocusDoc();
+    var handle = widget.mount(doc);
+    var fields = findAll(handle.shadow, "signin__input");
+    fields[0].value = "gavtesting";
+    fields[1].value = "pw";
+    handle.signInForm.fire("submit");
+    await flush();
+    handle.submit("hours?");
+    await flush();
+    assert.strictEqual(findByClass(handle.shadow, "signin-overlay"), null, "signed in, no gate");
+
+    stage.rejecting = true;
+    doc.focused = null;
+    handle.submit("and tomorrow?");
+    await flush();
+
+    assert.strictEqual(widget.signedIn(), false, "the dead token was dropped");
+    var overlay = findByClass(handle.shadow, "signin-overlay");
+    assert.ok(overlay, "the overlay is back over the transcript");
+    assert.strictEqual(findByClass(handle.shadow, "composer").hidden, true);
+    assert.strictEqual(
+      findByClass(overlay, "signin__error").textContent, widget.STRINGS.en.signInExpired,
+      "and it says why, rather than reappearing unexplained"
+    );
+    // The password field, not the username: the name is still filled in from the first
+    // sign-in, and the password is the only thing this person has to type again.
+    assert.strictEqual(doc.focused, findAll(handle.shadow, "signin__input")[1], "focus is in the overlay");
+  } finally {
+    g.restore();
+  }
+});
+
+test("a token the widget already knows is expired brings the overlay back before any request", async () => {
+  var seen = [];
+  // 60.5s, minus the 60s safety margin, is half a second of validity: enough for the first
+  // question, gone by the second. Expiry is tracked locally precisely so the second question
+  // is never sent - a browser cannot read the 401 it would come back as.
+  var g = withGate(GATE_ATTRS, routeGate(cognitoOk("SHORT", 60.5), { answer: "Open 9-5.", sources: [] }, seen));
+  try {
+    var doc = makeFocusDoc();
+    var handle = widget.mount(doc);
+    var fields = findAll(handle.shadow, "signin__input");
+    fields[0].value = "gavtesting";
+    fields[1].value = "pw";
+    handle.signInForm.fire("submit");
+    await flush();
+    handle.submit("hours?");
+    await flush();
+    assert.strictEqual(seen.length, 1, "the first question went out");
+    assert.strictEqual(findByClass(handle.shadow, "signin-overlay"), null);
+
+    await sleep(700);
+    handle.submit("and tomorrow?");
+    await flush();
+
+    assert.strictEqual(seen.length, 1, "no doomed request was sent");
+    var overlay = findByClass(handle.shadow, "signin-overlay");
+    assert.ok(overlay, "the overlay is back");
+    assert.strictEqual(findByClass(overlay, "signin__error").textContent, widget.STRINGS.en.signInExpired);
   } finally {
     g.restore();
   }
@@ -2534,7 +2991,7 @@ test("a rejected sign-in says so, clears the password, and stays gated", async (
     assert.strictEqual(err.hidden, false, "the alert is shown");
     assert.strictEqual(err.textContent, widget.STRINGS.en.signInFailed);
     assert.strictEqual(fields[1].value, "", "the password does not sit in the form for the next person");
-    assert.strictEqual(findByClass(handle.shadow, "signin").hidden, false, "still gated");
+    assert.ok(findByClass(handle.shadow, "signin-overlay"), "still gated: the overlay stays up");
     assert.strictEqual(findByClass(handle.shadow, "composer").hidden, true);
     assert.strictEqual(findByClass(handle.shadow, "suggestions"), null, "still no dead buttons");
   } finally {
