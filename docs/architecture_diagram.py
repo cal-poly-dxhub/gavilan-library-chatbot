@@ -27,16 +27,17 @@ app/handler.py, scraper/):
     live catalog tools search_book_catalog + search_course_reserves, which call the EXTERNAL Ex
     Libris Primo discovery API directly (a search plus a per-record availability/delivery call).
     So the query Lambda now reaches a third party on the hot path - it is no longer fully
-    AWS-internal; each Primo call is timed out and soft-fails. The output guardrail is attached
-    to every Converse call.
+    AWS-internal; each Primo call is timed out and soft-fails. NO guardrail is attached to the
+    Converse call - the answer is screened by nothing but the system prompt.
   - Widget delivery: private S3 bucket (widget.js) fronted by a CloudFront distribution with
     an OAC-secured origin, built in the SAME stack. Separate concern from the query path:
     CloudFront + S3 deliver the widget CODE to the browser; the injected widget then uses the
     API Gateway query path.
 
-Bedrock Guardrails is a real current component (content filters + PII), screening the input
-before the loop and the output on every Converse call. WAF is NOT deployed today, so it
-alone remains in the "Planned" group.
+Bedrock Guardrails is a real current component, but a deliberately narrow one: ONE guardrail
+screening the INPUT for PROMPT_ATTACK before the loop, with no other content filter, no PII
+policy, and nothing attached to Converse. WAF is NOT deployed today, so it alone remains in
+the "Planned" group.
 """
 
 import os
@@ -85,7 +86,7 @@ with Diagram(
         widget = Client("Chat widget\n(embedded JS,\ninjected into page)")
         api = APIGateway("API Gateway\nHTTP API v2\nPOST /query")
         query_fn = Lambda("Lambda (python3.13)\nagentic Converse\ntool-use loop")
-        guardrails = Shield("Bedrock\nGuardrails\n(content + PII)")
+        guardrails = Shield("Bedrock Guardrail\ninput screen\n(PROMPT_ATTACK only)")
         claude = Bedrock("Claude Sonnet 4.6\n(Converse)\ngeneration")
 
     # Widget CODE delivery. SEPARATE concern from the query flow: CloudFront + S3 ship
@@ -119,9 +120,10 @@ with Diagram(
     # path (search + a per-record availability/delivery call), timed out and soft-failing.
     query_fn >> Edge(color="darkblue", style="dashed", label="search_book_catalog\n(Primo search + availability)") >> primo_api
     query_fn >> Edge(color="darkblue", style="dashed", label="search_course_reserves\n(Primo search + availability)") >> primo_api
-    # Generation is screened by Bedrock Guardrails on every Converse call in the loop.
-    query_fn >> Edge(style="dashed", label="Converse\n(each loop turn)") >> guardrails
-    guardrails >> Edge(style="dashed", dir="both", label="screen input\n+ output") >> claude
+    # The guardrail screens the QUESTION once, before the loop starts. Generation itself is
+    # unscreened: the Converse call carries no guardrailConfig.
+    query_fn >> Edge(style="dashed", label="ApplyGuardrail\n(source=INPUT, once)") >> guardrails
+    query_fn >> Edge(style="dashed", dir="both", label="Converse\n(each loop turn)") >> claude
 
     # --- Response back to the user ---
     query_fn >> Edge(color="darkgreen", style="dotted", label="{answer, sources}\n(via API GW + widget)") >> student

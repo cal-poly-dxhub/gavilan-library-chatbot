@@ -670,8 +670,9 @@
         var outTok = Q.output_tokens_avg;
         var model = inTok / 1e6 * R.generation_input_per_1m +
                     outTok / 1e6 * R.generation_output_per_1m;
-        var guard = Q.guardrail_content_units_avg / 1000 * R.guardrail_content_per_1k_units +
-                    Q.guardrail_pii_units_avg / 1000 * R.guardrail_pii_per_1k_units;
+        // One content-filter screen on the question. There is no PII policy and no
+        // answer-side guardrail, so this is the whole guardrail line.
+        var guard = Q.guardrail_content_units_avg / 1000 * R.guardrail_content_per_1k_units;
         var retrieval = Q.retrievals_avg *
                         (R.vector_query_per_1m / 1e6 +
                          Q.retrieval_query_tokens / 1e6 * R.embedding_per_1m);
@@ -713,13 +714,12 @@
       // Accrues from the widget's usage events, which the embed below opts
       // into. Priced with the SAME rate table as the estimator, so the two
       // halves of this panel can never disagree.
-      var sess = { q: 0, calls: 0, inTok: 0, outTok: 0, grContent: 0, grPii: 0, retr: 0 };
+      var sess = { q: 0, calls: 0, inTok: 0, outTok: 0, grContent: 0, retr: 0 };
 
       function sessionCost() {
         return sess.inTok / 1e6 * R.generation_input_per_1m +
                sess.outTok / 1e6 * R.generation_output_per_1m +
                sess.grContent / 1000 * R.guardrail_content_per_1k_units +
-               sess.grPii / 1000 * R.guardrail_pii_per_1k_units +
                sess.retr * (R.vector_query_per_1m / 1e6 +
                             Q.retrieval_query_tokens / 1e6 * R.embedding_per_1m) +
                sess.q * (R.api_requests_per_1m / 1e6 + R.lambda_per_1m_requests / 1e6 +
@@ -733,7 +733,7 @@
         $("sess-calls").textContent = num(sess.calls);
         $("sess-in").textContent = num(sess.inTok);
         $("sess-out").textContent = num(sess.outTok);
-        $("sess-gr").textContent = num(sess.grContent + sess.grPii);
+        $("sess-gr").textContent = num(sess.grContent);
         $("sess-per").textContent = sess.q ? money(total / sess.q, 4) : "-";
         if (sess.q) {
           $("sess-sub").textContent =
@@ -758,9 +758,6 @@
         sess.outTok += u.output_tokens || 0;
         sess.retr += u.retrievals || 0;
         sess.grContent += g.content_policy_units || 0;
-        sess.grPii += Math.max(
-          (g.sensitive_information_policy_units || 0) -
-          (g.sensitive_information_policy_free_units || 0), 0);
         renderSession();
       });
 

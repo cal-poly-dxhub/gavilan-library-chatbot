@@ -3,11 +3,14 @@
 Fronted by an API Gateway HTTP API (payload format 2.0) with two routes on this one Lambda:
   - POST /query -> the real query path (_handle_query):
       0. _apply_input_guardrail() -> Bedrock `ApplyGuardrail` (source=INPUT) on the BARE
-         user query.
+         user query. It screens for PROMPT_ATTACK and nothing else: a block is an injection
+         attempt, and everything else about how this bot answers - including how it handles
+         a student in crisis - is the system prompt's job, because the screen runs first and
+         would otherwise pre-empt it.
       1. run_agent() -> an AGENTIC Bedrock Converse tool-use loop under the real system
-         prompt (app/system_prompt.md), with the OUTPUT guardrail (content filters, answer
-         side only) attached to every Converse call as a backstop. The model is given FOUR
-         tools: `search_library_info` (KB `Retrieve`), `database_catalog` (authoritative
+         prompt (app/system_prompt.md). NO guardrail is attached to the Converse call: the
+         output guardrail was removed, so nothing screens or rewrites the answer. The model
+         is given FOUR tools: `search_library_info` (KB `Retrieve`), `database_catalog` (authoritative
          research-database lookup from static JSON), `search_book_catalog` (a LIVE search of
          the Primo book/media catalog), and `search_course_reserves` (a LIVE search of the
          Primo course-reserves scope) - the two live catalog tools return evidence the
@@ -58,10 +61,10 @@ Wiring comes from env vars set by the CDK stack.
     only - retrieval, the tools, and the knowledge base are untouched. See _extract_language.
   - When the request sets `include_usage: true`, the response also carries a `usage`
     object: the BILLABLE units this one question consumed, summed across the whole agent
-    loop (every Converse call, the input guardrail screen, the output backstop on each
-    turn, and each KB retrieval). See _new_usage() for the shape and why each field is
-    there. The demo page's cost meter is the only client that asks for it; the widget
-    never does, so a student's response is byte-identical to what it was before.
+    loop (every Converse call, the one input guardrail screen, and each KB retrieval). See
+    _new_usage() for the shape and why each field is there. The demo page's cost meter is
+    the only client that asks for it; the widget never does, so a student's response is
+    byte-identical to what it was before.
 """
 
 import base64
@@ -102,28 +105,24 @@ MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "10"))
 # The only conversation roles accepted from the client. A widget "bot" turn maps to "assistant".
 _VALID_ROLES = ("user", "assistant")
 
-# Two Bedrock guardrails, set by the CDK stack from config.yaml. Either pair may be unset
-# locally, in which case that screen is skipped rather than failing:
-#   INPUT  - screened on the bare user query BEFORE retrieval via the ApplyGuardrail API
-#            (source=INPUT). PII is masked-and-proceeds; content/prompt-attack is blocked.
-#   OUTPUT - attached to the Converse call as a backstop on the generated answer only.
+# ONE Bedrock guardrail, set by the CDK stack from config.yaml. It may be unset locally, in
+# which case the screen is skipped rather than failing.
+#
+# It runs on the bare user query BEFORE the loop via the ApplyGuardrail API (source=INPUT)
+# and screens PROMPT_ATTACK ONLY. There is no output guardrail: nothing is attached to
+# Converse, so nothing screens, blocks or rewrites the generated answer. And there is no PII
+# policy, so the query the model sees is the query the student typed - a screen that
+# anonymized it would hand the model {NAME} and {ADDRESS} in place of the details that make
+# an urgent message legible. The system prompt owns all of that.
 INPUT_GUARDRAIL_ID = os.environ.get("INPUT_GUARDRAIL_ID")
 INPUT_GUARDRAIL_VERSION = os.environ.get("INPUT_GUARDRAIL_VERSION")
-OUTPUT_GUARDRAIL_ID = os.environ.get("OUTPUT_GUARDRAIL_ID")
-OUTPUT_GUARDRAIL_VERSION = os.environ.get("OUTPUT_GUARDRAIL_VERSION")
-GUARDRAIL_TRACE = os.environ.get("GUARDRAIL_TRACE", "enabled")
-
-# Converse stopReason when the output guardrail blocks the generated response.
-_GUARDRAIL_STOP_REASON = "guardrail_intervened"
 
 # ApplyGuardrail response fields (verified against the installed bedrock-runtime model).
-# Top-level action is "NONE" or "GUARDRAIL_INTERVENED"; both mask and block report
-# GUARDRAIL_INTERVENED, so the mask-vs-block decision comes from the per-item action in the
-# assessment: content/topic/word policies only ever "BLOCKED"; PII entities/regexes report
-# "ANONYMIZED" when masked or "BLOCKED" when blocked.
+# Top-level action is "NONE" or "GUARDRAIL_INTERVENED". With a single content-filter policy
+# configured, an intervention can only ever be a block, so the top-level action IS the
+# decision - see _is_blocked.
 _ACTION_INTERVENED = "GUARDRAIL_INTERVENED"
 _ITEM_BLOCKED = "BLOCKED"
-_ITEM_ANONYMIZED = "ANONYMIZED"
 
 # Last-resort student-facing message if the input guardrail blocks but returns no message
 # text (documented behavior is that `outputs` carries the configured block message, so this
@@ -1253,81 +1252,39 @@ def _run_reserves_tool(tool_input):
     return result_json, source
 
 
-def _output_guardrail_config():
-    """Converse guardrailConfig for the OUTPUT backstop, or None if not wired (id + version
-    required).
-
-    This guardrail is content-filters-only with input strengths NONE and no PII policy, so
-    attaching it to Converse screens the generated answer WITHOUT touching the retrieved
-    <context> in the user message. Input screening happens separately in
-    _apply_input_guardrail(), so no guardContent tagging is needed here."""
-    if not OUTPUT_GUARDRAIL_ID or not OUTPUT_GUARDRAIL_VERSION:
-        return None
-    return {
-        "guardrailIdentifier": OUTPUT_GUARDRAIL_ID,
-        "guardrailVersion": OUTPUT_GUARDRAIL_VERSION,
-        "trace": GUARDRAIL_TRACE,
-    }
-
-
 def _guardrail_output_text(response):
-    """The text the guardrail returned in `outputs` - the masked query (on anonymize) or the
-    configured block message (on block). Empty string if absent."""
+    """The text the guardrail returned in `outputs` - the configured block message. Empty
+    string if absent."""
     for out in response.get("outputs") or []:
         if isinstance(out, dict) and out.get("text"):
             return out["text"]
     return ""
 
 
-def _classify_input_assessment(response):
-    """Reduce an ApplyGuardrail(source=INPUT) response to one decision.
+def _is_blocked(response):
+    """Did the input screen block this query?
 
-    Returns "block" if any policy hard-blocked the query (content filter, prompt attack,
-    denied topic, blocked word, or a PII entity configured to BLOCK); "mask" if the only
-    intervention was PII anonymization; "clean" if nothing intervened.
+    The guardrail carries exactly one policy - the PROMPT_ATTACK content filter - and a
+    content filter's only intervention is a block. So the top-level action is the whole
+    decision: "GUARDRAIL_INTERVENED" means a detected injection attempt, "NONE" means the
+    query passes through untouched. There is no mask case any more, because there is no PII
+    policy to anonymize anything, and no per-item scan, because there is no second policy
+    whose per-item action could disagree with the top-level one.
 
-    Both mask and block report action=GUARDRAIL_INTERVENED at the top level, so we inspect
-    the per-item actions in the assessment rather than trusting the top-level action alone."""
-    if response.get("action") != _ACTION_INTERVENED:
-        return "clean"
-
-    blocked = False
-    anonymized = False
-    for assessment in response.get("assessments") or []:
-        for f in (assessment.get("contentPolicy") or {}).get("filters", []) or []:
-            if f.get("action") == _ITEM_BLOCKED:
-                blocked = True
-        for t in (assessment.get("topicPolicy") or {}).get("topics", []) or []:
-            if t.get("action") == _ITEM_BLOCKED:
-                blocked = True
-        word_policy = assessment.get("wordPolicy") or {}
-        for w in (word_policy.get("customWords") or []) + (
-            word_policy.get("managedWordLists") or []
-        ):
-            if w.get("action") == _ITEM_BLOCKED:
-                blocked = True
-        sip = assessment.get("sensitiveInformationPolicy") or {}
-        for item in (sip.get("piiEntities") or []) + (sip.get("regexes") or []):
-            if item.get("action") == _ITEM_BLOCKED:
-                blocked = True
-            elif item.get("action") == _ITEM_ANONYMIZED:
-                anonymized = True
-
-    if blocked:
-        return "block"
-    if anonymized:
-        return "mask"
-    # Intervened but the assessment showed neither a hard block nor an anonymization. This
-    # should not happen given the model's action enums; block conservatively rather than
-    # silently forwarding a query the guardrail flagged.
-    return "block"
+    This also fails closed: an intervention we cannot explain still blocks, rather than
+    silently forwarding a query the guardrail flagged."""
+    return response.get("action") == _ACTION_INTERVENED
 
 
 def _reduce_assessments(assessments):
     """Privacy-safe summary of guardrail assessments for logging: policy/entity TYPES +
-    actions + counts only, NEVER the raw matched text (item["match"] is the very PII/content
-    the guardrail exists to keep out of plaintext logs). Shared by the input screen and the
-    output-backstop logging."""
+    actions + counts only, NEVER the raw matched text (item["match"] is the very content the
+    guardrail exists to keep out of plaintext logs).
+
+    Only the PROMPT_ATTACK content filter is configured, so in practice `content_filters` is
+    the field that is ever populated. The rest of the reduction stays because its job is to
+    strip raw text out of WHATEVER Bedrock returns - a summarizer that only knows one shape
+    would leak the first time the response carried another."""
     content_filters = []
     topics_blocked = 0
     words_blocked = 0
@@ -1357,26 +1314,10 @@ def _reduce_assessments(assessments):
     }
 
 
-def _converse_trace_assessments(trace):
-    """Collect the guardrail assessment objects out of a Converse response trace.guardrail,
-    ignoring modelOutput and any other raw-text fields. inputAssessment is a map of
-    guardrail-id -> assessment; outputAssessments is a map of guardrail-id -> list of
-    assessments (verified against the installed bedrock-runtime Converse model)."""
-    guardrail = (trace or {}).get("guardrail") or {}
-    collected = []
-    input_assessment = guardrail.get("inputAssessment")
-    if isinstance(input_assessment, dict):
-        collected.extend(a for a in input_assessment.values() if isinstance(a, dict))
-    output_assessments = guardrail.get("outputAssessments")
-    if isinstance(output_assessments, dict):
-        for entries in output_assessments.values():
-            if isinstance(entries, list):
-                collected.extend(a for a in entries if isinstance(a, dict))
-    return collected
-
-
 def _log_input_guardrail(response, decision):
-    """Structured, PII-safe log of the input-screen outcome on every request."""
+    """Structured, PII-safe log of the input-screen outcome on every request. This is the
+    only guardrail log line there is - nothing screens the output, so there is nothing to
+    log on the way back out."""
     print(
         json.dumps(
             {
@@ -1391,19 +1332,20 @@ def _log_input_guardrail(response, decision):
 
 
 def _apply_input_guardrail(query, usage=None):
-    """Screen the bare user query BEFORE retrieval via ApplyGuardrail (source=INPUT).
+    """Screen the bare user query for PROMPT_ATTACK via ApplyGuardrail (source=INPUT), before
+    the agent loop.
 
     `usage` is the optional billable-usage tally (see _new_usage). ApplyGuardrail reports the
     text units it charged in its own response, so the screen's cost is recorded here even when
     it blocks and the request never reaches Converse.
 
     Returns a (decision, text) pair:
-      ("proceed", <query>)          - clean, or PII masked; run retrieval/generation on <query>
-                                      (the masked text when PII was present, silently).
-      ("block", <blocked message>)  - content-filter / prompt-attack / PII-block hit; the
-                                      caller returns the message with no retrieval or generation.
+      ("proceed", <query>)          - nothing intervened; the query is handed to the loop
+                                      EXACTLY as the student typed it (nothing rewrites it).
+      ("block", <blocked message>)  - a detected prompt-injection attempt; the caller returns
+                                      the message with no retrieval and no generation.
 
-    If the input guardrail is not wired (local/dev), the query passes through untouched."""
+    If the guardrail is not wired (local/dev), the query passes through untouched."""
     if not INPUT_GUARDRAIL_ID or not INPUT_GUARDRAIL_VERSION:
         return "proceed", query
 
@@ -1415,17 +1357,14 @@ def _apply_input_guardrail(query, usage=None):
         # path, which this project deliberately does not use.
         content=[{"text": {"text": query}}],
     )
-    decision = _classify_input_assessment(response)
-    _log_input_guardrail(response, decision)
+    blocked = _is_blocked(response)
+    _log_input_guardrail(response, "block" if blocked else "clean")
     if usage is not None:
         usage["guardrail_calls"] += 1
         _add_guardrail_units(usage, response.get("usage"))
 
-    if decision == "block":
+    if blocked:
         return "block", _guardrail_output_text(response) or _FALLBACK_BLOCK_MESSAGE
-    if decision == "mask":
-        # Proceed silently on the masked query; the student is not told masking happened.
-        return "proceed", _guardrail_output_text(response) or query
     return "proceed", query
 
 
@@ -1436,33 +1375,6 @@ def _message_text(message):
         if isinstance(block, dict) and "text" in block:
             return block["text"]
     return ""
-
-
-def _first_text(response):
-    """The first text block of a Converse response. On a guardrail block this is the
-    configured blocked message; otherwise the generated answer."""
-    return _message_text(response.get("output", {}).get("message", {}))
-
-
-def _log_guardrail_assessment(response):
-    """Structured, PII-safe log of the OUTPUT guardrail outcome on every generation, so
-    interventions are measurable for later tuning. Logs stopReason + a REDUCED assessment
-    (types/actions/counts), never the raw trace - trace.guardrail carries modelOutput and
-    matched text, which must not land in plaintext logs. -> CloudWatch Logs."""
-    stop_reason = response.get("stopReason")
-    print(
-        json.dumps(
-            {
-                "event": "guardrail_assessment",
-                "stop_reason": stop_reason,
-                "intervened": stop_reason == _GUARDRAIL_STOP_REASON,
-                "assessment": _reduce_assessments(
-                    _converse_trace_assessments(response.get("trace"))
-                ),
-            },
-            default=str,
-        )
-    )
 
 
 # --- Tool-call trace (opt-in debug payload only) -------------------------------------------
@@ -1515,7 +1427,7 @@ def _tool_call_record(name, tool_input, status, result_json):
 # student question is NOT one model call: this is an agentic Converse loop, so a question can
 # be several invocations, and each one resends the whole accumulated conversation (history +
 # system prompt + link table + every tool result so far). Retrieved KB passages ride in those
-# input tokens, and the guardrails bill per text unit on EVERY turn, not once per question.
+# input tokens, and the guardrail bills per 1,000-character text unit rather than per question.
 # None of that is guessable from the outside - it has to be measured, per request, from what
 # Bedrock itself reports.
 #
@@ -1551,9 +1463,10 @@ def _new_usage():
       output_tokens - summed Converse outputTokens (capped per turn by GENERATION_MAX_TOKENS).
       cache_*       - prompt-cache reads/writes if the model reports them; kept separate
                       because they are priced differently from plain input tokens.
-      guardrail_calls / guardrail_units - the input screen plus the output backstop attached
-                      to every Converse turn. Guardrails bill per TEXT UNIT, per policy, so
-                      units are kept per policy name rather than as one number.
+      guardrail_calls / guardrail_units - the ONE input screen per question (nothing is
+                      attached to Converse any more, so no turn adds to this). Guardrails
+                      bill per TEXT UNIT, per policy, so units are kept per policy name
+                      rather than as one number.
       retrievals    - KB Retrieve calls (the priming one plus any the model made). Each
                       embeds the query and queries the vector index.
       tool_calls    - every tool the loop ran, including the non-billable Primo ones. Context
@@ -1611,27 +1524,6 @@ def _add_guardrail_units(usage, reported):
         if isinstance(value, int):
             field = _camel_to_snake(key)
             usage["guardrail_units"][field] = usage["guardrail_units"].get(field, 0) + value
-
-
-def _add_converse_guardrail_usage(usage, response):
-    """Pull the OUTPUT backstop's text-unit usage out of a Converse response trace.
-
-    The units live on each assessment's `invocationMetrics.usage`, in the same trace this
-    handler already reads for its PII-safe guardrail logging - so this needs no extra call and
-    no extra permission. It requires guardrail trace to be enabled (config: guardrail.trace);
-    with the trace off there is simply nothing to count and the field stays at zero rather
-    than the request failing."""
-    if usage is None:
-        return
-    counted = False
-    for assessment in _converse_trace_assessments(response.get("trace")):
-        metrics = assessment.get("invocationMetrics")
-        if not isinstance(metrics, dict):
-            continue
-        _add_guardrail_units(usage, metrics.get("usage"))
-        counted = True
-    if counted:
-        usage["guardrail_calls"] += 1
 
 
 # --- Priming retrieval: the KB is the floor of every turn, not a choice --------------------
@@ -1743,9 +1635,12 @@ def run_agent(messages, usage=None, language=None):
     `messages` is the seed conversation in Converse shape (a list of {role, content} turns,
     starting with user and ending with the newest user turn - see _seed_messages), already
     input-screened. The system prompt goes in Converse `system`, never into these messages. The
-    loop mutates its own copy of `messages`, so callers should pass a fresh list. Each turn:
-      - call Converse with the one-tool toolConfig + the OUTPUT guardrail (backstop on every turn);
-      - if the OUTPUT guardrail intervenes -> return the blocked message, no sources;
+    loop mutates its own copy of `messages`, so callers should pass a fresh list.
+
+    NO guardrail is attached to the Converse call. The answer is screened by nothing, which is
+    the point: the system prompt is what governs it, and an output filter could only replace a
+    considered reply with canned decline copy. Each turn:
+      - call Converse with the four-tool toolConfig;
       - if stopReason == "tool_use" -> run the tool for EACH toolUse block the model requested
         (it may ask for several at once), append the assistant turn and ONE user message carrying
         all the toolResults, and loop;
@@ -1754,7 +1649,7 @@ def run_agent(messages, usage=None, language=None):
     whole loop (empty if the model answered directly, e.g. a greeting). A safety cap of
     MAX_AGENT_ITERATIONS bounds the loop.
 
-    Returns {"answer", "blocked", "chunks", "catalog_sources", "tool_calls"}: `chunks` are the KB
+    Returns {"answer", "chunks", "catalog_sources", "tool_calls"}: `chunks` are the KB
     passages from search_library_info (drive `sources` + eval full_context); `catalog_sources` are
     the synthetic source entries the non-KB tools contributed (the A-Z databases page and the
     per-query Primo search pages; the curated link block contributes none - see _links_block);
@@ -1773,46 +1668,26 @@ def run_agent(messages, usage=None, language=None):
     tool_calls = []
     answer = ""
     tool_config = _tool_config()
-    guardrail = _output_guardrail_config()
 
     # Seed the loop with a retrieval the model did not have to decide to make (see _prime_loop).
     collected_chunks.extend(_prime_loop(messages, tool_calls, usage=usage))
 
     for _ in range(MAX_AGENT_ITERATIONS):
-        kwargs = {
-            "modelId": GENERATION_MODEL_ID,
-            "system": _system_blocks(language),
-            "messages": messages,
-            "toolConfig": tool_config,
+        # No guardrailConfig: the output guardrail is gone, so Converse can never come back
+        # with stopReason "guardrail_intervened" and there is no block branch below.
+        response = _bedrock_client().converse(
+            modelId=GENERATION_MODEL_ID,
+            system=_system_blocks(language),
+            messages=messages,
+            toolConfig=tool_config,
             # Short, direct, low-variance answers for a factual FAQ bot. The maxTokens/temperature
             # key names and nesting match the bedrock-runtime Converse inferenceConfig shape.
-            "inferenceConfig": {
+            inferenceConfig={
                 "maxTokens": GENERATION_MAX_TOKENS,
                 "temperature": GENERATION_TEMPERATURE,
             },
-        }
-        # OUTPUT guardrail on EVERY turn so the final answer is always screened.
-        if guardrail:
-            kwargs["guardrailConfig"] = guardrail
-
-        response = _bedrock_client().converse(**kwargs)
-        _log_guardrail_assessment(response)
-        # Count this turn BEFORE any early return: a turn the output guardrail blocked was
-        # still generated and still billed, and a cost meter that skipped it would understate.
+        )
         _add_model_usage(usage, response)
-        _add_converse_guardrail_usage(usage, response)
-
-        if response.get("stopReason") == _GUARDRAIL_STOP_REASON:
-            # The OUTPUT guardrail blocked this turn: return its message, drop all sources.
-            return {
-                "answer": _first_text(response),
-                "blocked": True,
-                "chunks": [],
-                "catalog_sources": [],
-                # The trace is debug-only and never reaches the widget, so a block keeps it:
-                # knowing which tools ran before the block is exactly what you want here.
-                "tool_calls": tool_calls,
-            }
 
         out_message = response.get("output", {}).get("message", {}) or {}
         text = _message_text(out_message)
@@ -1823,7 +1698,6 @@ def run_agent(messages, usage=None, language=None):
             # Terminal turn (end_turn / max_tokens / stop_sequence / ...): we have the answer.
             return {
                 "answer": answer,
-                "blocked": False,
                 "chunks": collected_chunks,
                 "catalog_sources": catalog_sources,
                 "tool_calls": tool_calls,
@@ -1890,7 +1764,6 @@ def run_agent(messages, usage=None, language=None):
     # Iteration cap hit without a terminal turn: return the best answer we have (or a fallback).
     return {
         "answer": answer or _MAX_ITERS_FALLBACK_MESSAGE,
-        "blocked": False,
         "chunks": collected_chunks,
         "catalog_sources": catalog_sources,
         "tool_calls": tool_calls,
@@ -2129,23 +2002,20 @@ def _handle_query(event):
     # JSON error instead of an opaque 500. `stage` names the step that failed. No retry logic.
     stage = "input_guardrail"
     try:
-        # Screen the bare query BEFORE the agent runs. A content-filter / prompt-attack hit is
+        # Screen the bare query for a prompt-injection attempt BEFORE the agent runs. A hit is
         # blocked here and returns immediately - no retrieval, no generation, no Bedrock spend.
-        # PII is masked and we proceed silently on the masked text; the retrieved passages the
-        # tool returns are never input-screened, so contact facts survive.
-        decision, screened_query = _apply_input_guardrail(query, usage=usage)
+        # Nothing else is screened and nothing is rewritten: a query that proceeds reaches the
+        # model exactly as it was typed, which is what lets the system prompt do its job.
+        decision, blocked_message = _apply_input_guardrail(query, usage=usage)
         if decision == "block":
             # A blocked query still paid for the guardrail screen, so the meter still reports.
-            blocked = {"answer": screened_query, "sources": []}
+            blocked = {"answer": blocked_message, "sources": []}
             if include_usage:
                 blocked["usage"] = usage
             return _response(200, blocked)
-        # Replace the newest user turn with the screened text (masked, if the guardrail
-        # anonymized PII) before seeding, so the agent runs on the screened question.
-        conversation[-1]["text"] = screened_query
-        # The agentic loop: Converse tool-use with KB retrieval as the sole tool. Retrieval,
-        # generation, and the output-guardrail backstop all happen inside; on any fault this
-        # whole step reports as the "agent" stage. Seed it with the trimmed conversation history.
+        # The agentic loop: Converse tool-use over the four tools. Retrieval and generation
+        # both happen inside; on any fault this whole step reports as the "agent" stage. Seed
+        # it with the trimmed conversation history.
         stage = "agent"
         result = run_agent(_seed_messages(conversation), usage=usage, language=language)
     except Exception as exc:  # noqa: BLE001 - deliberately broad: any AWS/runtime fault
@@ -2153,19 +2023,15 @@ def _handle_query(event):
 
     # Sources: KB passages from search_library_info (deduped by uri) PLUS any synthetic sources
     # the non-KB tools contributed (the A-Z page and the Primo search pages; the curated link
-    # block contributes none). On an OUTPUT guardrail block the answer is the blocked message, so attach no sources
-    # at all. full_context stays KB-only (what the model semantically retrieved), so the synthetic
-    # sources never pollute eval data.
+    # block contributes none). full_context stays KB-only (what the model semantically
+    # retrieved), so the synthetic sources never pollute eval data.
     chunks = result["chunks"]
-    if result["blocked"]:
-        sources = []
-    else:
-        sources = _build_sources(chunks)
-        seen = {s["uri"] for s in sources}
-        for cs in result.get("catalog_sources", []):
-            if cs["uri"] and cs["uri"] not in seen:
-                seen.add(cs["uri"])
-                sources.append(cs)
+    sources = _build_sources(chunks)
+    seen = {s["uri"] for s in sources}
+    for cs in result.get("catalog_sources", []):
+        if cs["uri"] and cs["uri"] not in seen:
+            seen.add(cs["uri"])
+            sources.append(cs)
     payload = {"answer": result["answer"], "sources": sources}
     if include_full_context:
         # Opt-in debug payload. `full_context` is the KB passages; `tool_calls` is every tool

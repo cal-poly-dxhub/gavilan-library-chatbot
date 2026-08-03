@@ -18,10 +18,10 @@
   - [x] KB source bucket + scraper Lambda (deps layer, weekly EventBridge schedule, one-click deploy Trigger)
   - [x] Dedicated catalog S3 bucket + wiring
   - [x] Query Lambda + own role, HTTP API (API Gateway v2, POST /query + GET /warm), stage throttling
-  - [x] Two Bedrock guardrails (input screen + output backstop) + numbered versions
+  - [x] One Bedrock guardrail (input screen, PROMPT_ATTACK only) + numbered version
   - [x] Widget hosting: S3 + CloudFront (OAC) in the same stack; BucketDeployment of widget.js; CfnOutput embed tag
   - [x] `config.yaml` single source of truth
-- [x] **Query path** — agentic Converse tool-use loop (`run_agent`); four tools (`search_library_info`, `database_catalog`, `search_book_catalog`, `search_course_reserves`); `{answer, sources}` contract; input guardrail pre-loop, output guardrail on every Converse call
+- [x] **Query path** — agentic Converse tool-use loop (`run_agent`); four tools (`search_library_info`, `database_catalog`, `search_book_catalog`, `search_course_reserves`); `{answer, sources}` contract; input guardrail pre-loop, no guardrail on the Converse call
 - [x] **Self-updating catalog** — scraper parses databases.php (HTML anchor parse) + Sonnet enrichment (subjects/aliases) -> catalog S3 bucket; tool reads from S3 with TTL cache; hand-authored not-held seed merged at read time; robustness guard keeps last-good on failure
 - [x] **Live Primo catalog tools** — `search_book_catalog` (general catalog) + `search_course_reserves` (course reserves) call the Ex Libris Primo discovery API (search + per-record availability); evidence-not-verdict (model judges, `total == 0` the only not-held signal); timeout + availability budget + soft-fail; defensive `$$`-encoding parse; `<textbook_flow>` routes course textbooks to reserves
 - [x] **Single-session multi-turn** — client sends the `messages` history each request; stateless Lambda (no server-side store), trimmed to the last 10 messages before seeding the loop; legacy `{query}` still accepted (NOT the DynamoDB-backed design - see V2)
@@ -32,11 +32,11 @@
 
 ### Next
 
-- [x] **Deploy + validate live** — `/query` validated end-to-end (four tools, multi-turn, guardrails, live Primo). Remaining spot checks: catalog populated from a real scrape, widget from the hosted script tag
+- [x] **Deploy + validate live** — `/query` validated end-to-end (four tools, multi-turn, guardrail, live Primo). Remaining spot checks: catalog populated from a real scrape, widget from the hosted script tag
 - [x] **CORS lockdown** — `allow_origins` restricted to the widget domain via `cors.allow_origins` in config.yaml; wildcard rejected at synth
 - [ ] **Provide library context** — final seed URLs + any blacklist into `config.yaml`; Q&A set into `eval/datasets/`
 - [ ] **Parallelize Primo availability calls** — the per-record delivery calls run sequentially under a wall-clock budget; fan them out so slow availability lookups don't push toward the Lambda timeout
-- [ ] **Iterate** (eval-driven) — tune chunking, prompt behavior, guardrail thresholds; re-run retrieve + answer-quality evals
+- [ ] **Iterate** (eval-driven) — tune chunking and prompt behavior; re-run retrieve + answer-quality evals
 
 ---
 

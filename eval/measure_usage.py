@@ -171,12 +171,11 @@ def ask(api, messages, timeout):
 
 
 def flat(usage):
-    """One usage dict flattened to the scalar fields the cost model needs, with guardrail
-    units summed into the two policies this deployment actually bills for."""
+    """One usage dict flattened to the scalar fields the cost model needs. The content policy
+    is the only one this deployment bills for: the guardrail screens PROMPT_ATTACK (a content
+    filter) on the input and carries no sensitive-information policy, so there are no PII
+    units to price."""
     units = usage.get("guardrail_units", {}) or {}
-    pii = units.get("sensitive_information_policy_units", 0) - units.get(
-        "sensitive_information_policy_free_units", 0
-    )
     return {
         "model_calls": usage.get("model_calls", 0),
         "input_tokens": usage.get("input_tokens", 0),
@@ -184,7 +183,6 @@ def flat(usage):
         "retrievals": usage.get("retrievals", 0),
         "tool_calls": usage.get("tool_calls", 0),
         "guardrail_content_units": units.get("content_policy_units", 0),
-        "guardrail_pii_units": max(pii, 0),
     }
 
 
@@ -195,7 +193,6 @@ _FIELDS = (
     "retrievals",
     "tool_calls",
     "guardrail_content_units",
-    "guardrail_pii_units",
 )
 
 
@@ -343,17 +340,14 @@ def main():
     ctx_base, ctx_slope = fit_context(by_position)
     calls_base, calls_slope = fit_calls(by_position)
 
-    # Guardrail text units are close to "one for the input screen plus one per Converse turn",
-    # but NOT exactly: a Bedrock text unit covers up to 1,000 characters, so a long answer
-    # spends a second output unit. The estimator therefore uses the measured average rather
-    # than the tidy formula; this line reports how often the formula actually held so the gap
-    # is visible instead of assumed away.
-    units_check = [
-        (r["guardrail_content_units"], 1 + r["model_calls"]) for r in all_rows
-    ]
+    # Guardrail text units should now be ONE per question: the input screen is the only
+    # guardrail call left (nothing is attached to Converse), and a Bedrock text unit covers up
+    # to 1,000 characters, so only a question longer than that spends a second. The estimator
+    # still uses the measured average rather than the formula; this line reports how often the
+    # formula actually held, so the gap is visible instead of assumed away.
+    units_check = [(r["guardrail_content_units"], 1) for r in all_rows]
     units_exact = sum(1 for got, want in units_check if got == want)
     units_avg = statistics.fmean([r["guardrail_content_units"] for r in all_rows])
-    pii_avg = statistics.fmean([r["guardrail_pii_units"] for r in all_rows])
 
     calls = [r["model_calls"] for r in all_rows]
     outs = [r["output_tokens"] for r in all_rows]
@@ -371,12 +365,11 @@ def main():
     print(f"  output_tokens_avg: {round(statistics.fmean(outs), 0):.0f}")
     print(f"  retrievals_avg: {round(statistics.fmean(rets), 2)}")
     print(f"  guardrail_content_units_avg: {round(units_avg, 2)}")
-    print(f"  guardrail_pii_units_avg: {round(pii_avg, 2)}")
     print(f"\n  # model_calls by position: base {calls_base:.2f}, "
           f"slope {calls_slope:+.3f} per prior turn")
-    print(f"  # guardrail units == 1 + model_calls held for "
+    print(f"  # guardrail units == 1 (the input screen alone) held for "
           f"{units_exact}/{len(units_check)} questions "
-          f"(a text unit covers 1,000 chars, so a long answer spends an extra one)")
+          f"(a text unit covers 1,000 chars, so a long question spends an extra one)")
 
 
 if __name__ == "__main__":
