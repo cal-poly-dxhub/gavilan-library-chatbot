@@ -2139,4 +2139,445 @@ test("the error palette that now renders still passes 4.5:1 (1.4.3)", () => {
   assert.ok(/\.retry \{[^}]*color: var\(--error-ink\)/.test(SOURCE.replace(/\n/g, " ")));
 });
 
+// =========================================================================
+// ===  sign-in gate (TEMPORARY: these tests leave with the feature)  ======
+// =========================================================================
+//
+// The gate that matters is the API Gateway JWT authorizer on POST /query, which no test here
+// can reach. What IS testable in this file is everything the widget must get right around it:
+// that an ungated embed is completely untouched, that the token rides in a header and never in
+// a body, that the password is never kept, and that a person who cannot send anything is not
+// shown controls that pretend otherwise.
+
+// Like withNetwork, but with a real attribute map on the script tag and a fetch that can tell
+// the Cognito call apart from the /query call.
+function withGate(attrs, fetchImpl) {
+  var priorDoc = global.document;
+  var priorFetch = global.fetch;
+  var priorErr = console.error;
+  var calls = [];
+  global.document = {
+    querySelector: function () {
+      return {
+        getAttribute: function (name) {
+          return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null;
+        }
+      };
+    }
+  };
+  global.fetch = function (url, opts) {
+    calls.push({ url: url, opts: opts });
+    return fetchImpl(url, opts);
+  };
+  console.error = function () {};
+  return {
+    calls: calls,
+    cognito: function () {
+      return calls.filter(function (c) { return /cognito-idp/.test(c.url); });
+    },
+    query: function () {
+      return calls.filter(function (c) { return /\/query$/.test(c.url); });
+    },
+    restore: function () {
+      global.document = priorDoc;
+      global.fetch = priorFetch;
+      console.error = priorErr;
+      widget.signOut();
+    }
+  };
+}
+
+var GATE_ATTRS = {
+  "data-api-url": "https://api.test/query",
+  "data-user-pool-id": "us-west-2_TESTPOOL",
+  "data-client-id": "testclientid123"
+};
+
+// Cognito's real success shape, trimmed to the fields the widget reads.
+function cognitoOk(token, expiresIn) {
+  return {
+    ok: true,
+    json: function () {
+      return Promise.resolve({
+        AuthenticationResult: {
+          AccessToken: token,
+          ExpiresIn: expiresIn === undefined ? 86400 : expiresIn,
+          TokenType: "Bearer",
+          RefreshToken: "refresh-token-the-widget-must-ignore",
+          IdToken: "id-token-the-widget-must-ignore"
+        }
+      });
+    }
+  };
+}
+
+function routeGate(cognitoRes, queryPayload, seenBodies) {
+  return function (url, opts) {
+    if (/cognito-idp/.test(url)) return Promise.resolve(cognitoRes);
+    if (seenBodies) seenBodies.push({ body: JSON.parse(opts.body), headers: opts.headers });
+    return Promise.resolve({
+      ok: true,
+      json: function () { return Promise.resolve(queryPayload); }
+    });
+  };
+}
+
+test("an embed with no sign-in ids is the ungated widget: no config, nothing required", () => {
+  // The production tag today, the offline harness, and the tag left after go-live.
+  assert.strictEqual(widget.authConfig(), null, "no document at all reads as ungated");
+  assert.strictEqual(widget.authRequired(), false);
+  var g = withGate({ "data-api-url": "https://api.test/query" }, function () {
+    return Promise.reject(new Error("no call expected"));
+  });
+  try {
+    assert.strictEqual(widget.authConfig(), null, "data-api-url alone is not a gate");
+    assert.strictEqual(widget.authRequired(), false);
+  } finally {
+    g.restore();
+  }
+});
+
+test("both ids are required, and the region comes from the pool id rather than a third attribute", () => {
+  var half = withGate(
+    { "data-api-url": "https://api.test/query", "data-user-pool-id": "us-west-2_TESTPOOL" },
+    function () { return Promise.reject(new Error("no call expected")); }
+  );
+  try {
+    assert.strictEqual(widget.authConfig(), null, "a pool id with no client id is not a gate");
+  } finally {
+    half.restore();
+  }
+
+  var g = withGate(GATE_ATTRS, function () { return Promise.reject(new Error("x")); });
+  try {
+    var cfg = widget.authConfig();
+    assert.deepStrictEqual(cfg, {
+      poolId: "us-west-2_TESTPOOL",
+      clientId: "testclientid123",
+      region: "us-west-2"
+    });
+  } finally {
+    g.restore();
+  }
+
+  // A pool id that is not "<region>_<suffix>" is a misconfiguration, and reading it as
+  // region "" would build a nonsense hostname and fail as an opaque network error.
+  var bad = withGate(
+    {
+      "data-api-url": "https://api.test/query",
+      "data-user-pool-id": "no-underscore-here",
+      "data-client-id": "testclientid123"
+    },
+    function () { return Promise.reject(new Error("x")); }
+  );
+  try {
+    assert.strictEqual(widget.authConfig(), null);
+  } finally {
+    bad.restore();
+  }
+});
+
+test("the ungated request is byte-identical: no Authorization header at all", async () => {
+  var seen = [];
+  var g = withGate({ "data-api-url": "https://api.test/query" },
+    routeGate(null, { answer: "hi", sources: [] }, seen));
+  try {
+    await widget.sendQuery([{ role: "user", content: "hours?" }]);
+    assert.strictEqual(seen.length, 1);
+    assert.deepStrictEqual(seen[0].headers, { "Content-Type": "application/json" });
+    assert.deepStrictEqual(Object.keys(seen[0].body), ["messages"]);
+  } finally {
+    g.restore();
+  }
+});
+
+test("a gated widget will not spend a request without a token", async () => {
+  var g = withGate(GATE_ATTRS, routeGate(null, { answer: "hi", sources: [] }, []));
+  try {
+    var err = null;
+    try {
+      await widget.sendQuery([{ role: "user", content: "hours?" }]);
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err, "sendQuery rejects rather than resolving an answer");
+    assert.strictEqual(err.reason, "expired");
+    assert.strictEqual(g.query().length, 0, "no /query request was made");
+  } finally {
+    g.restore();
+  }
+});
+
+test("signIn posts InitiateAuth to the pool's region, and the password goes nowhere else", async () => {
+  var seen = [];
+  var g = withGate(GATE_ATTRS, routeGate(cognitoOk("ACCESS-TOKEN-1"), { answer: "hi", sources: [] }, seen));
+  try {
+    var ok = await widget.signIn("someone@example.com", "hunter2-correct-horse");
+    assert.strictEqual(ok, true);
+    assert.strictEqual(widget.signedIn(), true);
+
+    var call = g.cognito()[0];
+    assert.strictEqual(call.url, "https://cognito-idp.us-west-2.amazonaws.com/");
+    assert.strictEqual(call.opts.method, "POST");
+    assert.strictEqual(call.opts.headers["Content-Type"], "application/x-amz-json-1.1");
+    assert.strictEqual(
+      call.opts.headers["X-Amz-Target"],
+      "AWSCognitoIdentityProviderService.InitiateAuth"
+    );
+    var body = JSON.parse(call.opts.body);
+    assert.strictEqual(body.AuthFlow, "USER_PASSWORD_AUTH");
+    assert.strictEqual(body.ClientId, "testclientid123");
+    assert.strictEqual(body.AuthParameters.USERNAME, "someone@example.com");
+
+    // ...and now the question. The password must appear in the sign-in call and NOWHERE else.
+    await widget.sendQuery([{ role: "user", content: "hours?" }]);
+    assert.strictEqual(seen.length, 1);
+    var wire = JSON.stringify(seen[0]);
+    assert.ok(!/hunter2/.test(wire), "the password never reaches /query, header or body");
+    assert.ok(!/ACCESS-TOKEN-1/.test(JSON.stringify(seen[0].body)), "the token is not in the body");
+    assert.strictEqual(seen[0].headers.Authorization, "Bearer ACCESS-TOKEN-1");
+    assert.deepStrictEqual(Object.keys(seen[0].body), ["messages"]);
+  } finally {
+    g.restore();
+  }
+});
+
+test("bad credentials reject as 'credentials' and leave the widget signed out", async () => {
+  var denied = {
+    ok: false,
+    json: function () {
+      return Promise.resolve({
+        __type: "NotAuthorizedException",
+        message: "Incorrect username or password."
+      });
+    }
+  };
+  var g = withGate(GATE_ATTRS, routeGate(denied, null, []));
+  try {
+    var err = null;
+    try {
+      await widget.signIn("someone@example.com", "wrong");
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err && err.reason === "credentials", "reason is 'credentials'");
+    // AWS's own wording is never carried forward: the pool is configured not to say whether the
+    // address exists, and echoing its message would undo that.
+    assert.ok(!/Incorrect username/.test(String(err.message)), "AWS's message is not passed through");
+    assert.strictEqual(widget.signedIn(), false);
+  } finally {
+    g.restore();
+  }
+});
+
+test("a challenge instead of a token is a failed sign-in, not a half-signed-in widget", async () => {
+  // The shape when the account was created but its password was never made permanent.
+  var challenge = {
+    ok: true,
+    json: function () {
+      return Promise.resolve({ ChallengeName: "NEW_PASSWORD_REQUIRED", Session: "abc" });
+    }
+  };
+  var g = withGate(GATE_ATTRS, routeGate(challenge, null, []));
+  try {
+    var err = null;
+    try {
+      await widget.signIn("someone@example.com", "temp-password");
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err && err.reason === "credentials");
+    assert.strictEqual(widget.signedIn(), false);
+  } finally {
+    g.restore();
+  }
+});
+
+test("an unreachable Cognito is 'unavailable', a distinct outcome from a wrong password", async () => {
+  var g = withGate(GATE_ATTRS, function (url) {
+    if (/cognito-idp/.test(url)) return Promise.reject(new TypeError("Failed to fetch"));
+    return Promise.reject(new Error("unexpected"));
+  });
+  try {
+    var err = null;
+    try {
+      await widget.signIn("someone@example.com", "whatever");
+    } catch (e) {
+      err = e;
+    }
+    assert.ok(err && err.reason === "unavailable", "network failure is not reported as bad credentials");
+  } finally {
+    g.restore();
+  }
+});
+
+test("an expired token is caught before the request, not read off a 401", async () => {
+  // The 401 from an API Gateway authorizer carries no CORS headers, so a browser turns it into
+  // an opaque network error - the status is unreadable. Expiry is therefore tracked locally
+  // from ExpiresIn, which is what makes "your session ended" distinguishable at all.
+  var g = withGate(GATE_ATTRS, routeGate(cognitoOk("SHORT-LIVED", 1), { answer: "hi", sources: [] }, []));
+  try {
+    await widget.signIn("someone@example.com", "pw");
+    // ExpiresIn 1s, minus the 60s safety margin, is already in the past.
+    assert.strictEqual(widget.signedIn(), false, "a token inside its safety margin is already gone");
+    var err = null;
+    try {
+      await widget.sendQuery([{ role: "user", content: "hours?" }]);
+    } catch (e) {
+      err = e;
+    }
+    assert.strictEqual(err && err.reason, "expired");
+    assert.strictEqual(g.query().length, 0, "no doomed request was sent");
+  } finally {
+    g.restore();
+  }
+});
+
+test("the widget keeps no token or password anywhere a reload could find it", () => {
+  // The storage scan above covers the API surface; this covers the handle. Nothing the widget
+  // exposes can read a token back out, so nothing downstream can persist one by accident.
+  assert.ok(!("accessToken" in widget), "no token getter is exported");
+  assert.ok(!("session" in widget), "no session object is exported");
+  assert.ok(typeof widget.signedIn === "function" && typeof widget.signOut === "function");
+  // The refresh token is fetched and dropped: it appears nowhere in the source.
+  assert.ok(!/RefreshToken/.test(SOURCE), "the refresh token is never read");
+});
+
+// --- the panel while gated ----------------------------------------------
+
+test("a gated, signed-out panel shows sign-in in the composer's place and offers no dead buttons", () => {
+  var g = withGate(GATE_ATTRS, function () { return Promise.reject(new Error("x")); });
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    var signin = findByClass(handle.shadow, "signin");
+    var composer = findByClass(handle.shadow, "composer");
+    assert.ok(signin, "the sign-in form is in the panel");
+    assert.strictEqual(signin.hidden, false, "and it is the one on screen");
+    assert.strictEqual(composer.hidden, true, "the composer is not");
+    // The greeting still shows - it is what says WHAT you are signing in for - but the starter
+    // questions do not, because each is a button that would submit nothing.
+    assert.ok(/Gavilan College Library assistant/.test(allText(handle.shadow)), "greeting is present");
+    assert.strictEqual(findByClass(handle.shadow, "suggestions"), null, "no starter questions yet");
+  } finally {
+    g.restore();
+  }
+});
+
+test("the sign-in fields are real labelled inputs, typed, and reachable by keyboard", () => {
+  var g = withGate(GATE_ATTRS, function () { return Promise.reject(new Error("x")); });
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    var labels = findAll(handle.shadow, "signin__label");
+    var fields = findAll(handle.shadow, "signin__input");
+    assert.strictEqual(labels.length, 2);
+    assert.strictEqual(fields.length, 2);
+    labels.forEach(function (l, i) {
+      assert.strictEqual(l.tagName, "label");
+      assert.ok(l.textContent && l.textContent.trim(), "the label carries visible text");
+      // for/id resolves only because both ends are in this shadow root.
+      assert.strictEqual(l.getAttribute("for"), fields[i].getAttribute("id"));
+    });
+    assert.strictEqual(fields[0].getAttribute("type"), "email");
+    assert.strictEqual(fields[1].getAttribute("type"), "password");
+    assert.strictEqual(fields[0].getAttribute("autocomplete"), "username");
+    assert.strictEqual(fields[1].getAttribute("autocomplete"), "current-password");
+    // A failure has to be announced, not just drawn.
+    var err = findByClass(handle.shadow, "signin__error");
+    assert.strictEqual(err.getAttribute("role"), "alert");
+    assert.strictEqual(err.hidden, true, "and it is absent until there is something to say");
+  } finally {
+    g.restore();
+  }
+});
+
+test("signing in swaps the form for the composer and releases the starter questions", async () => {
+  var g = withGate(GATE_ATTRS, routeGate(cognitoOk("TOKEN-A"), { answer: "hi", sources: [] }, []));
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    var fields = findAll(handle.shadow, "signin__input");
+    fields[0].value = "someone@example.com";
+    fields[1].value = "a-password";
+    handle.signInForm.fire("submit");
+    await new Promise(function (r) { setTimeout(r, 0); });
+
+    assert.strictEqual(widget.signedIn(), true);
+    assert.strictEqual(findByClass(handle.shadow, "signin").hidden, true);
+    assert.strictEqual(findByClass(handle.shadow, "composer").hidden, false);
+    assert.ok(findByClass(handle.shadow, "suggestions"), "the starter questions arrive with the session");
+    // The password is cleared from the DOM the moment it is no longer needed.
+    assert.strictEqual(fields[1].value, "", "the password field is emptied");
+    assert.strictEqual(fields[0].value, "someone@example.com", "the email is not, so nobody retypes it");
+  } finally {
+    g.restore();
+  }
+});
+
+test("a rejected sign-in says so, clears the password, and stays gated", async () => {
+  var denied = { ok: false, json: function () { return Promise.resolve({ __type: "NotAuthorizedException" }); } };
+  var g = withGate(GATE_ATTRS, routeGate(denied, null, []));
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    var fields = findAll(handle.shadow, "signin__input");
+    fields[0].value = "someone@example.com";
+    fields[1].value = "wrong";
+    handle.signInForm.fire("submit");
+    await new Promise(function (r) { setTimeout(r, 0); });
+
+    var err = findByClass(handle.shadow, "signin__error");
+    assert.strictEqual(err.hidden, false, "the alert is shown");
+    assert.strictEqual(err.textContent, widget.STRINGS.en.signInFailed);
+    assert.strictEqual(fields[1].value, "", "the password does not sit in the form for the next person");
+    assert.strictEqual(findByClass(handle.shadow, "signin").hidden, false, "still gated");
+    assert.strictEqual(findByClass(handle.shadow, "composer").hidden, true);
+    assert.strictEqual(findByClass(handle.shadow, "suggestions"), null, "still no dead buttons");
+  } finally {
+    g.restore();
+  }
+});
+
+test("a gated panel will not submit a question, however it is asked to", async () => {
+  var seen = [];
+  var g = withGate(GATE_ATTRS, routeGate(cognitoOk("T"), { answer: "hi", sources: [] }, seen));
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    handle.submit("what are the hours?");
+    await new Promise(function (r) { setTimeout(r, 0); });
+    assert.strictEqual(seen.length, 0, "no /query request escaped");
+    assert.strictEqual(handle.getState().started, false, "and the conversation did not start");
+  } finally {
+    g.restore();
+  }
+});
+
+test("the sign-in form is localized, and a switch does not strand it in the other language", () => {
+  var g = withGate(GATE_ATTRS, function () { return Promise.reject(new Error("x")); });
+  try {
+    var doc = makeDoc();
+    var handle = widget.mount(doc);
+    var heading = findByClass(handle.shadow, "signin__heading");
+    var submit = findByClass(handle.shadow, "signin__submit");
+    assert.strictEqual(heading.textContent, widget.STRINGS.en.signInHeading);
+    assert.strictEqual(submit.textContent, widget.STRINGS.en.signInSubmit);
+
+    handle.chooseLanguage("es");
+    assert.strictEqual(heading.textContent, widget.STRINGS.es.signInHeading);
+    assert.strictEqual(submit.textContent, widget.STRINGS.es.signInSubmit);
+    assert.strictEqual(
+      findByClass(handle.shadow, "signin__intro").textContent,
+      widget.STRINGS.es.signInIntro
+    );
+    var labels = findAll(handle.shadow, "signin__label");
+    assert.strictEqual(labels[0].textContent, widget.STRINGS.es.signInEmailLabel);
+    assert.strictEqual(labels[1].textContent, widget.STRINGS.es.signInPasswordLabel);
+  } finally {
+    widget.resetLanguage();
+    g.restore();
+  }
+});
+
 run();

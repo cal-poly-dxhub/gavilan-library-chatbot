@@ -97,7 +97,22 @@
         "Sorry, I couldn't reach the library assistant just now. " +
         "Please try again in a moment.",
       retryLabel: "Try again",
-      notConnected: "The library assistant isn't connected yet. Please try again later."
+      notConnected: "The library assistant isn't connected yet. Please try again later.",
+      // ---- sign-in gate (temporary; removed at go-live) ----
+      // The panel says WHY it is asking. "Sign in" with no reason reads like a data grab on a
+      // library page; "this preview is private" is the honest version and sets expectations.
+      signInHeading: "Sign in to try the assistant",
+      signInIntro: "This preview is private. Use the account you were given.",
+      signInEmailLabel: "Email",
+      signInPasswordLabel: "Password",
+      signInSubmit: "Sign in",
+      signInPending: "Signing in…",
+      // Cognito is configured not to distinguish a wrong address from a wrong password, and
+      // neither does this copy.
+      signInFailed: "That email and password didn't work. Please check them and try again.",
+      signInUnavailable:
+        "Sorry, sign-in isn't reachable just now. Please try again in a moment.",
+      signInExpired: "Your session ended. Please sign in again."
     },
     es: {
       languageName: "Español",
@@ -136,7 +151,18 @@
         "Vuelve a intentarlo en unos momentos.",
       retryLabel: "Reintentar",
       notConnected:
-        "El asistente de la biblioteca aún no está conectado. Vuelve a intentarlo más tarde."
+        "El asistente de la biblioteca aún no está conectado. Vuelve a intentarlo más tarde.",
+      signInHeading: "Inicia sesión para probar el asistente",
+      signInIntro: "Esta versión de prueba es privada. Usa la cuenta que te dieron.",
+      signInEmailLabel: "Correo electrónico",
+      signInPasswordLabel: "Contraseña",
+      signInSubmit: "Iniciar sesión",
+      signInPending: "Iniciando sesión…",
+      signInFailed:
+        "Ese correo electrónico y esa contraseña no funcionaron. Revísalos e inténtalo de nuevo.",
+      signInUnavailable:
+        "Lo siento, ahora mismo no se puede iniciar sesión. Vuelve a intentarlo en unos momentos.",
+      signInExpired: "Tu sesión terminó. Vuelve a iniciar sesión."
     }
   };
 
@@ -220,7 +246,10 @@
     // After this long with no response, the typing indicator gains an honest "still working"
     // note so a slow turn doesn't look frozen. Kept generous so it only shows on genuinely slow
     // responses, not routine ones (it must not read like a startup message every message).
-    wakingHintDelayMs: 6000
+    wakingHintDelayMs: 6000,
+    // Sign-in is one small unsigned call to Cognito with no model behind it, so it has no
+    // reason to sit near the query timeout. Short enough that a dead network reads as dead.
+    signInTimeoutMs: 10000
   };
 
   // Capture the script element at load time (before the deferred mount runs),
@@ -295,6 +324,166 @@
     }
   }
 
+  // ---- sign-in gate: TEMPORARY, removed at go-live ------------------------
+  //
+  // WHY. The bot is not on gavilan.edu yet; the only thing driving the billable /query is a
+  // demo link, and a link travels. The real gate is the API Gateway JWT authorizer on POST
+  // /query - this code is only how a person obtains a token that satisfies it. Nothing here
+  // can weaken it: an embed that skipped the sign-in ids does not get an ungated backend, it
+  // gets a 401 on every question.
+  //
+  // TWO ATTRIBUTES, and their absence is the ungated widget. The offline dev harness, the
+  // pre-gate embeds, and the post-go-live tag all carry neither, and for them every path below
+  // is a no-op - which is the same opt-in-by-attribute shape as data-usage-events.
+  //
+  // NOTHING IS STORED. The token lives in the closure variable below and nowhere else - no
+  // browser storage of any kind, no cookie - and the refresh token Cognito hands back is
+  // dropped unread. A reload signs in again, deliberately: this is one password shared by
+  // link, and a tab that stays signed in forever is a password that leaks with a borrowed
+  // laptop.
+  var AUTH_POOL_ATTR = "data-user-pool-id";
+  var AUTH_CLIENT_ATTR = "data-client-id";
+  // The one Cognito operation this widget calls. Unsigned and public: it is what every browser
+  // sign-in does, and it is why the app client must have no secret.
+  var AUTH_TARGET = "AWSCognitoIdentityProviderService.InitiateAuth";
+
+  // { accessToken, expiresAt } while signed in, null otherwise.
+  var session = null;
+
+  function trimmedAttr(el, name) {
+    var raw = el && el.getAttribute ? el.getAttribute(name) : null;
+    return raw && String(raw).trim() ? String(raw).trim() : null;
+  }
+
+  /**
+   * This embed's sign-in configuration, or null if the tag carries none (the ungated case).
+   * The region is DERIVED from the pool id, whose documented format is `<region>_<suffix>`:
+   * a third attribute would be a third thing that can drift out of step with the other two.
+   */
+  function authConfig() {
+    var el = scriptEl();
+    if (!el) return null;
+    var poolId = trimmedAttr(el, AUTH_POOL_ATTR);
+    var clientId = trimmedAttr(el, AUTH_CLIENT_ATTR);
+    if (!poolId || !clientId) return null;
+    var cut = poolId.indexOf("_");
+    if (cut <= 0) return null;
+    return { poolId: poolId, clientId: clientId, region: poolId.slice(0, cut) };
+  }
+
+  /** Whether this embed is gated at all. */
+  function authRequired() {
+    return authConfig() !== null;
+  }
+
+  /** The held access token if it is still valid, else null (dropping the dead session). */
+  function accessToken() {
+    if (!session) return null;
+    if (session.expiresAt <= Date.now()) {
+      session = null;
+      return null;
+    }
+    return session.accessToken;
+  }
+
+  function signedIn() {
+    return accessToken() !== null;
+  }
+
+  function signOut() {
+    session = null;
+  }
+
+  /** A rejection the UI can branch on without matching message text. */
+  function authError(reason) {
+    var err = new Error("sign-in: " + reason);
+    err.reason = reason;
+    return err;
+  }
+
+  /**
+   * Exchange an email and password for an access token: ONE unsigned fetch to Cognito's public
+   * InitiateAuth, no SDK and no build step.
+   *
+   * USER_PASSWORD_AUTH rather than SRP because SRP needs big-integer crypto no dependency-free
+   * widget is going to carry. The password crosses the wire inside TLS instead of never leaving
+   * the browser - the right trade for one shared demo account, and not a pattern for real
+   * student accounts.
+   *
+   * The password is a parameter and a request body field and nothing else: never stored, never
+   * logged, and never sent to /query. Resolves true; rejects with `.reason`:
+   *   "credentials"  - Cognito said no, or answered with a challenge instead of a token
+   *   "unavailable"  - the call never completed (network, DNS, CORS, timeout)
+   */
+  function signIn(email, password) {
+    var cfg = authConfig();
+    if (!cfg || typeof fetch === "undefined") {
+      return Promise.reject(authError("unavailable"));
+    }
+    var controller =
+      typeof AbortController !== "undefined" ? new AbortController() : null;
+    var timer = null;
+    if (controller) {
+      timer = setTimeout(function () {
+        controller.abort();
+      }, CONFIG.signInTimeoutMs);
+    }
+    return fetch("https://cognito-idp." + cfg.region + ".amazonaws.com/", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-amz-json-1.1",
+        "X-Amz-Target": AUTH_TARGET
+      },
+      body: JSON.stringify({
+        AuthFlow: "USER_PASSWORD_AUTH",
+        ClientId: cfg.clientId,
+        AuthParameters: { USERNAME: email, PASSWORD: password }
+      }),
+      signal: controller ? controller.signal : undefined
+    })
+      .then(function (res) {
+        // Cognito reports a bad password as a 4xx with a typed JSON body, so the body is worth
+        // reading either way - but its `message` is never surfaced. It is AWS's wording, in
+        // AWS's language, and the pool is configured not to distinguish a wrong address from a
+        // wrong password, which is only worth doing if the UI does not undo it.
+        return res.json().then(
+          function (data) { return { ok: res.ok, data: data }; },
+          function () { return { ok: res.ok, data: null }; }
+        );
+      })
+      .then(function (r) {
+        var result = r.data && r.data.AuthenticationResult;
+        var token =
+          result && typeof result.AccessToken === "string" ? result.AccessToken : null;
+        if (!r.ok || !token) {
+          // A challenge is a 200 with no token, and the likely one here is
+          // NEW_PASSWORD_REQUIRED: the account exists but its password was never made
+          // permanent. That is a setup mistake nobody at the keyboard can fix, so it reads to
+          // them as a failed sign-in and the name goes to the console for whoever set it up.
+          if (r.data && r.data.ChallengeName && typeof console !== "undefined" && console.error) {
+            console.error("[gavilan-widget] sign-in challenge:", r.data.ChallengeName);
+          }
+          throw authError("credentials");
+        }
+        // ExpiresIn is seconds. Expire a minute early, so a token that would die mid-flight is
+        // treated as gone BEFORE the request rather than as an unreadable failure after it -
+        // see the 401 note in realQuery for why after is not a usable signal.
+        var ttl = typeof result.ExpiresIn === "number" ? result.ExpiresIn : 3600;
+        session = {
+          accessToken: token,
+          expiresAt: Date.now() + Math.max(0, ttl - 60) * 1000
+        };
+        return true;
+      })
+      .catch(function (err) {
+        if (err && err.reason) throw err;
+        throw authError("unavailable");
+      })
+      .finally(function () {
+        if (timer) clearTimeout(timer);
+      });
+  }
+
   /**
    * The single entry point the UI calls. Takes the full conversation so far as a
    * `messages` array ({ role, content }, oldest first, newest user turn last) and
@@ -305,6 +494,11 @@
     var url = apiUrl();
     if (!url) {
       return Promise.resolve({ answer: t("notConnected"), sources: [] });
+    }
+    // A gated embed with no live token must not spend a request to discover that. This is also
+    // the only expiry signal a browser reliably gives us (again: see realQuery).
+    if (authRequired() && !signedIn()) {
+      return Promise.reject(authError("expired"));
     }
     return realQuery(url, messages);
   }
@@ -343,13 +537,30 @@
         controller.abort();
       }, CONFIG.requestTimeoutMs);
     }
+    // The token rides in the Authorization HEADER and never in the body - it must not end up in
+    // a request log, an eval capture, or anything that echoes the payload back. An ungated
+    // embed adds no header at all, so its request stays byte-identical to the pre-gate one.
+    var headers = { "Content-Type": "application/json" };
+    var token = accessToken();
+    if (token) headers.Authorization = "Bearer " + token;
     return fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: headers,
       body: requestBody(messages),
       signal: controller ? controller.signal : undefined
     })
       .then(function (res) {
+        if (res.status === 401 || res.status === 403) {
+          // The authorizer rejected the token. MOSTLY UNREACHABLE FROM A BROWSER, and worth
+          // saying why: API Gateway "adds the configured CORS headers to the response from an
+          // integration", and an authorizer rejection never reaches the integration - so this
+          // 401 arrives with no Access-Control-Allow-Origin and the browser converts it into an
+          // opaque network failure before any status is readable here. That is why expiry is
+          // caught BEFORE the request (see sendQuery) rather than from the response. Kept
+          // anyway: it is correct wherever the response IS readable, and costs one comparison.
+          signOut();
+          throw authError("expired");
+        }
         if (!res.ok) {
           throw new Error("Backend returned HTTP " + res.status);
         }
@@ -1130,6 +1341,45 @@
     "  outline: 3px solid var(--focus-ring); outline-offset: 2px;",
     "  box-shadow: 0 0 0 2px var(--focus-halo);",
     "}",
+    // sign-in gate (TEMPORARY - this block goes at go-live with the rest of the gate).
+    // Occupies the composer's slot, so the panel keeps one input area rather than growing a
+    // second one. Borrows the composer's tokens throughout: same border, same two-tone focus
+    // ring, same brand button, so it reads as part of the widget and not a bolted-on form.
+    ".signin {",
+    "  display: flex; flex-direction: column; gap: 8px;",
+    "  padding: 12px; border-top: 1px solid var(--panel-border); background: #fff;",
+    "}",
+    ".signin__heading { font-weight: 600; font-size: 14px; }",
+    ".signin__intro { font-size: 12px; color: var(--muted); margin: 0; }",
+    ".signin__field { display: flex; flex-direction: column; gap: 3px; }",
+    ".signin__label { font-size: 12px; color: var(--muted); }",
+    ".signin__input {",
+    "  padding: 9px 11px; border: 1px solid var(--line); border-radius: 10px;",
+    "  font: inherit; color: inherit; background: #fff; min-height: 40px;",
+    "}",
+    ".signin__input:focus-visible {",
+    "  outline: 2px solid var(--focus-ring);",
+    "  outline-offset: 1px;",
+    "  box-shadow: 0 0 0 1px var(--focus-halo);",
+    "  border-color: color-mix(in srgb, var(--brand) 55%, transparent);",
+    "}",
+    ".signin__submit {",
+    "  appearance: none; border: none; border-radius: 10px; cursor: pointer;",
+    "  background: var(--accent); color: var(--accent-ink);",
+    "  font: inherit; font-weight: 600; font-size: 14px; height: 40px;",
+    "}",
+    ".signin__submit:hover:not(:disabled) { filter: brightness(1.07); }",
+    ".signin__submit:disabled { opacity: .5; cursor: default; }",
+    ".signin__submit:focus-visible {",
+    "  outline: 3px solid var(--focus-ring); outline-offset: 2px;",
+    "  box-shadow: 0 0 0 2px var(--focus-halo);",
+    "}",
+    // Same palette as the failed-send bubble, which the contrast suite already measures at
+    // 4.5:1 - a sign-in failure is not a different kind of error.
+    ".signin__error {",
+    "  font-size: 13px; border-radius: 8px; padding: 7px 9px;",
+    "  background: var(--error-bg); color: var(--error-ink);",
+    "}",
     // first-launch example questions (removed after the first message)
     ".suggestions { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; margin: 2px 0 2px; }",
     ".suggestions__label { font-size: 12px; color: var(--muted); margin-bottom: 2px; }",
@@ -1158,6 +1408,10 @@
   // place an ARIA id reference can resolve from - one pointing at the host document
   // would fail silently.
   var GREETING_ID = "gavilan-chatbot-greeting";
+  // Same rule for the sign-in fields: a <label for> resolves only inside the shadow root that
+  // holds both ends of it. TEMPORARY, with the rest of the gate.
+  var SIGNIN_EMAIL_ID = "gavilan-chatbot-signin-email";
+  var SIGNIN_PASSWORD_ID = "gavilan-chatbot-signin-password";
 
   // Everything that can hold focus inside the panel, in DOM order. `:not([disabled])`
   // matters for Send, which disables itself while a request is pending.
@@ -1207,7 +1461,10 @@
       expanded: false,
       started: false,
       messages: [],
-      lastQuestion: null
+      lastQuestion: null,
+      // A sign-in call is in flight (TEMPORARY, with the gate). Separate from `pending`, which
+      // is about a question: the two forms are never on screen together, so they never race.
+      signingIn: false
     };
 
     // launcher
@@ -1305,9 +1562,69 @@
     form.appendChild(input);
     form.appendChild(send);
 
+    // ---- sign-in form (TEMPORARY: the whole block leaves at go-live) ----
+    //
+    // It stands IN THE COMPOSER'S PLACE rather than beside it: exactly one of the two is ever
+    // in the panel, so there is never a text box on screen that silently cannot send. Both are
+    // real <form>s, so Enter submits whichever is showing without any key handling of ours.
+    //
+    // Real <label for> pairs, not placeholder text: a placeholder disappears the moment someone
+    // types, which is exactly when they most need to know which box they are in, and it is not
+    // an accessible name. Both ends of each pair sit in this shadow root, the only place an id
+    // reference resolves from.
+    var signInForm = doc.createElement("form");
+    signInForm.className = "signin";
+    var siHeading = doc.createElement("div");
+    siHeading.className = "signin__heading";
+    var siIntro = doc.createElement("p");
+    siIntro.className = "signin__intro";
+
+    function signInField(id, type, autocomplete) {
+      var wrap = doc.createElement("div");
+      wrap.className = "signin__field";
+      var label = doc.createElement("label");
+      label.className = "signin__label";
+      label.setAttribute("for", id);
+      var field = doc.createElement("input");
+      field.className = "signin__input";
+      field.setAttribute("id", id);
+      field.setAttribute("type", type);
+      // Let a password manager fill this. The widget stores nothing itself; whether the
+      // BROWSER remembers a credential is the person's own decision, not ours to block.
+      field.setAttribute("autocomplete", autocomplete);
+      field.setAttribute("required", "required");
+      wrap.appendChild(label);
+      wrap.appendChild(field);
+      signInForm.appendChild(wrap);
+      return { label: label, field: field };
+    }
+
+    var siError = doc.createElement("div");
+    siError.className = "signin__error";
+    // A failure has to be announced, not just drawn: the person's focus is in a field, not on
+    // the message. role=alert so it is read when it appears, and hidden when there is nothing
+    // to say so it is not an empty box in the layout or a stray node in the tree.
+    siError.setAttribute("role", "alert");
+    siError.hidden = true;
+
+    var siSubmit = doc.createElement("button");
+    siSubmit.type = "submit";
+    siSubmit.className = "signin__submit";
+
+    signInForm.appendChild(siHeading);
+    signInForm.appendChild(siIntro);
+    var siEmailPair = signInField(SIGNIN_EMAIL_ID, "email", "username");
+    var siPasswordPair = signInField(SIGNIN_PASSWORD_ID, "password", "current-password");
+    var siEmail = siEmailPair.field;
+    var siPassword = siPasswordPair.field;
+    signInForm.appendChild(siError);
+    signInForm.appendChild(siSubmit);
+    signInForm.hidden = true;
+
     panel.appendChild(header);
     panel.appendChild(thread);
     panel.appendChild(form);
+    panel.appendChild(signInForm);
     root.appendChild(panel);
 
     // ---- language ----
@@ -1354,6 +1671,14 @@
       input.setAttribute("placeholder", t("inputPlaceholder"));
       send.textContent = t("sendLabel");
       send.setAttribute("aria-label", t("sendAria"));
+      // Sign-in chrome (TEMPORARY, with the rest of the gate). Painted unconditionally, even
+      // for an ungated embed where the form is never shown: a switch must not be able to leave
+      // a half-translated form behind, and the cost of a few textContent writes is nothing.
+      siHeading.textContent = t("signInHeading");
+      siIntro.textContent = t("signInIntro");
+      siEmailPair.label.textContent = t("signInEmailLabel");
+      siPasswordPair.label.textContent = t("signInPasswordLabel");
+      siSubmit.textContent = state.signingIn ? t("signInPending") : t("signInSubmit");
     }
 
     /**
@@ -1374,7 +1699,86 @@
       if (same) return;
       setLanguage(code, true);
       applyLanguage();
+      // A sign-in failure message is chrome, not a turn, so it must not be left in the language
+      // the person just switched away from. Clearing beats retranslating: it is one line, and
+      // the next attempt writes it again. (TEMPORARY, with the gate.)
+      showSignInError("");
       if (!state.started) resetOpeningState();
+    }
+
+    // ---- sign-in gate (TEMPORARY: this whole block leaves at go-live) ----
+
+    /**
+     * Show exactly one of the composer and the sign-in form. For an UNGATED embed the gate is
+     * never true, so the composer is the only thing that has ever existed and every path here
+     * is inert. The focus trap already skips a `[hidden]` subtree, so hiding one form also
+     * takes its controls out of the Tab cycle.
+     */
+    function applyAuthState() {
+      var gated = authRequired() && !signedIn();
+      signInForm.hidden = !gated;
+      form.hidden = gated;
+    }
+
+    /** Say something went wrong, or clear it. Empty text removes the box entirely. */
+    function showSignInError(message) {
+      siError.textContent = message || "";
+      siError.hidden = !message;
+    }
+
+    function setSigningIn(pending) {
+      state.signingIn = pending;
+      siSubmit.disabled = pending;
+      siEmail.disabled = pending;
+      siPassword.disabled = pending;
+      // The button says which of the two things it is doing, rather than just greying out.
+      siSubmit.textContent = pending ? t("signInPending") : t("signInSubmit");
+    }
+
+    function focusSignIn() {
+      var target = siEmail.value ? siPassword : siEmail;
+      if (typeof target.focus === "function") {
+        try { target.focus(); } catch (e) { /* ignore */ }
+      }
+    }
+
+    /**
+     * Hand the two field values to signIn() and act on the outcome. The password is read here,
+     * passed once, and cleared from the field on BOTH paths - it is never held anywhere else,
+     * and a failed attempt must not leave it sitting in a form for the next person at the
+     * machine. The email stays, because retyping it is the wrong thing to make someone do.
+     */
+    function submitSignIn() {
+      if (state.signingIn) return;
+      var email = String(siEmail.value == null ? "" : siEmail.value).trim();
+      var password = String(siPassword.value == null ? "" : siPassword.value);
+      if (!email || !password) {
+        focusSignIn();
+        return;
+      }
+      showSignInError("");
+      setSigningIn(true);
+      signIn(email, password).then(
+        function () {
+          siPassword.value = "";
+          setSigningIn(false);
+          applyAuthState();
+          // The starter questions were withheld while the panel could not send anything; this
+          // is the moment they become real offers, so this is when they are drawn.
+          if (!state.started && !suggestionsWrap) renderSuggestions();
+          // Focus followed the form that just disappeared, so it has to be placed - and the
+          // composer is both the next step and where the greeting's description points.
+          focusInput();
+        },
+        function (err) {
+          siPassword.value = "";
+          setSigningIn(false);
+          showSignInError(
+            err && err.reason === "unavailable" ? t("signInUnavailable") : t("signInFailed")
+          );
+          focusSignIn();
+        }
+      );
     }
 
     // ---- rendering ----
@@ -1709,7 +2113,11 @@
     function seedOpeningState() {
       var greeting = appendBotMessage(t("greeting"), []);
       greetingWrap = greeting.wrap;
-      renderSuggestions();
+      // The starter questions wait for a session (TEMPORARY, with the gate). They are buttons
+      // that send a question, and while the panel cannot send anything they would be four
+      // controls that visibly do nothing. The GREETING still shows: it is what tells someone
+      // what they are being asked to sign in FOR.
+      if (!(authRequired() && !signedIn())) renderSuggestions();
       greeting.bubble.id = GREETING_ID;
       input.setAttribute("aria-describedby", GREETING_ID);
     }
@@ -1717,6 +2125,14 @@
     function submitQuestion(question) {
       var text = String(question == null ? "" : question).trim();
       if (!text || state.pending) return;
+      // Belt to the hidden composer's braces (TEMPORARY, with the gate): a programmatic submit
+      // - the test handle, or a starter chip that outlived a token - must not spend a request
+      // that is going to come back 401.
+      if (authRequired() && !signedIn()) {
+        applyAuthState();
+        focusSignIn();
+        return;
+      }
       state.started = true; // the opening state is now history: never re-rendered
       removeSuggestions(); // the starter questions go away once any message is sent
       state.lastQuestion = text;
@@ -1743,8 +2159,19 @@
         },
         function (err) {
           typing.done();
-          var retry = appendError(question);
           setPending(false);
+          // The session ended mid-conversation (TEMPORARY, with the gate). Say so and put the
+          // sign-in form back, rather than showing a "couldn't reach the assistant" bubble for
+          // something a password fixes. Reachable in practice only after a token's full day,
+          // because expiry is checked before the request rather than read off a 401.
+          if (err && err.reason === "expired") {
+            signOut();
+            applyAuthState();
+            showSignInError(t("signInExpired"));
+            focusSignIn();
+            return;
+          }
+          var retry = appendError(question);
           // Focus the retry button rather than the composer: the button lives in the
           // thread, which is EARLIER in DOM order than the composer, so from the
           // composer it was unreachable by Tab and only findable by Shift+Tab (2.4.3).
@@ -1795,7 +2222,10 @@
       state.open = true;
       panel.hidden = false;
       launcher.hidden = true;
-      focusInput();
+      // Focus the control that is actually on screen. With the gate up that is the email field,
+      // and focusing a hidden composer would drop focus to nowhere. (TEMPORARY, with the gate.)
+      if (authRequired() && !signedIn()) focusSignIn();
+      else focusInput();
       scrollToBottom();
     }
 
@@ -1834,6 +2264,13 @@
       input.value = "";
       autosize();
       submitQuestion(text);
+    });
+
+    // A real form submit, so Enter in either field works with no key handling of our own.
+    // (TEMPORARY, with the gate.)
+    signInForm.addEventListener("submit", function (e) {
+      e.preventDefault();
+      submitSignIn();
     });
 
     input.addEventListener("input", autosize);
@@ -1889,6 +2326,11 @@
     // the active language rather than in English-then-corrected.
     applyLanguage();
 
+    // Decide which of the composer and the sign-in form is on screen BEFORE seeding, because
+    // seedOpeningState asks the same question to decide whether the starter questions are real
+    // offers yet. (TEMPORARY, with the gate.)
+    applyAuthState();
+
     // seed the greeting + first-launch example questions so they're present when the panel opens
     seedOpeningState();
 
@@ -1899,6 +2341,11 @@
       close: closePanel,
       submit: submitQuestion,
       chooseLanguage: chooseLanguage,
+      // Sign-in surface, for tests only (TEMPORARY, with the gate). The handle exposes the
+      // ACTION, never the token: nothing here can read the access token back out.
+      signIn: submitSignIn,
+      signInForm: signInForm,
+      composerForm: form,
       getState: function () { return state; }
     };
   }
@@ -1933,6 +2380,16 @@
       usageEventsEnabled: usageEventsEnabled,
       USAGE_ATTR: USAGE_ATTR,
       USAGE_EVENT: USAGE_EVENT,
+      // Sign-in gate (TEMPORARY, removed at go-live). signOut is here so a test that signs in
+      // can hand an unauthenticated module back to the tests after it; there is deliberately no
+      // way to read the access token, and no way to set one without going through signIn().
+      authConfig: authConfig,
+      authRequired: authRequired,
+      signedIn: signedIn,
+      signIn: signIn,
+      signOut: signOut,
+      AUTH_POOL_ATTR: AUTH_POOL_ATTR,
+      AUTH_CLIENT_ATTR: AUTH_CLIENT_ATTR,
       CONFIG: CONFIG,
       HOST_ID: HOST_ID,
       // Localization surface. setLanguage/resetLanguage exist for test isolation: the module
