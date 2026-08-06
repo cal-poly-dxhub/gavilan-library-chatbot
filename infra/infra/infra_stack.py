@@ -64,18 +64,29 @@ from infra.config import (
 # Repo-root app/ directory holding the Lambda handler source (app/handler.py).
 # infra_stack.py is <repo>/infra/infra/infra_stack.py, so parents[2] is the repo root.
 _APP_DIR = Path(__file__).resolve().parents[2] / "app"
-# Repo-root frontend/ directory. The widget bucket takes ONLY widget.js (mock.js /
-# demo.html / demo-live.html are dev-only and must never ship). The demo site takes ONLY
-# demo-site.html, into a separate bucket of its own - see the Demo site sections below.
+# Repo-root frontend/ directory. The widget bucket takes ONLY widget.js and the downloadable
+# defaults/theme.json (mock.js / demo.html / demo-live.html are dev-only and must never
+# ship). The demo site takes ONLY demo-site.html, into a separate bucket of its own - see the
+# Demo site sections below.
 _FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 
 # The runtime theme file: uploaded BY THE CUSTOMER into the widget bucket root after
 # handover, read by widget.js on every page load. It is not in this repo and never in a
 # deployment source - the stack's whole job here is to make sure a deploy cannot delete it
-# and that a browser on another origin can read it. `theme.example.json` IS shipped (it
-# documents the keys and the defaults) and is overwritten on every deploy by design.
+# and that a browser on another origin can read it.
 _WIDGET_THEME_FILE = "theme.json"
-_WIDGET_THEME_EXAMPLE_FILE = "theme.example.json"
+
+# The starting point the customer downloads, under its own prefix in the SAME bucket. It is
+# a deployment-owned copy of the built-in defaults, ALREADY NAMED theme.json, so the whole
+# customisation flow is: click the download link in the stack outputs, edit, drag into the
+# bucket link next to it. No CLI, no rename, and no reading a generated bucket name off one
+# output to find it in a list of nineteen.
+#
+# The prefix is what makes the naming work. A second copy called theme.json cannot sit at
+# the root next to the customer's - it would BE the customer's - so it lives one level down
+# and the root stays theirs alone.
+_WIDGET_THEME_DEFAULTS_PREFIX = "defaults"
+_WIDGET_THEME_DEFAULTS_DIR = _FRONTEND_DIR / _WIDGET_THEME_DEFAULTS_PREFIX
 
 # The shipped demo page and the two placeholders the deploy stamps into it. Keeping the
 # names here (rather than inline) makes the synth-time assertion below the single place
@@ -1379,35 +1390,73 @@ class GavilanChatbotStack(Stack):
         # the auto-delete-objects custom resource, which DependsOn the OAC bucket policy,
         # which DependsOn the distribution -> a synth-blocking dependency cycle.
 
-        # Upload ONLY frontend/widget.js and the annotated theme.example.json. The
-        # include-only exclude pattern ("*" then the two "!" entries) keeps mock.js,
-        # demo.html, and any future dev files out of production. On deploy, invalidate the
-        # CloudFront cache for both so an updated file is served immediately instead of from
-        # edge cache.
+        # Upload ONLY frontend/widget.js. The include-only exclude pattern ("*" then the one
+        # "!" entry) keeps mock.js, demo.html, and any future dev files out of production. On
+        # deploy, invalidate the CloudFront cache for it so an updated widget is served
+        # immediately instead of from edge cache.
         s3deploy.BucketDeployment(
             self,
             "WidgetDeployment",
             destination_bucket=widget_bucket,
-            sources=[
-                s3deploy.Source.asset(
-                    str(_FRONTEND_DIR),
-                    exclude=["*", "!widget.js", f"!{_WIDGET_THEME_EXAMPLE_FILE}"],
-                )
-            ],
-            # THE CUSTOMER'S theme.json SURVIVES EVERY DEPLOY, and this one line is the whole
+            sources=[s3deploy.Source.asset(str(_FRONTEND_DIR), exclude=["*", "!widget.js"])],
+            # TWO FILES IN THIS BUCKET SURVIVE EVERY DEPLOY, and this one line is the whole
             # reason. BucketDeployment prunes by default - `aws s3 sync --delete` - which
             # removes destination objects the source does not contain, and the source here is
-            # a two-file asset that will never contain a file the customer wrote. Without
-            # this, the first `cdk deploy` after they set their colours silently deletes them.
+            # a one-file asset. Without this, the first `cdk deploy` after the customer sets
+            # their colours silently deletes them.
+            #
+            #   theme.json    - the customer's file, at the root. By definition never in a
+            #                   deployment source.
+            #   defaults/*    - the download below, written by a DIFFERENT BucketDeployment
+            #                   and therefore just as absent from this one's source.
+            #
+            # The second entry is not redundant. `Exclude` becomes `aws s3 sync --exclude
+            # <pattern>`, whose patterns are fnmatched against the FULL path with the sync
+            # root prepended - so "theme.json" matches the root object and nothing else, and
+            # `defaults/theme.json` would be pruned on every deploy without a pattern of its
+            # own. Verified against aws-cli 2.35.11, not assumed.
             #
             # It has to be THIS exclude (the BucketDeployment prop, which scopes the sync
             # command) and NOT the identically-named one on Source.asset, which only filters
             # what gets packed into the asset and does nothing to the prune. They are easy to
             # confuse, both are present in this call, and only one of them protects anything.
             # test_the_theme_file_is_outside_the_prune_scope pins the rendered property.
-            exclude=[_WIDGET_THEME_FILE],
+            exclude=[_WIDGET_THEME_FILE, f"{_WIDGET_THEME_DEFAULTS_PREFIX}/*"],
             distribution=widget_distribution,
-            distribution_paths=["/widget.js", f"/{_WIDGET_THEME_EXAMPLE_FILE}"],
+            distribution_paths=["/widget.js"],
+        )
+
+        # --- defaults/theme.json: the thing the customer clicks ------------------------
+        #
+        # A SECOND deployment into the SAME bucket, which is normally the way to delete
+        # widget.js by accident. It is safe here because of exactly two properties, and both
+        # are load-bearing:
+        #
+        #   prune=False            - it deletes nothing, ever, so it cannot fight the widget
+        #                            deployment over objects it does not own.
+        #   destination_key_prefix - it writes under defaults/ and nowhere else.
+        #
+        # ...and the widget deployment excludes that prefix from its own prune, so neither
+        # can reach the other's objects regardless of which one CloudFormation runs last.
+        #
+        # It exists as its own deployment because content_disposition applies to EVERY object
+        # in a deployment, and widget.js must not download as an attachment - a <script src>
+        # that comes back as a file download is a broken widget.
+        s3deploy.BucketDeployment(
+            self,
+            "WidgetThemeDefaultsDeployment",
+            destination_bucket=widget_bucket,
+            sources=[s3deploy.Source.asset(str(_WIDGET_THEME_DEFAULTS_DIR))],
+            destination_key_prefix=_WIDGET_THEME_DEFAULTS_PREFIX,
+            prune=False,
+            # The point of the whole prefix. A browser given this header saves the file
+            # instead of rendering the JSON in a tab, and saves it under the key's own name -
+            # theme.json - so the customer never has to rename anything before uploading it
+            # back. The explicit filename is belt and braces for a browser that would
+            # otherwise derive it from the URL.
+            content_disposition=f'attachment; filename="{_WIDGET_THEME_FILE}"',
+            distribution=widget_distribution,
+            distribution_paths=[f"/{_WIDGET_THEME_DEFAULTS_PREFIX}/*"],
         )
 
         # --- Shared URLs (outputs + the demo page below) -------------------------------
@@ -1512,17 +1561,35 @@ class GavilanChatbotStack(Stack):
             value=query_url,
             description="HTTP API POST /query endpoint the widget calls.",
         )
-        # Where the customer puts their theme file. Printed as a bucket path rather than a
-        # URL because the upload is a console drag-and-drop into that bucket, and the bucket
-        # name is generated - there is nowhere else to read it off.
+        # The two ends of the theming flow, both as https:// URLs so the CloudFormation
+        # Outputs tab renders them as links the customer can click. That is the entire
+        # design: a generated bucket name in a nineteen-bucket account is not something to
+        # match by eye, and the demo-site bucket sits right next to this one - an upload into
+        # the wrong one succeeds and changes nothing.
+        CfnOutput(
+            self,
+            "WidgetThemeDownload",
+            value=f"https://{widget_distribution.distribution_domain_name}"
+            f"/{_WIDGET_THEME_DEFAULTS_PREFIX}/{_WIDGET_THEME_FILE}",
+            description=(
+                "Step 1: click to download theme.json (the current defaults, already "
+                "correctly named). Edit it, then upload it via WidgetThemeUpload. "
+                "See docs/widget-theming.md."
+            ),
+        )
         CfnOutput(
             self,
             "WidgetThemeUpload",
-            value=f"s3://{widget_bucket.bucket_name}/{_WIDGET_THEME_FILE}",
+            # Deep link to the objects view of THIS bucket, so the drag-and-drop target is
+            # one click away and cannot be the wrong bucket.
+            value=(
+                f"https://{self.region}.console.aws.amazon.com/s3/buckets/"
+                f"{widget_bucket.bucket_name}?region={self.region}&tab=objects"
+            ),
             description=(
-                "Upload theme.json here to restyle the widget without a redeploy "
-                "(see docs/widget-theming.md; theme.example.json in the same bucket "
-                "documents every key)."
+                "Step 2: the widget bucket in the S3 console. Upload your edited theme.json "
+                "here, at the top level (next to widget.js), to restyle the widget with no "
+                "redeploy. Allow about a minute for the CDN."
             ),
         )
         # --- Sign-in gate: the ids, and the two commands that create the one account ---

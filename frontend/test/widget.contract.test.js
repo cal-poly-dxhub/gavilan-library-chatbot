@@ -3050,10 +3050,14 @@ test("the sign-in form is localized, and a switch does not strand it in the othe
 // questions, and a file that is not JSON. The answer is always "ignore that one key and
 // render the rest", and the default install has to stay byte-identical.
 
-// theme.example.json ships in the same bucket and is the only documentation the customer
-// is guaranteed to find, so it is tested as code, not as prose.
-const THEME_EXAMPLE = JSON.parse(
-  fs.readFileSync(path.join(__dirname, "..", "theme.example.json"), "utf8")
+// defaults/theme.json is what the customer downloads from the stack's output link and edits
+// in place, so it is tested as code: it has to BE the defaults, and it has to carry the
+// pointer to the guide, because once downloaded it travels alone.
+const THEME_DEFAULTS_PATH = path.join(__dirname, "..", "defaults", "theme.json");
+const THEME_DEFAULTS = JSON.parse(fs.readFileSync(THEME_DEFAULTS_PATH, "utf8"));
+const THEMING_DOC = fs.readFileSync(
+  path.join(__dirname, "..", "..", "docs", "widget-theming.md"),
+  "utf8"
 );
 
 // mount() reads the module-level theme, so a themed mount has to hand the default back.
@@ -3385,34 +3389,50 @@ test("the theme adds no storage and no second request path", () => {
   });
 });
 
-test("theme.example.json is valid, documented, and is the shipped default", () => {
-  // It is the only documentation guaranteed to be next to the file the customer edits, so
-  // it has to stay in step with the code rather than drift into being wrong.
-  assert.ok(Array.isArray(THEME_EXAMPLE._readme) && THEME_EXAMPLE._readme.length > 5);
-  const prose = THEME_EXAMPLE._readme.join("\n");
-  ["theme.json", "highlightColor", "fontFamily", "starterQuestions"].forEach((key) => {
-    assert.ok(prose.indexOf(key) >= 0, "_readme documents " + key);
+test("defaults/theme.json is valid, is the shipped default, and points at the guide", () => {
+  // It is downloaded, edited and re-uploaded under the name it already has - so it must be
+  // a plain theme.json the widget reads, not a variant with a different name or shape.
+  assert.strictEqual(path.basename(THEME_DEFAULTS_PATH), "theme.json");
+
+  // Once it is in someone's Downloads folder it is on its own, and JSON takes no comments,
+  // so one key carries the pointer back to the guide that documents every value.
+  assert.strictEqual(typeof THEME_DEFAULTS._readme, "string");
+  assert.ok(THEME_DEFAULTS._readme.indexOf("theme.json") >= 0, THEME_DEFAULTS._readme);
+  const url = (THEME_DEFAULTS._readme.match(/https?:\/\/\S+/) || [])[0];
+  assert.ok(url, "the _readme must carry the documentation URL");
+  assert.ok(url.endsWith("docs/widget-theming.md"), url);
+
+  // ...and that guide is now the ONLY documentation of the keys, so it is what gets tested
+  // for staying in step with the code.
+  ["highlightColor", "fontFamily", "starterQuestions"].forEach((key) => {
+    assert.ok(THEMING_DOC.indexOf(key) >= 0, "the guide documents " + key);
   });
   widget.FONT_KEYWORDS.forEach((keyword) => {
-    assert.ok(prose.indexOf('"' + keyword + '"') >= 0, "_readme lists the font keyword " + keyword);
+    assert.ok(
+      THEMING_DOC.indexOf('`"' + keyword + '"`') >= 0,
+      "the guide lists the font keyword " + keyword
+    );
   });
-  assert.ok(prose.indexOf(String(widget.MAX_STARTER_CHARS)) >= 0, "_readme states the length cap");
+  assert.ok(
+    THEMING_DOC.indexOf(String(widget.MAX_STARTER_CHARS)) >= 0,
+    "the guide states the length cap"
+  );
 
   // Every value in it equals a built-in default, so uploading it unchanged is a no-op...
-  assert.strictEqual(THEME_EXAMPLE.highlightColor, widget.DEFAULT_HIGHLIGHT);
-  assert.strictEqual(THEME_EXAMPLE.fontFamily, widget.DEFAULT_FONT);
+  assert.strictEqual(THEME_DEFAULTS.highlightColor, widget.DEFAULT_HIGHLIGHT);
+  assert.strictEqual(THEME_DEFAULTS.fontFamily, widget.DEFAULT_FONT);
   assert.deepStrictEqual(
-    THEME_EXAMPLE.starterQuestions.en,
+    THEME_DEFAULTS.starterQuestions.en,
     widget.STRINGS.en.suggestedQuestions
   );
   assert.deepStrictEqual(
-    THEME_EXAMPLE.starterQuestions.es,
+    THEME_DEFAULTS.starterQuestions.es,
     widget.STRINGS.es.suggestedQuestions
   );
   // ...and the widget reads it without dropping anything, _readme included (unknown keys
-  // are ignored, so the documentation can live in the file it documents).
-  withTheme(THEME_EXAMPLE, () => {
-    assert.strictEqual(widget.themeCss(), "", "the example theme is the default theme");
+  // are ignored, so the pointer can live in the file it points from).
+  withTheme(THEME_DEFAULTS, () => {
+    assert.strictEqual(widget.themeCss(), "", "the shipped defaults are the default theme");
     assert.deepStrictEqual(widget.starterQuestions(), widget.STRINGS.en.suggestedQuestions);
   });
 });

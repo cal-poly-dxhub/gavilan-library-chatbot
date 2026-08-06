@@ -1,0 +1,22 @@
+{
+  "_readme": "Edit the values below, keep this file named theme.json, and upload it to the top level of the widget bucket - the full guide, including what each key accepts, is at https://github.com/cal-poly-dxhub/gavilan-library-chatbot/blob/main/docs/widget-theming.md",
+
+  "highlightColor": "#8a1c30",
+
+  "fontFamily": "system",
+
+  "starterQuestions": {
+    "en": [
+      "What are the library hours?",
+      "How do I check out a book?",
+      "Where do I find my textbook?",
+      "What research databases are available?"
+    ],
+    "es": [
+      "¿Cuál es el horario de la biblioteca?",
+      "¿Cómo pido prestado un libro?",
+      "¿Dónde encuentro mi libro de texto?",
+      "¿Qué bases de datos de investigación hay?"
+    ]
+  }
+}
