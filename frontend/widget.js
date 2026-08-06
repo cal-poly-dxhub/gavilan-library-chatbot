@@ -24,6 +24,10 @@
  * switches between them. The language choice is session-only too, for the same
  * reason as the transcript: nothing about a conversation is written down.
  *
+ * Three things are customer-changeable AFTER handover without a redeploy - the highlight
+ * colour, the font family and the starter questions - by uploading a theme.json next to
+ * this file in the widget bucket. See the THEME section below and docs/widget-theming.md.
+ *
  * The ONE exception is the TEMPORARY sign-in gate's access token, which is kept
  * in `sessionStorage` so a reload does not throw away a session that is still
  * valid. That key leaves with the gate at go-live - see the gate block below for
@@ -254,7 +258,13 @@
     wakingHintDelayMs: 6000,
     // Sign-in is one small unsigned call to Cognito with no model behind it, so it has no
     // reason to sit near the query timeout. Short enough that a dead network reads as dead.
-    signInTimeoutMs: 10000
+    signInTimeoutMs: 10000,
+    // How long the boot sequence will wait for theme.json before mounting with the built-in
+    // defaults. Mounting is DEFERRED until this settles (see the boot block at the bottom),
+    // because a widget that paints maroon and then repaints in the library's colour is worse
+    // than one that appears a beat later - so this is the whole of the delay a broken or slow
+    // theme file can add to the widget appearing, and it is capped here.
+    themeTimeoutMs: 1500
   };
 
   // Capture the script element at load time (before the deferred mount runs),
@@ -747,6 +757,301 @@
   // ==========================  END API LAYER  ==============================
   // =========================================================================
 
+  // =========================================================================
+  // ==============================  THEME  ==================================
+  // =========================================================================
+  //
+  // The library owns the bucket and the distribution after handover, so the three things
+  // a customer actually asks to change - the highlight colour, the typeface, and the
+  // starter questions - are read at runtime from ONE file uploaded next to widget.js:
+  //
+  //     https://<the widget CDN>/theme.json
+  //
+  // No redeploy, no settings page, and nothing hand-edited inside a shipped file. See
+  // docs/widget-theming.md for the upload steps; frontend/theme.example.json is the
+  // annotated copy that ships beside this one.
+  //
+  // JSON, never JS. A .js config would be executable code running on the library's page
+  // with the widget's privileges; a JSON file is data that this module parses and
+  // ALLOWLISTS. Every value below is either matched against a pattern (the colour), looked
+  // up in a table we own (the font), or rendered as a text node (the questions) - nothing
+  // from the file is ever concatenated into CSS without passing one of those.
+  //
+  // Failure is per key and silent: an unreadable colour leaves the colour alone, a
+  // misspelled font keyword leaves the font alone, and malformed JSON (or a 404, which is
+  // what every install serves until the first upload) leaves everything alone. Soft-fail
+  // is the point - the file is edited by hand, by someone who cannot redeploy, so a typo
+  // has to cost them one wrong setting rather than a blank widget.
+
+  var THEME_FILE = "theme.json";
+
+  // The shipped defaults. `themeCss` emits nothing for a value still equal to its default,
+  // so an install with no theme.json renders byte-identically to the pre-theme widget.
+  var DEFAULT_HIGHLIGHT = "#8a1c30";
+  var DEFAULT_FONT = "system";
+
+  // Family only - never size, weight or line-height. Those are wired to the layout (the
+  // panel clamps, the 1.4.4 resize behaviour, the two-tone focus rings), and handing them
+  // to a text field turns a colour change into an accessibility regression.
+  //
+  // Enumerated keywords rather than a free-text font stack, and every stack here resolves
+  // on both macOS and Windows with no download and no @font-face: a customer typing a
+  // family name they have installed locally would ship a widget that falls back to Times
+  // for everyone else, and they would never see it.
+  var FONT_KEYWORDS = ["system", "sans", "serif", "mono", "inherit"];
+  var FONT_STACKS = {
+    // The OS UI font - what the widget has always used.
+    system:
+      "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
+    sans: "Arial, Helvetica, 'Helvetica Neue', sans-serif",
+    serif: "Georgia, 'Times New Roman', Times, serif",
+    mono: "ui-monospace, SFMono-Regular, Menlo, Consolas, 'Courier New', monospace",
+    // "inherit" is not a stack: it hands the widget over to whatever the host page is set
+    // in, which is the one option that cannot be enumerated. Handled separately in themeCss
+    // because it also has to defeat `:host { all: initial }`.
+    inherit: null
+  };
+
+  // Four is what the panel shows without pushing the greeting off screen on a phone, and
+  // the character cap is roughly one line of a chip at the widget's width. Over either
+  // limit the extra entries are dropped rather than truncated - a half-sentence question
+  // reads as a bug, a missing one reads as a shorter list.
+  var MAX_STARTER_QUESTIONS = 4;
+  var MAX_STARTER_CHARS = 120;
+
+  function defaultTheme() {
+    return {
+      highlight: DEFAULT_HIGHLIGHT,
+      font: DEFAULT_FONT,
+      // null (not a table of built-ins) so `starterQuestions` can tell "the customer said
+      // nothing" from "the customer said something", which is what drives the Spanish
+      // fallback below.
+      starterQuestions: null
+    };
+  }
+
+  var theme = defaultTheme();
+
+  function resetTheme() {
+    theme = defaultTheme();
+  }
+
+  /**
+   * `#abc` / `#aabbcc` (any case) expanded to a lowercase six-digit hex, or null.
+   *
+   * Deliberately narrow, for two independent reasons. It is a security boundary: this
+   * string is concatenated into a stylesheet, so anything that could carry a `;` or a `}`
+   * would let theme.json write arbitrary CSS into the widget. And the ink derivation below
+   * needs actual channel values, which a named colour or a `var()` cannot give us.
+   */
+  function normalizeHex(value) {
+    if (typeof value !== "string") return null;
+    var hex = value.trim().toLowerCase();
+    if (!/^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/.test(hex)) return null;
+    if (hex.length === 4) {
+      hex = "#" + hex[1] + hex[1] + hex[2] + hex[2] + hex[3] + hex[3];
+    }
+    return hex;
+  }
+
+  /** WCAG relative luminance of a normalized six-digit hex. */
+  function relativeLuminance(hex) {
+    var channels = [
+      parseInt(hex.slice(1, 3), 16),
+      parseInt(hex.slice(3, 5), 16),
+      parseInt(hex.slice(5, 7), 16)
+    ].map(function (v) {
+      var c = v / 255;
+      return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+  }
+
+  /**
+   * Black or white text for a given highlight - whichever contrasts better with it.
+   *
+   * There is deliberately NO validation of the customer's colour against a contrast floor,
+   * because this derivation makes one unnecessary: the worst case over every colour in the
+   * sRGB cube is the crossover point where black and white contrast equally, at luminance
+   * 0.1791, and that gives 4.58:1 - above the 4.5:1 that 1.4.3 asks for. So text on the
+   * highlight passes for ANY colour a customer can type, and there is nothing to reject.
+   */
+  function inkFor(hex) {
+    return relativeLuminance(hex) > 0.1791 ? "#000000" : "#ffffff";
+  }
+
+  /** One language's starter questions from the file, capped and cleaned, or null. */
+  function readQuestionList(value) {
+    if (!Array.isArray(value)) return null;
+    var out = [];
+    for (var i = 0; i < value.length && out.length < MAX_STARTER_QUESTIONS; i++) {
+      if (typeof value[i] !== "string") continue;
+      var q = value[i].replace(/\s+/g, " ").trim();
+      if (!q || q.length > MAX_STARTER_CHARS) continue;
+      out.push(q);
+    }
+    return out.length ? out : null;
+  }
+
+  /**
+   * The per-language starter questions from the file, or null if it offered none usable.
+   * Only the languages the widget actually offers are read, so an unknown key is ignored
+   * rather than becoming a language nobody can select.
+   */
+  function readStarterQuestions(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    var out = null;
+    for (var i = 0; i < LANGUAGES.length; i++) {
+      var list = readQuestionList(value[LANGUAGES[i]]);
+      if (!list) continue;
+      out = out || {};
+      out[LANGUAGES[i]] = list;
+    }
+    return out;
+  }
+
+  /**
+   * Merge a parsed theme.json over the built-in defaults. Returns true if anything moved.
+   * Always starts from a fresh default set, so this is idempotent and a re-parse of a
+   * broken file cannot leave half of a previous one behind.
+   */
+  function applyTheme(data) {
+    theme = defaultTheme();
+    if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+    var changed = false;
+
+    var hex = normalizeHex(data.highlightColor);
+    if (hex) {
+      theme.highlight = hex;
+      changed = true;
+    }
+
+    // indexOf against our own list, not a property lookup on FONT_STACKS: `"constructor"`
+    // is a truthy property of every object literal, and a lookup would happily resolve it.
+    if (typeof data.fontFamily === "string") {
+      var font = data.fontFamily.trim().toLowerCase();
+      if (FONT_KEYWORDS.indexOf(font) >= 0) {
+        theme.font = font;
+        changed = true;
+      }
+    }
+
+    var questions = readStarterQuestions(data.starterQuestions);
+    if (questions) {
+      theme.starterQuestions = questions;
+      changed = true;
+    }
+
+    return changed;
+  }
+
+  /**
+   * The starter questions to show, in the active language.
+   *
+   * Spanish is optional in the file and falls back to the customer's ENGLISH list rather
+   * than to our built-in Spanish one. That looks backwards until you consider what a
+   * customised English list means: they have replaced our questions with theirs, and the
+   * shipped Spanish questions may now ask about a service they removed. Showing their
+   * English wording to a Spanish reader is worse copy but honest; machine-translating it
+   * would be neither, so it is not done.
+   */
+  function starterQuestions() {
+    if (theme.starterQuestions) {
+      var list = theme.starterQuestions[lang.code] || theme.starterQuestions[DEFAULT_LANG];
+      if (list && list.length) return list;
+    }
+    return t("suggestedQuestions");
+  }
+
+  /**
+   * The theme's CSS, appended AFTER the shipped stylesheet inside the same <style> element.
+   * Same-specificity later rules win, so this overrides without the base stylesheet having
+   * to know a theme exists - and it is empty for an unthemed install, which is what keeps
+   * the default rendering provably unchanged.
+   */
+  function themeCss() {
+    var rules = [];
+    if (theme.highlight !== DEFAULT_HIGHLIGHT) {
+      var ink = inkFor(theme.highlight);
+      // --brand is the single source of truth the base stylesheet already derives the
+      // header, launcher, buttons, user bubbles and links from; the two ink variables are
+      // everything drawn ON the highlight.
+      rules.push(
+        ".root { --brand: " + theme.highlight +
+          "; --accent-ink: " + ink +
+          "; --user-ink: " + ink + "; }"
+      );
+    }
+    if (theme.font === "inherit") {
+      // `:host { all: initial }` resets font-family to the browser default, which is not
+      // the host page's family - so inheriting takes an explicit later declaration on the
+      // host element, where `inherit` means "the page element this widget was appended to".
+      rules.push(":host { font-family: inherit; }");
+      rules.push(".root, .header__title { font-family: inherit; }");
+    } else if (theme.font !== DEFAULT_FONT) {
+      rules.push(".root, .header__title { font-family: " + FONT_STACKS[theme.font] + "; }");
+    }
+    return rules.join("\n");
+  }
+
+  /** Absolute URL of theme.json, resolved next to this script's own src. */
+  function themeUrl() {
+    var el = scriptEl();
+    if (!el) return null;
+    var src = el.src || (el.getAttribute ? el.getAttribute("src") : null);
+    if (!src) return null;
+    try {
+      return new URL(THEME_FILE, src).href;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /**
+   * Fetch and apply theme.json. NEVER rejects and never waits longer than
+   * CONFIG.themeTimeoutMs: the boot sequence holds the mount on this promise, so a hung
+   * CDN must degrade to the default theme rather than to no widget at all.
+   *
+   * Cross-origin by construction (the CDN is not the library's domain), so the widget
+   * distribution serves this path with CORS headers - see the theme behavior in
+   * infra/infra/infra_stack.py.
+   */
+  function loadTheme() {
+    return new Promise(function (resolve) {
+      var url = themeUrl();
+      if (!url || typeof fetch === "undefined") return resolve(false);
+      var settled = false;
+      function finish(applied) {
+        if (settled) return;
+        settled = true;
+        resolve(applied);
+      }
+      var timer = setTimeout(function () { finish(false); }, CONFIG.themeTimeoutMs);
+      function done(applied) {
+        clearTimeout(timer);
+        finish(applied);
+      }
+      try {
+        fetch(url, { method: "GET" })
+          .then(function (res) {
+            // A 404 is the NORMAL state of a fresh install - nobody has uploaded a theme
+            // yet - so it is not an error path, just an empty one.
+            return res && res.ok ? res.json() : null;
+          })
+          .then(
+            function (data) { done(applyTheme(data)); },
+            function () { done(false); }
+          );
+      } catch (e) {
+        done(false);
+      }
+    });
+  }
+
+  // =========================================================================
+  // ============================  END THEME  ================================
+  // =========================================================================
+
   // ---- small helpers (no dependencies) ------------------------------------
 
   /**
@@ -1184,6 +1489,10 @@
   // head (not the shadow root) because @font-face registered at the document level is usable
   // inside the shadow tree, which a shadow-scoped link cannot guarantee across browsers. Purely
   // decorative: if the host site's CSP blocks the font, the title just falls back to serif.
+  //
+  // Bitter belongs to the DEFAULT theme, not to the widget: any other `fontFamily` keyword
+  // replaces the title's family too, which would leave this fetching a webfont nothing uses.
+  // So mount only calls this when the theme is the default one - see the guard there.
   var FONT_LINK_ID = "gavilan-chatbot-font";
   var FONT_HREF =
     "https://fonts.googleapis.com/css2?family=Bitter:wght@600;700&display=swap";
@@ -1313,8 +1622,14 @@
     "  color: var(--accent-ink); font-size: 22px; line-height: 1;",
     "  cursor: pointer; padding: 2px 6px; border-radius: 6px;",
     "}",
-    ".header__close:hover { background: rgba(255,255,255,0.18); }",
-    ".header__close:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }",
+    // The header's own overlays and rings are white because the ink on the highlight is
+    // white - they are the SAME decision, not two. So they track --accent-ink (via
+    // currentColor for the washes), which the theme derives from the highlight colour.
+    // A themed install with a light highlight gets black ink and black washes here, and a
+    // white ring on pale yellow - which is what these used to hardcode - never happens.
+    // This is not the two-tone --focus-ring/--focus-halo pair, which stays fixed.
+    ".header__close:hover { background: color-mix(in srgb, currentColor 18%, transparent); }",
+    ".header__close:focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 1px; }",
     ".header__actions { display: inline-flex; align-items: center; gap: 2px; flex: 0 0 auto; margin-left: auto; }",
     // language control: a segmented pair of real buttons in the header. The ACTIVE one is a
     // filled white pill, not merely a different text color, so the state reads without relying
@@ -1322,23 +1637,26 @@
     // what drives the styling (one source of truth, no parallel class to fall out of sync).
     ".header__lang {",
     "  display: inline-flex; align-items: center; gap: 2px; margin-right: 4px;",
-    "  background: rgba(255,255,255,0.16); border-radius: 999px; padding: 2px;",
+    "  background: color-mix(in srgb, currentColor 16%, transparent); border-radius: 999px; padding: 2px;",
     "}",
     ".header__lang-btn {",
     "  appearance: none; border: none; background: transparent; color: var(--accent-ink);",
     "  font: inherit; font-size: 11px; font-weight: 700; line-height: 1; white-space: nowrap;",
     "  cursor: pointer; padding: 4px 8px; border-radius: 999px;",
     "}",
-    ".header__lang-btn:hover { background: rgba(255,255,255,0.2); }",
-    ".header__lang-btn[aria-pressed=\"true\"] { background: #fff; color: var(--brand); }",
-    ".header__lang-btn:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }",
+    ".header__lang-btn:hover { background: color-mix(in srgb, currentColor 20%, transparent); }",
+    // The active pill is the ink/highlight pair inverted, so it carries exactly the ratio
+    // the un-inverted pair does - at worst the 4.58:1 floor that picking the better of
+    // black and white guarantees.
+    ".header__lang-btn[aria-pressed=\"true\"] { background: var(--accent-ink); color: var(--brand); }",
+    ".header__lang-btn:focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 2px; }",
     ".header__expand {",
     "  appearance: none; border: none; background: transparent;",
     "  color: var(--accent-ink); font-size: 17px; line-height: 1;",
     "  cursor: pointer; padding: 2px 6px; border-radius: 6px;",
     "}",
-    ".header__expand:hover { background: rgba(255,255,255,0.18); }",
-    ".header__expand:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }",
+    ".header__expand:hover { background: color-mix(in srgb, currentColor 18%, transparent); }",
+    ".header__expand:focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 1px; }",
     // thread
     ".thread {",
     "  flex: 1 1 auto; overflow-y: auto; padding: 14px;",
@@ -1576,7 +1894,11 @@
     if (!doc || !doc.body) return null;
     if (doc.getElementById(HOST_ID)) return null; // already mounted
 
-    ensureTitleFont(doc); // load Bitter for the title (host document head; safe no-op if blocked)
+    // Bitter is the default theme's title face, so a themed font keyword means there is no
+    // webfont to fetch at all (see ensureTitleFont).
+    if (theme.font === DEFAULT_FONT) {
+      ensureTitleFont(doc); // host document head; safe no-op if blocked
+    }
 
     var host = doc.createElement("div");
     host.id = HOST_ID;
@@ -1584,7 +1906,11 @@
     var shadow = host.attachShadow({ mode: "open" });
 
     var style = doc.createElement("style");
-    style.textContent = STYLES;
+    // The theme's overrides go in the SAME element, after the shipped rules, so the first
+    // paint is already themed: there is no second stylesheet to arrive and no frame in
+    // which the default colours are on screen. Empty string for an unthemed install.
+    var overrides = themeCss();
+    style.textContent = overrides ? STYLES + "\n" + overrides : STYLES;
     shadow.appendChild(style);
 
     var root = doc.createElement("div");
@@ -2215,7 +2541,9 @@
     var greetingWrap = null;
 
     function renderSuggestions() {
-      var qs = t("suggestedQuestions");
+      // starterQuestions(), not t(): theme.json can replace this list per language, and the
+      // built-in table is what it falls back to.
+      var qs = starterQuestions();
       if (!qs || !qs.length) return;
       var wrap = doc.createElement("div");
       wrap.className = "suggestions";
@@ -2546,11 +2874,25 @@
     // Fire the pre-warm as early as the deferred script runs, so the OSS cold start overlaps
     // with the user reading the page rather than their first query.
     warmBackend();
-    if (document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", function () { mount(); });
-    } else {
-      mount();
-    }
+
+    // theme.json is fetched in PARALLEL with the rest of page load and the mount waits on
+    // it, so the widget is themed on its first paint rather than repainted a frame later.
+    // The wait costs nothing in the normal case (a small same-CDN file, usually already in
+    // flight before the DOM is ready) and is capped at CONFIG.themeTimeoutMs in the bad one:
+    // a dead CDN delays the launcher by that much and then shows the default colours.
+    // mount() itself stays synchronous and theme-free, which is what the tests drive.
+    var themeSettled = loadTheme();
+    var domSettled = new Promise(function (resolve) {
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", function () { resolve(); });
+      } else {
+        resolve();
+      }
+    });
+    Promise.all([themeSettled, domSettled]).then(
+      function () { mount(); },
+      function () { mount(); }
+    );
   }
 
   if (IS_COMMONJS) {
@@ -2583,6 +2925,23 @@
       AUTH_STORAGE_KEY: AUTH_STORAGE_KEY,
       CONFIG: CONFIG,
       HOST_ID: HOST_ID,
+      // Runtime theme surface. resetTheme exists for the same reason resetLanguage does:
+      // the module is loaded once per process, so a test that themes it has to hand the
+      // shipped default back to the tests after it. loadTheme is not exported - the fetch
+      // is boot-only, and applyTheme is the whole of what a test needs to drive.
+      applyTheme: applyTheme,
+      resetTheme: resetTheme,
+      themeCss: themeCss,
+      themeUrl: themeUrl,
+      starterQuestions: starterQuestions,
+      inkFor: inkFor,
+      THEME_FILE: THEME_FILE,
+      FONT_KEYWORDS: FONT_KEYWORDS,
+      FONT_STACKS: FONT_STACKS,
+      DEFAULT_HIGHLIGHT: DEFAULT_HIGHLIGHT,
+      DEFAULT_FONT: DEFAULT_FONT,
+      MAX_STARTER_QUESTIONS: MAX_STARTER_QUESTIONS,
+      MAX_STARTER_CHARS: MAX_STARTER_CHARS,
       // Localization surface. setLanguage/resetLanguage exist for test isolation: the module
       // is loaded once per process, so a test that switches language has to hand the default
       // back to the tests that follow it.

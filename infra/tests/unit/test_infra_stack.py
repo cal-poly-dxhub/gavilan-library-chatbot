@@ -902,6 +902,113 @@ def test_widget_bucket_deployment_uploads_the_widget():
     assert "WidgetBucket" in blob and "DemoSiteBucket" in blob, blob
 
 
+# --- theme.json: the customer's file, on infrastructure they inherit -----------
+#
+# It is uploaded by hand after handover, into a bucket a deploy also writes to and reads
+# from a CDN built for a file that changes once a release. Three things have to be true of
+# the template or the feature is worse than not shipping it: a deploy cannot delete it, a
+# browser on another origin can read it, and an edit shows up in about a minute.
+
+
+def _widget_deployment(template):
+    """The widget bucket's BucketDeployment custom resource (not the demo site's)."""
+    deps = {
+        lid: r
+        for lid, r in template.find_resources("Custom::CDKBucketDeployment").items()
+        if "DemoSite" not in lid
+    }
+    assert len(deps) == 1, list(deps)
+    return next(iter(deps.values()))
+
+
+def test_the_theme_file_is_outside_the_prune_scope():
+    # THE regression this feature can have: BucketDeployment prunes with `aws s3 sync
+    # --delete`, and the customer's theme.json is by definition not in the deployment's
+    # source - so without an explicit exclude the first deploy after they set their colours
+    # deletes their file and the widget silently reverts. The fix is one property, and it is
+    # the BucketDeployment `exclude` (which scopes the sync command), NOT the identically
+    # named argument on Source.asset (which only filters what is packed into the asset).
+    # Both are in that call; only this one shows up here.
+    props = _widget_deployment(_template())["Properties"]
+    assert props["Prune"] is True, "still pruning - the exclude is a scope, not an off switch"
+    assert props["Exclude"] == ["theme.json"], props.get("Exclude")
+
+    # And nothing in the repo ships a theme.json, so the deployed asset can never contain a
+    # file that would overwrite the customer's. theme.example.json is the one that ships.
+    frontend = pathlib.Path(__file__).resolve().parents[3] / "frontend"
+    assert not (frontend / "theme.json").exists(), "the repo must not ship a theme.json"
+    assert (frontend / "theme.example.json").exists()
+    assert props["DistributionPaths"] == ["/widget.js", "/theme.example.json"]
+
+
+def test_the_theme_file_is_served_cross_origin_and_briefly_cached():
+    template = _template()
+    config = _distribution(template, "widget.js")["Properties"]["DistributionConfig"]
+
+    # Its own behavior on the widget distribution, matched by path.
+    behaviors = {b["PathPattern"]: b for b in config.get("CacheBehaviors", [])}
+    assert "theme.json" in behaviors, behaviors
+    theme_behavior = behaviors["theme.json"]
+
+    # CORS. The fetch is cross-origin by construction - the widget runs on the library's page
+    # and the file is on the CDN - so without this the browser refuses to hand the body to
+    # widget.js and every install silently renders the default theme.
+    policies = template.find_resources("AWS::CloudFront::ResponseHeadersPolicy")
+    (cors_policy,) = [
+        r
+        for lid, r in policies.items()
+        if lid.startswith("WidgetTheme")
+    ]
+    cfg = cors_policy["Properties"]["ResponseHeadersPolicyConfig"]
+    cors = cfg["CorsConfig"]
+    # `*` here is NOT the wildcard config.yaml rejects for the API: that one guards a
+    # billable POST endpoint, this is a world-readable static file on the customer's own CDN.
+    assert cors["AccessControlAllowOrigins"]["Items"] == ["*"], cors
+    assert cors["AccessControlAllowMethods"]["Items"] == ["GET", "HEAD"], cors
+    assert cors["AccessControlAllowCredentials"] is False, cors
+    assert cors["OriginOverride"] is True, cors
+    # Freshness for the BROWSER, which would otherwise apply heuristic caching off S3's
+    # Last-Modified and could hold a stale theme for hours. It cannot come from the object:
+    # the customer uploads through the S3 console, which sets no metadata.
+    (header,) = cfg["CustomHeadersConfig"]["Items"]
+    assert header["Header"] == "Cache-Control", header
+    assert "max-age=60" in header["Value"], header
+    assert theme_behavior["ResponseHeadersPolicyId"] == {"Ref": _logical_id(policies, cors_policy)}
+
+    # Freshness for the EDGE. CACHING_OPTIMIZED, which widget.js uses, is a 24-hour default
+    # TTL - right for a file versioned by deploy, wrong for one edited by hand.
+    (cache_policy,) = [
+        r for lid, r in template.find_resources("AWS::CloudFront::CachePolicy").items()
+        if lid.startswith("WidgetTheme")
+    ]
+    ttls = cache_policy["Properties"]["CachePolicyConfig"]
+    assert ttls["DefaultTTL"] == 60 and ttls["MaxTTL"] == 60 and ttls["MinTTL"] == 0, ttls
+
+    # widget.js delivery is untouched: the default behavior keeps its own cache policy and
+    # takes on no response-headers policy (a <script src> is not a cross-origin fetch).
+    default_behavior = config["DefaultCacheBehavior"]
+    assert "ResponseHeadersPolicyId" not in default_behavior, default_behavior
+    assert default_behavior["CachePolicyId"] != theme_behavior["CachePolicyId"]
+
+
+def _logical_id(resources, target):
+    for lid, r in resources.items():
+        if r is target:
+            return lid
+    raise AssertionError("resource not found")
+
+
+def test_the_stack_says_where_to_put_the_theme_file():
+    # The bucket name is generated, so an output is the only place the customer can read it -
+    # and the upload is a console drag-and-drop, not a URL fetch.
+    outputs = _template().find_outputs("*")
+    assert "WidgetThemeUpload" in outputs, list(outputs)
+    value = outputs["WidgetThemeUpload"]["Value"]
+    literals = "".join(p for p in value["Fn::Join"][1] if isinstance(p, str))
+    assert literals.startswith("s3://"), literals
+    assert literals.endswith("/theme.json"), literals
+
+
 def test_stack_outputs_ready_to_paste_embed_tag():
     template = _template()
     outputs = template.find_outputs("*")
@@ -1035,15 +1142,22 @@ def test_demo_site_origin_is_allowlisted_at_deploy_time():
 def test_demo_site_is_marked_as_a_demo_and_noindex():
     template = _template()
     # noindex at the edge: a crawler that never parses the HTML still gets the header, and the
-    # header cannot be lost to an edit of the page.
-    policies = template.find_resources("AWS::CloudFront::ResponseHeadersPolicy")
+    # header cannot be lost to an edit of the page. Selected by logical id rather than counted:
+    # the widget CDN carries a response-headers policy of its own now (CORS for theme.json),
+    # and this test is about the demo's.
+    policies = {
+        lid: r
+        for lid, r in template.find_resources("AWS::CloudFront::ResponseHeadersPolicy").items()
+        if "DemoSite" in lid
+    }
     assert len(policies) == 1, list(policies)
     (policy,) = policies.values()
     headers = policy["Properties"]["ResponseHeadersPolicyConfig"]["CustomHeadersConfig"]["Items"]
     robots = [h for h in headers if h["Header"] == "X-Robots-Tag"]
     assert robots and "noindex" in robots[0]["Value"], headers
-    # ...and it is attached to the DEMO distribution only; the production widget CDN keeps
-    # its original behavior with no response-headers policy.
+    # ...and it is attached to the DEMO distribution only; the production widget CDN's DEFAULT
+    # behavior - the one that serves widget.js - still carries no response-headers policy at
+    # all, so the demo's noindex has never reached it and neither has theme.json's CORS.
     demo_behavior = _distribution(template, "index.html")["Properties"]["DistributionConfig"][
         "DefaultCacheBehavior"
     ]
@@ -1099,7 +1213,10 @@ def test_demo_site_can_be_turned_off_in_config():
     template.resource_count_is("AWS::CloudFront::Distribution", 1)
     template.resource_count_is("AWS::CloudFront::OriginAccessControl", 1)
     template.resource_count_is("Custom::CDKBucketDeployment", 1)
-    template.resource_count_is("AWS::CloudFront::ResponseHeadersPolicy", 0)
+    # One response-headers policy survives, and it is the widget's theme.json CORS one, not a
+    # leftover of the demo's noindex.
+    policies = template.find_resources("AWS::CloudFront::ResponseHeadersPolicy")
+    assert [lid for lid in policies if "DemoSite" in lid] == [], list(policies)
     assert "DemoSiteUrl" not in template.find_outputs("*")
 
     # The allowlist falls back to exactly what config lists and nothing else: no leftover demo
@@ -1137,11 +1254,12 @@ def test_demo_site_does_not_change_widget_delivery():
         return next(iter(deps.values()))["Properties"]
 
     a, b = widget_deployment(with_demo), widget_deployment(without_demo)
-    for key in ("DestinationBucketName", "DistributionPaths", "Prune", "SourceObjectKeys"):
+    for key in ("DestinationBucketName", "DistributionPaths", "Prune", "Exclude", "SourceObjectKeys"):
         assert a.get(key) == b.get(key), (key, a.get(key), b.get(key))
-    # Still pruning its own bucket, still only widget.js, still invalidated on deploy.
+    # Still pruning its own bucket, still shipping exactly the two files it owns, still
+    # invalidated on deploy.
     assert a["Prune"] is True
-    assert a["DistributionPaths"] == ["/widget.js"]
+    assert a["DistributionPaths"] == ["/widget.js", "/theme.example.json"]
     assert "SourceMarkers" not in a, "the widget upload must stay a plain asset copy"
 
     assert (

@@ -1,0 +1,59 @@
+{
+  "_readme": [
+    "This file is an EXAMPLE, and every value in it is the widget's built-in default.",
+    "It is overwritten on every deploy, so do not edit it in place - copy it.",
+    "",
+    "TO USE IT: download this file, edit the values, save it as theme.json, and upload",
+    "theme.json to the SAME bucket, at the top level (next to widget.js). The widget reads",
+    "it on every page load, so a change is live within about a minute - no redeploy.",
+    "Deleting theme.json puts everything back to these defaults.",
+    "",
+    "Keys this widget reads are listed below. Anything else in the file - including this",
+    "_readme - is ignored, and any single key it cannot understand is ignored on its own:",
+    "a typo in the colour leaves the colour alone rather than breaking the widget. The one",
+    "exception is a file that is not valid JSON, which is ignored entirely. Paste it into a",
+    "JSON validator if the widget does not pick up your change.",
+    "",
+    "highlightColor - the one colour the widget is built from. It fills the header, the",
+    "  launcher button, the Send button and your own chat bubbles, and tints the links.",
+    "  A hex colour and nothing else - six digits (\"#8a1c30\") or three (\"#a13\").",
+    "  Colour names (\"maroon\") and rgb() values are NOT read. The text drawn on top of it",
+    "  is chosen for you - black or white, whichever is easier to read on your colour - so",
+    "  there is no second value to set and no combination that comes out unreadable.",
+    "",
+    "fontFamily - one of these five words, and nothing else. Fonts are not downloaded, so",
+    "  the choice is limited to what every Mac and Windows machine already has:",
+    "    \"system\"  - the visitor's own operating-system interface font (the default).",
+    "    \"sans\"    - Arial / Helvetica.",
+    "    \"serif\"   - Georgia / Times New Roman.",
+    "    \"mono\"    - a fixed-width font (Menlo / Consolas).",
+    "    \"inherit\" - whatever font the page the widget sits on is already using.",
+    "  Only the typeface changes. Text sizes, weights and line spacing are fixed, because",
+    "  they are what keep the panel readable when a visitor zooms in.",
+    "",
+    "starterQuestions - the example questions offered under the greeting, before anyone has",
+    "  typed anything. Up to FOUR per language, each up to 120 characters; extra or",
+    "  over-long ones are dropped. \"es\" is optional - leave it out and Spanish visitors see",
+    "  your English list, because nothing here is machine-translated. Remove the whole",
+    "  starterQuestions block to keep the built-in questions in both languages."
+  ],
+
+  "highlightColor": "#8a1c30",
+
+  "fontFamily": "system",
+
+  "starterQuestions": {
+    "en": [
+      "What are the library hours?",
+      "How do I check out a book?",
+      "Where do I find my textbook?",
+      "What research databases are available?"
+    ],
+    "es": [
+      "¿Cuál es el horario de la biblioteca?",
+      "¿Cómo pido prestado un libro?",
+      "¿Dónde encuentro mi libro de texto?",
+      "¿Qué bases de datos de investigación hay?"
+    ]
+  }
+}
