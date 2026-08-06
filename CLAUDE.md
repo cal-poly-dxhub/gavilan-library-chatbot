@@ -16,6 +16,7 @@ RAG chatbot for Gavilan College Library. Answers operational student questions (
 - **Guardrails:** ONE Bedrock Guardrail, screening the INPUT for `PROMPT_ATTACK` and nothing else (see "Guardrail note")
 - **Config:** `config.yaml` at repo root; single source of truth for changeable knobs
 - **Frontend:** vanilla JS widget (Shadow DOM, dependency-free). Bilingual chrome (English + Español) from one string table, switched by a control in the panel header; an explicit choice is sent as `language` on the request
+- **Runtime theming:** the customer changes the highlight colour, the font family and the starter questions by uploading ONE `theme.json` to the widget bucket root - no redeploy, no code edit. Fetched at init, merged over built-in defaults, soft-failing per key. See "Widget theme file" below and `docs/widget-theming.md`
 - **Demo site:** one static page (`frontend/demo-site.html`) on its OWN S3 + CloudFront, embedding the production widget from the production CDN. `cdk deploy` stamps the live API + widget URLs AND the `cost_model` block into it, and outputs `DemoSiteUrl`. Toggle with `demo_site.enabled` in config.yaml
 - **Cost visibility (demo only):** the demo page carries a session cost meter + a monthly estimator behind one control in the DEMO banner. It is fed by the widget's opt-in `data-usage-events` attribute (absent from the production embed) and the handler's opt-in `include_usage` flag. Rates + measured constants live in `config.yaml` under `cost_model`; re-measure with `eval/measure_usage.py`
 
@@ -138,6 +139,63 @@ The demo link is unauthenticated Bedrock spend, so `POST /query` sits behind a C
 - **The widget stores NOTHING**: token in a JS variable, no browser storage, no cookie, refresh token dropped unread. Reload means signing in again, by design.
 - **Removing it** is: the auth section in `infra_stack.py`, the `Authorization` entry in `allow_headers`, `authorizer=` on the `/query` route, the four `DemoAuth*` outputs, the two `data-*` attributes on the embed tag and in `demo-site.html` (+ their placeholders), and everything in `widget.js` and the contract test marked TEMPORARY.
 
+## Widget theme file (`theme.json`)
+
+At pickup the client deploys this stack into their OWN account, so the widget bucket and its
+distribution are theirs. Three things they will ask to change - the highlight colour, the font
+and the starter questions - are read at RUNTIME from `theme.json` at the widget bucket root.
+No redeploy, no settings page (a second surface to auth, host and maintain after handover), no
+hand-editing a shipped file. Full customer-facing guide in `docs/widget-theming.md`.
+
+- **JSON, never JS.** A `.js` config is executable code on the library's page with the widget's
+  privileges. Every value is allowlisted: the colour matched against a hex pattern (it is
+  concatenated into a stylesheet, so that regex is a security boundary - anything carrying `;`
+  or `}` would let the file restyle or hide the widget), the font looked up in a table we own,
+  the questions rendered as text nodes.
+- **Soft-fails per key**; malformed JSON (or the 404 every install serves until the first
+  upload) falls back entirely. An unthemed install emits ZERO theme CSS, so its rendering is
+  provably byte-identical to the pre-theme widget.
+- **The customer's file must survive `cdk deploy`.** `BucketDeployment` prunes with `aws s3
+  sync --delete` and the source will never contain a file the customer wrote, so the widget
+  deployment carries `exclude=["theme.json"]`. That is the **BucketDeployment** prop (it scopes
+  the sync command), NOT the identically named argument on `Source.asset` (which only filters
+  what is packed into the asset and protects nothing). Both are in that one call. Pinned by
+  `test_the_theme_file_is_outside_the_prune_scope`.
+- **`theme.example.json` ships** (documents every key + default) and is overwritten freely; the
+  repo must never contain a `theme.json`.
+- **Highlight colour ONLY.** No background or text knob: twelve colour values are not tokens,
+  and the divider, focus ring and halo were each measured against specific light surfaces to
+  clear 3:1. Text ON the highlight is DERIVED - black or white, whichever contrasts better -
+  and needs no validation: the worst case over the whole sRGB cube is the black/white crossover
+  at 4.58:1, above the 4.5:1 floor. Everything drawn on the header (washes, its own rings)
+  follows that derived ink rather than a hardcoded `#fff`, or a pale highlight gets an invisible
+  focus ring. The two-tone `--focus-ring`/`--focus-halo` pair is NOT themeable.
+- **Font: enumerated keywords, family only.** `system` (default) / `sans` / `serif` / `mono` /
+  `inherit`. Never size, weight or line-height - those are wired to the panel's zoom/reflow
+  clamps, so a font-size field turns a branding change into an accessibility regression. Every
+  stack resolves on macOS AND Windows with no download and no `@font-face`, because a customer
+  typing a locally-installed family name would ship a Times fallback for everyone else and
+  never see it. Bitter belongs to the DEFAULT theme, so the Google Fonts fetch is conditional
+  on `fontFamily == "system"`.
+- **Starter questions: per-language, max four each, 120 chars.** Over-long entries are dropped,
+  not truncated. Spanish is optional and falls back to the customer's ENGLISH list, not to our
+  built-in Spanish (which may now ask about a service they removed). No machine translation.
+- **CORS + TTL come from the DISTRIBUTION, not the object** - the customer uploads through the
+  S3 console and sets no metadata. `theme.json` gets its own cache behavior on the widget
+  distribution: a 60s cache policy plus a response-headers policy carrying
+  `Access-Control-Allow-Origin: *` and `Cache-Control: max-age=60`. The `*` is NOT the wildcard
+  `config.py` rejects for the API - that one guards a billable POST endpoint; this is a
+  world-readable static file on the customer's own CDN, and an exact allowlist would add no
+  secrecy and one silent failure mode (a staging subdomain nobody listed). `widget.js` delivery
+  is untouched: the default behavior keeps `CACHING_OPTIMIZED` and takes no CORS header.
+- **No flash of default colours.** The fetch runs in parallel with page load and the mount
+  WAITS on it, capped at `CONFIG.themeTimeoutMs` (1.5s) - so a themed install paints themed on
+  the first frame and a dead CDN delays the launcher by at most that before showing defaults.
+  `mount()` itself stays synchronous and theme-free (that is what the contract tests drive).
+- **Conformance scope:** the accessibility audit measured DEFAULT colours. Derived ink is safe
+  at any highlight, but the highlight is also a text colour on light surfaces (links, source
+  links, starter chips), so a custom one is the customer's to verify.
+
 ## `/feedback` contract (the widget's report-an-answer path will build against this)
 
 `POST /feedback` request shape - an ALLOWLIST of exactly five fields, and an unexpected sixth is a `400` rather than something passed through into a librarian's inbox:
@@ -182,12 +240,13 @@ The email is PLAIN TEXT and the `Subject` is a CONSTANT - no user-supplied text 
 - `scraper/` - scraper Lambda source. `scraper.py` (pure fetch/extract, incl. `extract_database_catalog` HTML parse, plus the tier helpers `all_seed_urls`/`urls_for_tier` shared by the Lambda and the CLI; `--tier` on the CLI) + `lambda_function.py` (gated S3 upload, gated KB ingestion, catalog regeneration: parse -> guard -> fingerprint gate -> Sonnet enrichment -> write to the catalog bucket). Own `.venv`/tests (needs trafilatura). `requirements-dev.txt` pins pytest to the same version as `infra/` and `eval/`; the tests need the runtime deps too, so install both files.
 - `eval/` - Bedrock RAG eval harness (boto3 tooling, NOT CDK). Runs on demand against deployed infra; cannot run offline. Retrieve-only formatter (chunking eval) + retrieve-and-generate formatter (answer quality, bring-your-own-inference). `capture_outputs.py` is a STUB until the bot is deployed. Separate `eval_config.yaml`.
   - `measure_usage.py` - measures what a question actually COSTS, by POSTing `/query` with `include_usage` and fitting the results. Prints the paste-ready `cost_model.measured` block for config.yaml. On demand only (it spends real Bedrock money); re-run after anything that moves token usage - `retrieval.number_of_results`, `chunking`, the system prompt, the link table, `generation.max_tokens`.
-- `frontend/` - embeddable widget + the demo page. TWO files ship, to two SEPARATE buckets:
+- `frontend/` - embeddable widget + the demo page. THREE files ship, to two SEPARATE buckets:
   - `widget.js` - the production widget (production-clean, no mock code); reads its endpoint from its `<script>` tag's `data-api-url`, POSTs a multi-turn `{messages: [...]}` array, renders `{answer, sources}`. **TEMPORARY sign-in gate:** when the tag also carries `data-user-pool-id` + `data-client-id` (region derived from the pool id's `<region>_` prefix), a sign-in form takes the composer's place until one unsigned `InitiateAuth` fetch returns a token, which then rides as `Authorization: Bearer` on every `/query`. Absent those two attributes the widget is byte-identical to the pre-gate one - the same opt-in-by-attribute shape as `data-usage-events` - and the gate does not depend on the widget either way, since API Gateway 401s an unauthenticated `/query` regardless. The ONLY file in the widget bucket. **Bilingual:** every user-visible string lives in the `STRINGS` table (keyed by language code, above the `END LOCALIZATION` banner); render code below that banner calls `t(key)` and holds no copy, which the contract suite enforces by scanning the file. The header carries a two-button English/Español toggle (real buttons, `aria-pressed`, group `aria-label`, visible focus ring - no ID-based ARIA, which cannot cross the shadow boundary), and switching sets `lang` on the host element AND the shadow root container. Each message is stamped with the language it was said in, so a switch relabels the chrome and NOT the transcript: past turns are never retranslated (that would cost a model call per message). The canned greeting + starter questions DO re-render on a switch, but only before the first message - they are the panel's opening state, not a turn anyone took. The language is session-only, deliberately: the widget stores nothing in the browser and a contract test pins that. The table covers the SCREEN-READER-ONLY text too (the per-turn speaker labels, the pending bubble's status region), because a label nobody can see is still read aloud - and because that text is invisible to any check that looks at the rendered page. Two things the toggle must NOT do, both of them accessibility fixes it would otherwise undo: the launcher takes no `aria-label` in any language (its visible text is its whole accessible name, WCAG 2.5.3), and re-seeding the opening state has to re-point the composer's `aria-describedby` at the NEW greeting bubble, or a switch leaves it aimed at a removed node.
+  - `theme.example.json` - the annotated copy of the runtime theme file, uploaded alongside `widget.js` into the widget bucket and overwritten on every deploy. It is the only documentation guaranteed to sit next to the file the customer edits, so the contract suite tests it as code: every value in it equals a built-in default, and its `_readme` has to name each key and each font keyword.
   - `demo-site.html` - the shareable demo page, uploaded as `index.html` to the demo bucket. A Gavilan-Library-styled sample page (local CSS only, nothing hotlinked from gavilan.edu) carrying the SAME one-line embed a library page would, so it cannot fork or drift from the shipped widget. Two placeholders, `__WIDGET_SRC__` and `__API_URL__`, are stamped at DEPLOY time (`s3deploy.Source.data` resolves CDK tokens during deployment) - nothing in it is account- or region-specific. Renaming either placeholder fails synth.
   - `mock.js` (dev-only fetch stub) + `demo.html` (offline mock harness) + `demo-live.html` (local page against the deployed API, needs the `localhost:8000` CORS entry) + `test/widget.contract.test.js` (zero-dep Node tests) never ship; dependency direction is one-way (widget never references the mock).
 - `config.yaml` - declarative settings at repo root; `cost_model` (published AWS rates + the MEASURED per-question constants + the zero-traffic baseline inputs, stamped into the demo page at deploy; note `scrapes_per_month` and `reindexes_per_month` are SEPARATE numbers because change gating means most runs re-index nothing), embedding model, `vector_store` (S3 Vectors names, data_type, distance_metric, non-filterable keys), `scraper.tiers` (per-tier schedule + URLs; the only declaration of cadence and tier membership) + `kb_exclude_urls`, `chunking`, `retrieval.number_of_results`, `generation.model_id`, `catalog` (enrichment model, S3 key, guard threshold, cache TTL), `primo` (the live-catalog knobs `timeout_seconds`, `number_of_results`, `availability_budget_seconds`, wired as `PRIMO_*` env; `search_course_reserves` reuses the same knobs), `library_links.data_file` (the bundled link-table filename; the stack feeds the SAME value to the Lambda asset include and the `LIBRARY_LINKS_FILE` env so they cannot drift), `cors.allow_origins` (the HTTP API browser allowlist), `demo_site.enabled` (the shareable demo page; when on, the stack appends the demo distribution's origin to the CORS allowlist as a deploy-time token), `feedback` (`enabled`, `notify_email`, `max_comment_chars`, `max_body_bytes`, `max_sources`; the three caps reach the feedback Lambda as `FEEDBACK_*` env vars, and `notify_email` never does - it becomes the SNS subscription), `guardrail` (`name`, the one-entry `content_filters` list, `blocked_input_messaging` - there is no output guardrail and no PII entity list). CDK reads it at synth via `infra/config.py`. Edit values here, do not hardcode in the stack.
-- `docs/` - design docs (`architecture.md`, `build-plan.md`, architecture diagram).
+- `docs/` - design docs (`architecture.md`, `build-plan.md`, architecture diagram), the accessibility audit, and `widget-theming.md` (the customer-facing guide to `theme.json`).
 - `.github/workflows/ci.yml` - the GitHub Actions checks (see CI under Commands). Four hermetic jobs, one per test surface.
 
 ## Excluded (do not reintroduce)

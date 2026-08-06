@@ -3040,4 +3040,381 @@ test("the sign-in form is localized, and a switch does not strand it in the othe
   }
 });
 
+// ==========================================================================
+// theme.json - the runtime customisation file
+// ==========================================================================
+//
+// The customer edits this file by hand, in an S3 console, with no way to redeploy and no
+// way to see a stack trace. So these are mostly tests about WRONG input: what the widget
+// does with a colour that is not a colour, a font it has never heard of, five starter
+// questions, and a file that is not JSON. The answer is always "ignore that one key and
+// render the rest", and the default install has to stay byte-identical.
+
+// theme.example.json ships in the same bucket and is the only documentation the customer
+// is guaranteed to find, so it is tested as code, not as prose.
+const THEME_EXAMPLE = JSON.parse(
+  fs.readFileSync(path.join(__dirname, "..", "theme.example.json"), "utf8")
+);
+
+// mount() reads the module-level theme, so a themed mount has to hand the default back.
+function withTheme(data, fn) {
+  widget.applyTheme(data);
+  try {
+    return fn();
+  } finally {
+    widget.resetTheme();
+  }
+}
+
+// WCAG 2.x contrast ratio between two six-digit hex colours.
+function contrastRatio(a, b) {
+  function lum(hex) {
+    const parts = [1, 3, 5].map((i) => {
+      const c = parseInt(hex.slice(i, i + 2), 16) / 255;
+      return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * parts[0] + 0.7152 * parts[1] + 0.0722 * parts[2];
+  }
+  const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+test("an install with no theme.json renders exactly as it always has", () => {
+  // The whole safety argument for shipping this: absent or unreadable, the theme emits no
+  // CSS at all, so there is nothing for it to override and nothing to regress.
+  assert.strictEqual(widget.themeCss(), "");
+  assert.strictEqual(widget.applyTheme(null), false);
+  assert.strictEqual(widget.applyTheme(undefined), false);
+  assert.strictEqual(widget.applyTheme("nope"), false);   // JSON.parse of a bare string
+  assert.strictEqual(widget.applyTheme([1, 2, 3]), false);
+  assert.strictEqual(widget.themeCss(), "");
+  assert.deepStrictEqual(widget.starterQuestions(), widget.STRINGS.en.suggestedQuestions);
+});
+
+test("a highlight colour moves --brand and derives its own ink", () => {
+  withTheme({ highlightColor: "#1E4B8F" }, () => {
+    const css = widget.themeCss();
+    assert.ok(/--brand:\s*#1e4b8f/.test(css), css);
+    // Dark blue -> white text.
+    assert.ok(/--accent-ink:\s*#ffffff/.test(css), css);
+    assert.ok(/--user-ink:\s*#ffffff/.test(css), css);
+  });
+  withTheme({ highlightColor: "#FFD400" }, () => {
+    // Bright yellow -> black text, which is the case the old hardcoded #fff got wrong.
+    const css = widget.themeCss();
+    assert.ok(/--accent-ink:\s*#000000/.test(css), css);
+    assert.ok(/--user-ink:\s*#000000/.test(css), css);
+  });
+  // Three-digit hex is accepted and expanded, so a customer copying "#a13" from a brand
+  // sheet is not silently ignored.
+  withTheme({ highlightColor: "#A13" }, () => {
+    assert.ok(/--brand:\s*#aa1133/.test(widget.themeCss()), widget.themeCss());
+  });
+});
+
+test("the derived ink clears 4.5:1 on every colour a customer can type", () => {
+  // This is why there is no contrast validation to fail: picking the better of black and
+  // white bottoms out at 4.58:1, above the 1.4.3 floor, so no hex needs rejecting. Swept
+  // rather than spot-checked, and the sweep straddles the crossover point.
+  let worst = Infinity;
+  let worstHex = null;
+  for (let r = 0; r < 256; r += 15) {
+    for (let g = 0; g < 256; g += 15) {
+      for (let b = 0; b < 256; b += 15) {
+        const hex =
+          "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("");
+        const ratio = contrastRatio(hex, widget.inkFor(hex));
+        if (ratio < worst) { worst = ratio; worstHex = hex; }
+      }
+    }
+  }
+  assert.ok(worst >= 4.5, "worst pair " + worstHex + " at " + worst.toFixed(2) + ":1");
+  // ...and the derivation really is picking the better one, not just a passing one.
+  assert.ok(worst >= 4.57 && worst <= 4.6, "worst is the crossover, got " + worst);
+});
+
+test("a colour that is not a hex colour leaves the colour alone", () => {
+  // Each of these is a plausible thing to type, and each has to cost the customer their
+  // colour and nothing else.
+  [
+    "maroon",                      // a CSS colour name
+    "rgb(138, 28, 48)",
+    "8a1c30",                      // no hash
+    "#8a1c3",                      // five digits
+    "#gggggg",
+    "",
+    42,
+    null,
+    ["#8a1c30"]
+  ].forEach((value) => {
+    withTheme({ highlightColor: value }, () => {
+      assert.strictEqual(
+        widget.themeCss(),
+        "",
+        "no CSS emitted for highlightColor " + JSON.stringify(value)
+      );
+    });
+  });
+});
+
+test("nothing from theme.json can write CSS of its own", () => {
+  // The colour is the one value that reaches a stylesheet, so the pattern that validates it
+  // is a security boundary, not tidiness: anything carrying a ; or a } would let a theme
+  // file restyle - or hide - the whole widget.
+  [
+    "#fff; } .panel { display: none } .x {",
+    "red; background-image: url(https://evil.test/x)",
+    "var(--anything)",
+    "#fff/**/;",
+    "expression(alert(1))"
+  ].forEach((value) => {
+    withTheme({ highlightColor: value }, () => {
+      assert.strictEqual(widget.themeCss(), "", "rejected: " + value);
+    });
+  });
+  // And the shape that IS accepted cannot contain either character by construction.
+  withTheme({ highlightColor: "#123abc" }, () => {
+    const declarations = widget.themeCss().split("{")[1];
+    assert.strictEqual(declarations.split(";").length, 4, declarations); // 3 decls + tail
+  });
+});
+
+test("the font is an enumerated keyword, resolved from a table the widget owns", () => {
+  widget.FONT_KEYWORDS.forEach((keyword) => {
+    withTheme({ fontFamily: keyword }, () => {
+      const css = widget.themeCss();
+      if (keyword === widget.DEFAULT_FONT) {
+        assert.strictEqual(css, "", "the default font emits nothing");
+        return;
+      }
+      assert.ok(/\.root, \.header__title \{ font-family:/.test(css), css);
+      if (keyword === "inherit") {
+        // Inheriting the host page's family needs the host element too: `:host { all:
+        // initial }` resets font-family to the browser default, not the page's.
+        assert.ok(/:host \{ font-family: inherit; \}/.test(css), css);
+      } else {
+        assert.ok(css.indexOf(widget.FONT_STACKS[keyword]) >= 0, css);
+      }
+    });
+  });
+  // Every stack is a list of families that ship on macOS AND Windows - no @font-face, no
+  // download, and no bare family name that would resolve on one desk and nowhere else.
+  widget.FONT_KEYWORDS.forEach((keyword) => {
+    const stack = widget.FONT_STACKS[keyword];
+    if (keyword === "inherit") {
+      assert.strictEqual(stack, null, "inherit is handled separately, not as a stack");
+      return;
+    }
+    assert.ok(/,\s*(sans-serif|serif|monospace)$/.test(stack), keyword + ": " + stack);
+    assert.ok(stack.indexOf("@font-face") < 0 && stack.indexOf("url(") < 0, stack);
+  });
+});
+
+test("an unknown font keyword leaves the font alone, including inherited property names", () => {
+  ["Comic Sans MS", "helvetica neue", "", "  ", 7, null, "toString", "constructor"].forEach(
+    (value) => {
+      withTheme({ fontFamily: value }, () => {
+        assert.strictEqual(
+          widget.themeCss(),
+          "",
+          "no CSS emitted for fontFamily " + JSON.stringify(value)
+        );
+      });
+    }
+  );
+  // Case and stray whitespace are forgiven, because they are typing, not intent.
+  withTheme({ fontFamily: "  SERIF " }, () => {
+    assert.ok(widget.themeCss().indexOf(widget.FONT_STACKS.serif) >= 0, widget.themeCss());
+  });
+});
+
+test("starter questions are per-language, capped in count and length", () => {
+  withTheme(
+    {
+      starterQuestions: {
+        en: ["One?", "Two?", "Three?", "Four?", "Five?"],   // one too many
+        es: ["Uno?", "x".repeat(widget.MAX_STARTER_CHARS + 1), "  Dos  ?  "]
+      }
+    },
+    () => {
+      assert.deepStrictEqual(widget.starterQuestions(), ["One?", "Two?", "Three?", "Four?"]);
+      assert.strictEqual(widget.setLanguage("es", true), true);
+      try {
+        // The over-long one is DROPPED rather than truncated (a half question reads as a
+        // bug), and whitespace is collapsed.
+        assert.deepStrictEqual(widget.starterQuestions(), ["Uno?", "Dos ?"]);
+      } finally {
+        widget.resetLanguage();
+      }
+    }
+  );
+});
+
+test("Spanish falls back to the customer's English list, never to a translation", () => {
+  withTheme({ starterQuestions: { en: ["Where is the makerspace?"] } }, () => {
+    assert.strictEqual(widget.setLanguage("es", true), true);
+    try {
+      // NOT the built-in Spanish questions: those may now ask about something the customer
+      // removed. Their English wording is worse copy but honest, and nothing is machine
+      // translated.
+      assert.deepStrictEqual(widget.starterQuestions(), ["Where is the makerspace?"]);
+      assert.notDeepStrictEqual(
+        widget.starterQuestions(),
+        widget.STRINGS.es.suggestedQuestions
+      );
+    } finally {
+      widget.resetLanguage();
+    }
+  });
+});
+
+test("unusable starter questions fall all the way back to the built-in table", () => {
+  [
+    { starterQuestions: [] },
+    { starterQuestions: ["a", "b"] },              // not keyed by language
+    { starterQuestions: { en: "not a list" } },
+    { starterQuestions: { en: [] } },
+    { starterQuestions: { en: [null, 3, ""] } },
+    { starterQuestions: { fr: ["Bonjour?"] } }     // a language the widget does not offer
+  ].forEach((data) => {
+    withTheme(data, () => {
+      assert.deepStrictEqual(
+        widget.starterQuestions(),
+        widget.STRINGS.en.suggestedQuestions,
+        JSON.stringify(data)
+      );
+    });
+  });
+});
+
+test("one bad key does not take the good ones down with it", () => {
+  // The realistic failure: they get the colour right and fat-finger the font.
+  withTheme({ highlightColor: "#2f6f4f", fontFamily: "papyrus", starterQuestions: 5 }, () => {
+    const css = widget.themeCss();
+    assert.ok(/--brand:\s*#2f6f4f/.test(css), css);
+    assert.ok(css.indexOf("font-family") < 0, css);
+    assert.deepStrictEqual(widget.starterQuestions(), widget.STRINGS.en.suggestedQuestions);
+  });
+});
+
+test("the themed panel is painted themed, in one stylesheet, on the first frame", () => {
+  // No flash of the default colours: the override lands in the SAME <style> element as the
+  // shipped rules, appended after them, before anything is in the document.
+  withTheme({ highlightColor: "#0b5d1e" }, () => {
+    const doc = makeDoc();
+    const handle = widget.mount(doc);
+    const styles = collectByTag(handle.shadow, "style");
+    assert.strictEqual(styles.length, 1, "exactly one stylesheet");
+    const css = styles[0].textContent;
+    const base = css.indexOf("--brand: #8a1c30");
+    const override = css.indexOf("--brand: #0b5d1e");
+    assert.ok(base >= 0 && override > base, "the override comes after the shipped rule");
+  });
+});
+
+test("the header's own rings and washes follow the derived ink, not a hardcoded white", () => {
+  // A white focus ring on a pale highlight is invisible. Everything drawn ON the header
+  // derives from --accent-ink (directly, or via currentColor for the translucent washes),
+  // which is the same decision as the text colour rather than a second one.
+  const RENDERED = SOURCE.slice(SOURCE.indexOf('".header {"'), SOURCE.indexOf('// thread'));
+  assert.ok(RENDERED, "found the header block");
+  assert.ok(
+    !/rgba\(255,\s*255,\s*255/.test(RENDERED),
+    "no hardcoded white wash left in the header: " + RENDERED
+  );
+  assert.ok(
+    !/outline:\s*\d+px solid #fff/.test(RENDERED),
+    "no hardcoded white ring left in the header"
+  );
+  assert.ok(/outline: 2px solid var\(--accent-ink\)/.test(RENDERED), RENDERED);
+  // The two-tone focus ring is NOT themeable and stays exactly where it was.
+  assert.ok(/--focus-ring: #1a1d21; --focus-halo: #ffffff;/.test(SOURCE));
+});
+
+test("the Google Fonts fetch happens only for the default font", () => {
+  function mountWithHead() {
+    const doc = makeDoc();
+    doc.head = makeEl("head");
+    doc.getElementById = function () { return null; };
+    widget.mount(doc);
+    return collectByTag(doc.head, "link").filter(function (l) {
+      return (l.href || "").indexOf("fonts.googleapis.com") >= 0;
+    });
+  }
+  // Bitter is the DEFAULT theme's title face, so any other choice replaces the title
+  // family and there is nothing left to download - the request should not be made.
+  assert.strictEqual(mountWithHead().length, 1, "default theme loads Bitter");
+  withTheme({ fontFamily: "serif" }, () => {
+    assert.strictEqual(mountWithHead().length, 0, "a themed font fetches no webfont");
+  });
+  withTheme({ fontFamily: "inherit" }, () => {
+    assert.strictEqual(mountWithHead().length, 0, "inherit fetches no webfont");
+  });
+});
+
+test("theme.json is fetched next to widget.js, with a bounded wait", () => {
+  const priorDoc = global.document;
+  global.document = {
+    querySelector: function () {
+      return { src: "https://d123.cloudfront.net/widget.js", getAttribute: function () { return null; } };
+    }
+  };
+  try {
+    assert.strictEqual(widget.themeUrl(), "https://d123.cloudfront.net/" + widget.THEME_FILE);
+  } finally {
+    global.document = priorDoc;
+  }
+  // A dead or slow CDN delays the widget appearing by this and no more.
+  assert.strictEqual(typeof widget.CONFIG.themeTimeoutMs, "number");
+  assert.ok(widget.CONFIG.themeTimeoutMs <= 2000, widget.CONFIG.themeTimeoutMs);
+  // The mount waits for the theme, so it cannot be the plain DOMContentLoaded call it was.
+  assert.ok(/Promise\.all\(\[themeSettled, domSettled\]\)/.test(SOURCE), "boot waits on both");
+});
+
+test("the theme adds no storage and no second request path", () => {
+  // Same rule as the rest of the widget: nothing about a visit is written down, and the
+  // theme is one GET of a static file - it never reaches /query.
+  assert.ok(/fetch\(url, \{ method: "GET" \}\)/.test(SOURCE));
+  const themeBlock = SOURCE.slice(
+    SOURCE.indexOf("==============================  THEME"),
+    SOURCE.indexOf("============================  END THEME")
+  );
+  assert.ok(themeBlock.length > 500, "found the theme block");
+  ["localStorage", "sessionStorage", "document.cookie", "indexedDB"].forEach((sink) => {
+    assert.ok(themeBlock.indexOf(sink) < 0, "theme code must not touch " + sink);
+  });
+});
+
+test("theme.example.json is valid, documented, and is the shipped default", () => {
+  // It is the only documentation guaranteed to be next to the file the customer edits, so
+  // it has to stay in step with the code rather than drift into being wrong.
+  assert.ok(Array.isArray(THEME_EXAMPLE._readme) && THEME_EXAMPLE._readme.length > 5);
+  const prose = THEME_EXAMPLE._readme.join("\n");
+  ["theme.json", "highlightColor", "fontFamily", "starterQuestions"].forEach((key) => {
+    assert.ok(prose.indexOf(key) >= 0, "_readme documents " + key);
+  });
+  widget.FONT_KEYWORDS.forEach((keyword) => {
+    assert.ok(prose.indexOf('"' + keyword + '"') >= 0, "_readme lists the font keyword " + keyword);
+  });
+  assert.ok(prose.indexOf(String(widget.MAX_STARTER_CHARS)) >= 0, "_readme states the length cap");
+
+  // Every value in it equals a built-in default, so uploading it unchanged is a no-op...
+  assert.strictEqual(THEME_EXAMPLE.highlightColor, widget.DEFAULT_HIGHLIGHT);
+  assert.strictEqual(THEME_EXAMPLE.fontFamily, widget.DEFAULT_FONT);
+  assert.deepStrictEqual(
+    THEME_EXAMPLE.starterQuestions.en,
+    widget.STRINGS.en.suggestedQuestions
+  );
+  assert.deepStrictEqual(
+    THEME_EXAMPLE.starterQuestions.es,
+    widget.STRINGS.es.suggestedQuestions
+  );
+  // ...and the widget reads it without dropping anything, _readme included (unknown keys
+  // are ignored, so the documentation can live in the file it documents).
+  withTheme(THEME_EXAMPLE, () => {
+    assert.strictEqual(widget.themeCss(), "", "the example theme is the default theme");
+    assert.deepStrictEqual(widget.starterQuestions(), widget.STRINGS.en.suggestedQuestions);
+  });
+});
+
 run();

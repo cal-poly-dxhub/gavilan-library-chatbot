@@ -10,6 +10,7 @@ data source:
   S3 data source (type S3, FIXED_SIZE chunking) + scraper Lambda that fills it
   query-path Lambda (own role) + HTTP API (API Gateway v2), POST /query
   widget hosting: private S3 bucket + CloudFront (OAC) + BucketDeployment(widget.js)
+                  + a CORS/short-TTL behavior for the customer-uploaded theme.json
   demo site: its OWN private bucket + CloudFront (OAC) serving one deploy-stamped page
 
 All changeable knobs come from the repo-root config.yaml
@@ -67,6 +68,14 @@ _APP_DIR = Path(__file__).resolve().parents[2] / "app"
 # demo.html / demo-live.html are dev-only and must never ship). The demo site takes ONLY
 # demo-site.html, into a separate bucket of its own - see the Demo site sections below.
 _FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
+
+# The runtime theme file: uploaded BY THE CUSTOMER into the widget bucket root after
+# handover, read by widget.js on every page load. It is not in this repo and never in a
+# deployment source - the stack's whole job here is to make sure a deploy cannot delete it
+# and that a browser on another origin can read it. `theme.example.json` IS shipped (it
+# documents the keys and the defaults) and is overwritten on every deploy by design.
+_WIDGET_THEME_FILE = "theme.json"
+_WIDGET_THEME_EXAMPLE_FILE = "theme.example.json"
 
 # The shipped demo page and the two placeholders the deploy stamps into it. Keeping the
 # names here (rather than inline) makes the synth-time assertion below the single place
@@ -1285,6 +1294,63 @@ class GavilanChatbotStack(Stack):
         # OAC and wires the bucket policy so only this distribution can read the object.
         widget_origin = origins.S3BucketOrigin.with_origin_access_control(widget_bucket)
 
+        # --- theme.json: its own behavior on the widget distribution -------------------
+        #
+        # The customer uploads theme.json through the S3 CONSOLE, which sets no metadata -
+        # so neither the freshness nor the CORS headers can come from the object. Both come
+        # from here instead, which is also what keeps "edit the file, reload the page" true
+        # without anyone having to know what Cache-Control is.
+        #
+        # Short TTL, both hops. CACHING_OPTIMIZED (the default behavior, for widget.js) is a
+        # 24-hour default TTL: correct for a versioned-by-deploy script, wrong for a file
+        # whose entire purpose is being edited by hand. 60 seconds is short enough that a
+        # colour change reads as immediate and long enough that the edge still absorbs the
+        # traffic. The explicit Cache-Control does the same job for the browser, which would
+        # otherwise apply heuristic freshness off S3's Last-Modified and could hold a stale
+        # theme for hours on an object that has not changed in a while.
+        widget_theme_cache_policy = cloudfront.CachePolicy(
+            self,
+            "WidgetThemeCachePolicy",
+            comment="Short TTL for the widget's customer-editable theme.json.",
+            default_ttl=Duration.seconds(60),
+            min_ttl=Duration.seconds(0),
+            max_ttl=Duration.seconds(60),
+        )
+
+        # CORS, because the fetch is cross-origin BY CONSTRUCTION: the widget runs on the
+        # library's page and theme.json lives on the CDN, so without an
+        # Access-Control-Allow-Origin the browser refuses to hand the body to widget.js and
+        # every install silently renders the default theme.
+        #
+        # `*` here, and that is NOT the wildcard config.yaml rejects for the API. That one
+        # guards a billable POST endpoint any page could otherwise drive from its visitors'
+        # browsers. This is a public, world-readable static file on the customer's own CDN,
+        # already served to anyone who requests it; an exact allowlist would add no secrecy
+        # and one real failure mode - the widget embedded on a staging or campus subdomain
+        # nobody thought to list, silently falling back to the default colours.
+        #
+        # Set from CloudFront rather than an S3 CORS rule for the same reason as the TTL:
+        # nothing about this may depend on how the object was uploaded.
+        widget_theme_headers_policy = cloudfront.ResponseHeadersPolicy(
+            self,
+            "WidgetThemeHeadersPolicy",
+            comment="CORS + short browser cache for the widget's theme.json.",
+            cors_behavior=cloudfront.ResponseHeadersCorsBehavior(
+                access_control_allow_credentials=False,
+                access_control_allow_headers=["*"],
+                access_control_allow_methods=["GET", "HEAD"],
+                access_control_allow_origins=["*"],
+                origin_override=True,
+            ),
+            custom_headers_behavior=cloudfront.ResponseCustomHeadersBehavior(
+                custom_headers=[
+                    cloudfront.ResponseCustomHeader(
+                        header="Cache-Control", value="public, max-age=60", override=True
+                    )
+                ]
+            ),
+        )
+
         widget_distribution = cloudfront.Distribution(
             self,
             "WidgetDistribution",
@@ -1295,6 +1361,17 @@ class GavilanChatbotStack(Stack):
                 viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
                 cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED,
             ),
+            # Same origin and bucket, different caching and headers. Scoped to this one path
+            # so widget.js delivery is untouched: it keeps the 24-hour cache and gains no
+            # CORS header it has never needed (a <script src> is not a cross-origin fetch).
+            additional_behaviors={
+                _WIDGET_THEME_FILE: cloudfront.BehaviorOptions(
+                    origin=widget_origin,
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                    cache_policy=widget_theme_cache_policy,
+                    response_headers_policy=widget_theme_headers_policy,
+                )
+            },
         )
         # NOTE: do NOT add an explicit distribution->bucket dependency. The origin already
         # references the bucket (GetAtt), so CloudFormation orders the bucket first. Adding
@@ -1302,21 +1379,35 @@ class GavilanChatbotStack(Stack):
         # the auto-delete-objects custom resource, which DependsOn the OAC bucket policy,
         # which DependsOn the distribution -> a synth-blocking dependency cycle.
 
-        # Upload ONLY frontend/widget.js into the bucket. The include-only exclude pattern
-        # ("*" then "!widget.js") keeps mock.js, demo.html, and any future dev files out of
-        # production. On deploy, invalidate the CloudFront cache for the file so an updated
-        # widget.js is served immediately instead of from edge cache.
+        # Upload ONLY frontend/widget.js and the annotated theme.example.json. The
+        # include-only exclude pattern ("*" then the two "!" entries) keeps mock.js,
+        # demo.html, and any future dev files out of production. On deploy, invalidate the
+        # CloudFront cache for both so an updated file is served immediately instead of from
+        # edge cache.
         s3deploy.BucketDeployment(
             self,
             "WidgetDeployment",
             destination_bucket=widget_bucket,
             sources=[
                 s3deploy.Source.asset(
-                    str(_FRONTEND_DIR), exclude=["*", "!widget.js"]
+                    str(_FRONTEND_DIR),
+                    exclude=["*", "!widget.js", f"!{_WIDGET_THEME_EXAMPLE_FILE}"],
                 )
             ],
+            # THE CUSTOMER'S theme.json SURVIVES EVERY DEPLOY, and this one line is the whole
+            # reason. BucketDeployment prunes by default - `aws s3 sync --delete` - which
+            # removes destination objects the source does not contain, and the source here is
+            # a two-file asset that will never contain a file the customer wrote. Without
+            # this, the first `cdk deploy` after they set their colours silently deletes them.
+            #
+            # It has to be THIS exclude (the BucketDeployment prop, which scopes the sync
+            # command) and NOT the identically-named one on Source.asset, which only filters
+            # what gets packed into the asset and does nothing to the prune. They are easy to
+            # confuse, both are present in this call, and only one of them protects anything.
+            # test_the_theme_file_is_outside_the_prune_scope pins the rendered property.
+            exclude=[_WIDGET_THEME_FILE],
             distribution=widget_distribution,
-            distribution_paths=["/widget.js"],
+            distribution_paths=["/widget.js", f"/{_WIDGET_THEME_EXAMPLE_FILE}"],
         )
 
         # --- Shared URLs (outputs + the demo page below) -------------------------------
@@ -1420,6 +1511,19 @@ class GavilanChatbotStack(Stack):
             "ChatbotApiUrl",
             value=query_url,
             description="HTTP API POST /query endpoint the widget calls.",
+        )
+        # Where the customer puts their theme file. Printed as a bucket path rather than a
+        # URL because the upload is a console drag-and-drop into that bucket, and the bucket
+        # name is generated - there is nowhere else to read it off.
+        CfnOutput(
+            self,
+            "WidgetThemeUpload",
+            value=f"s3://{widget_bucket.bucket_name}/{_WIDGET_THEME_FILE}",
+            description=(
+                "Upload theme.json here to restyle the widget without a redeploy "
+                "(see docs/widget-theming.md; theme.example.json in the same bucket "
+                "documents every key)."
+            ),
         )
         # --- Sign-in gate: the ids, and the two commands that create the one account ---
         #
