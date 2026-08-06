@@ -768,8 +768,8 @@
   //     https://<the widget CDN>/theme.json
   //
   // No redeploy, no settings page, and nothing hand-edited inside a shipped file. See
-  // docs/widget-theming.md for the upload steps; frontend/theme.example.json is the
-  // annotated copy that ships beside this one.
+  // docs/widget-theming.md for the upload steps; frontend/defaults/theme.json is the
+  // downloadable copy of these defaults, served from defaults/ in the same bucket.
   //
   // JSON, never JS. A .js config would be executable code running on the library's page
   // with the widget's privileges; a JSON file is data that this module parses and

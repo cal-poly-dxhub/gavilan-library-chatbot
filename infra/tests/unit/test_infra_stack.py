@@ -886,20 +886,22 @@ def test_widget_distribution_uses_oac_not_oai():
 
 def test_widget_bucket_deployment_uploads_the_widget():
     template = _template()
-    # Two BucketDeployments, each rendering as a CDK bucket-deployment custom resource: the
-    # widget's and the demo site's. They MUST target different buckets - a BucketDeployment
-    # prunes (`aws s3 sync --delete`), so two of them sharing one bucket would delete each
-    # other's objects on deploy.
+    # Three BucketDeployments, each rendering as a CDK bucket-deployment custom resource: the
+    # widget's, the downloadable theme defaults, and the demo site's.
     deployments = template.find_resources("Custom::CDKBucketDeployment")
-    assert len(deployments) == 2, list(deployments)
-    destinations = [d["Properties"]["DestinationBucketName"] for d in deployments.values()]
-    assert len(destinations) == len(
-        {json.dumps(d, sort_keys=True) for d in destinations}
-    ), destinations
-    # ...and neither of them was given a key prefix that would leave prune unscoped in a
-    # shared bucket - the separation is by bucket, which cannot be misconfigured away.
-    blob = json.dumps(destinations)
+    assert len(deployments) == 3, list(deployments)
+    blob = json.dumps([d["Properties"]["DestinationBucketName"] for d in deployments.values()])
     assert "WidgetBucket" in blob and "DemoSiteBucket" in blob, blob
+
+    # The demo site is in a bucket of its OWN, and that separation is the one that cannot be
+    # misconfigured away: it is the production widget it would otherwise be able to delete.
+    widget_bucket = _widget_deployment(template)["Properties"]["DestinationBucketName"]
+    demo_bucket = _demo_deployment(template)["Properties"]["DestinationBucketName"]
+    assert widget_bucket != demo_bucket, widget_bucket
+    # The widget's own deployment writes to the bucket root - no key prefix that would leave
+    # its prune scoped somewhere other than where widget.js actually lives.
+    assert "DestinationBucketKeyPrefix" not in _widget_deployment(template)["Properties"]
+    assert "DestinationBucketKeyPrefix" not in _demo_deployment(template)["Properties"]
 
 
 # --- theme.json: the customer's file, on infrastructure they inherit -----------
@@ -910,15 +912,25 @@ def test_widget_bucket_deployment_uploads_the_widget():
 # browser on another origin can read it, and an edit shows up in about a minute.
 
 
-def _widget_deployment(template):
-    """The widget bucket's BucketDeployment custom resource (not the demo site's)."""
+def _deployment(template, prefix):
+    """The one BucketDeployment custom resource whose logical id starts with `prefix`."""
     deps = {
         lid: r
         for lid, r in template.find_resources("Custom::CDKBucketDeployment").items()
-        if "DemoSite" not in lid
+        if lid.startswith(prefix)
     }
     assert len(deps) == 1, list(deps)
     return next(iter(deps.values()))
+
+
+def _widget_deployment(template):
+    """The deployment that ships widget.js (not the demo site's, not the defaults file's)."""
+    return _deployment(template, "WidgetDeployment")
+
+
+def _theme_defaults_deployment(template):
+    """The deployment that ships the downloadable defaults/theme.json."""
+    return _deployment(template, "WidgetThemeDefaultsDeployment")
 
 
 def test_the_theme_file_is_outside_the_prune_scope():
@@ -931,14 +943,59 @@ def test_the_theme_file_is_outside_the_prune_scope():
     # Both are in that call; only this one shows up here.
     props = _widget_deployment(_template())["Properties"]
     assert props["Prune"] is True, "still pruning - the exclude is a scope, not an off switch"
-    assert props["Exclude"] == ["theme.json"], props.get("Exclude")
 
-    # And nothing in the repo ships a theme.json, so the deployed asset can never contain a
-    # file that would overwrite the customer's. theme.example.json is the one that ships.
+    # TWO patterns, and the second is not redundant. `Exclude` becomes `aws s3 sync --exclude
+    # <pattern>`, whose patterns are fnmatched against the full path with the sync root
+    # prepended - so "theme.json" covers the root object and NOTHING under a prefix.
+    # Measured against aws-cli 2.35.11: with only the first pattern, `defaults/theme.json` is
+    # matched by neither and is deleted on every deploy, taking the download link with it.
+    assert props["Exclude"] == ["theme.json", "defaults/*"], props.get("Exclude")
+
+    # And nothing in the repo ships a root theme.json, so the deployed asset can never
+    # contain a file that would overwrite the customer's. The defaults copy lives under a
+    # prefix precisely so that stays true.
     frontend = pathlib.Path(__file__).resolve().parents[3] / "frontend"
     assert not (frontend / "theme.json").exists(), "the repo must not ship a theme.json"
-    assert (frontend / "theme.example.json").exists()
-    assert props["DistributionPaths"] == ["/widget.js", "/theme.example.json"]
+    assert (frontend / "defaults" / "theme.json").exists()
+    assert props["DistributionPaths"] == ["/widget.js"]
+
+
+def test_the_defaults_file_is_a_download_not_a_page():
+    # The customer's whole flow is: click the link in the Outputs tab, edit what lands in
+    # Downloads, drag it into the bucket link underneath. That only works if the browser
+    # SAVES the file rather than rendering the JSON in a tab, which is one header.
+    props = _theme_defaults_deployment(_template())["Properties"]
+    assert props["SystemMetadata"]["content-disposition"] == 'attachment; filename="theme.json"'
+
+    # It is deliberately a SECOND deployment into the bucket that already holds widget.js -
+    # normally the way to delete widget.js by accident. These two properties are what make it
+    # safe, and they are the reason a deployment-level header could be used at all (it applies
+    # to every object in its deployment, and a widget.js that downloads is a broken widget).
+    assert props["Prune"] is False, "it must never delete anything in a bucket it shares"
+    assert props["DestinationBucketKeyPrefix"] == "defaults", props.get(
+        "DestinationBucketKeyPrefix"
+    )
+    assert props["DistributionPaths"] == ["/defaults/*"], props.get("DistributionPaths")
+
+    # Same bucket as widget.js, which is the point - one bucket to find, one to upload into.
+    assert (
+        props["DestinationBucketName"]
+        == _widget_deployment(_template())["Properties"]["DestinationBucketName"]
+    )
+
+
+def test_only_one_deployment_prunes_each_bucket():
+    # The rule that keeps a shared bucket safe, asserted directly rather than by counting
+    # deployments: two PRUNING deployments in one bucket delete each other's objects and
+    # whichever CloudFormation runs last wins, so the breakage is intermittent.
+    by_bucket = {}
+    for props in (
+        r["Properties"] for r in _template().find_resources("Custom::CDKBucketDeployment").values()
+    ):
+        if props.get("Prune", True):
+            by_bucket.setdefault(json.dumps(props["DestinationBucketName"], sort_keys=True), 0)
+            by_bucket[json.dumps(props["DestinationBucketName"], sort_keys=True)] += 1
+    assert by_bucket and max(by_bucket.values()) == 1, by_bucket
 
 
 def test_the_theme_file_is_served_cross_origin_and_briefly_cached():
@@ -998,15 +1055,27 @@ def _logical_id(resources, target):
     raise AssertionError("resource not found")
 
 
-def test_the_stack_says_where_to_put_the_theme_file():
-    # The bucket name is generated, so an output is the only place the customer can read it -
-    # and the upload is a console drag-and-drop, not a URL fetch.
+def test_the_stack_links_both_ends_of_the_theming_flow():
+    # Every install generates its own bucket and CDN names, so the docs cannot carry either
+    # link - they have to come from the stack. Both are https:// so the CloudFormation
+    # Outputs tab renders them clickable: anything else is a name to match by eye against
+    # nineteen buckets, with the demo-site bucket sitting right next to the right one.
     outputs = _template().find_outputs("*")
-    assert "WidgetThemeUpload" in outputs, list(outputs)
-    value = outputs["WidgetThemeUpload"]["Value"]
-    literals = "".join(p for p in value["Fn::Join"][1] if isinstance(p, str))
-    assert literals.startswith("s3://"), literals
-    assert literals.endswith("/theme.json"), literals
+
+    def literals(name):
+        assert name in outputs, list(outputs)
+        return "".join(p for p in outputs[name]["Value"]["Fn::Join"][1] if isinstance(p, str))
+
+    download = literals("WidgetThemeDownload")
+    assert download.startswith("https://"), download
+    assert download.endswith("/defaults/theme.json"), download
+
+    upload = literals("WidgetThemeUpload")
+    assert upload.startswith("https://"), upload
+    assert ".console.aws.amazon.com/s3/buckets/" in upload, upload
+    assert "tab=objects" in upload, upload
+    # It points at the BUCKET, not at an object key that does not exist until they upload one.
+    assert "theme.json" not in upload, upload
 
 
 def test_stack_outputs_ready_to_paste_embed_tag():
@@ -1212,7 +1281,8 @@ def test_demo_site_can_be_turned_off_in_config():
     template.resource_count_is("AWS::S3::Bucket", 3)
     template.resource_count_is("AWS::CloudFront::Distribution", 1)
     template.resource_count_is("AWS::CloudFront::OriginAccessControl", 1)
-    template.resource_count_is("Custom::CDKBucketDeployment", 1)
+    # Two survive, both the widget bucket's: widget.js and the downloadable theme defaults.
+    template.resource_count_is("Custom::CDKBucketDeployment", 2)
     # One response-headers policy survives, and it is the widget's theme.json CORS one, not a
     # leftover of the demo's noindex.
     policies = template.find_resources("AWS::CloudFront::ResponseHeadersPolicy")
@@ -1244,23 +1314,26 @@ def test_demo_site_does_not_change_widget_delivery():
         == _distribution(without_demo, "widget.js")["Properties"]["DistributionConfig"]
     )
 
-    def widget_deployment(template):
-        deps = {
-            lid: r
-            for lid, r in template.find_resources("Custom::CDKBucketDeployment").items()
-            if "DemoSite" not in lid
-        }
-        assert len(deps) == 1, list(deps)
-        return next(iter(deps.values()))["Properties"]
-
-    a, b = widget_deployment(with_demo), widget_deployment(without_demo)
-    for key in ("DestinationBucketName", "DistributionPaths", "Prune", "Exclude", "SourceObjectKeys"):
+    keys = ("DestinationBucketName", "DistributionPaths", "Prune", "Exclude", "SourceObjectKeys")
+    a, b = (
+        _widget_deployment(with_demo)["Properties"],
+        _widget_deployment(without_demo)["Properties"],
+    )
+    for key in keys:
         assert a.get(key) == b.get(key), (key, a.get(key), b.get(key))
-    # Still pruning its own bucket, still shipping exactly the two files it owns, still
+    # Still pruning its own bucket, still shipping exactly the one file it owns, still
     # invalidated on deploy.
     assert a["Prune"] is True
-    assert a["DistributionPaths"] == ["/widget.js", "/theme.example.json"]
+    assert a["DistributionPaths"] == ["/widget.js"]
     assert "SourceMarkers" not in a, "the widget upload must stay a plain asset copy"
+
+    # The theme download is on the same path and is just as indifferent to the demo knob.
+    c, d = (
+        _theme_defaults_deployment(with_demo)["Properties"],
+        _theme_defaults_deployment(without_demo)["Properties"],
+    )
+    for key in keys + ("DestinationBucketKeyPrefix", "SystemMetadata"):
+        assert c.get(key) == d.get(key), (key, c.get(key), d.get(key))
 
     assert (
         with_demo.find_outputs("WidgetEmbedTag") == without_demo.find_outputs("WidgetEmbedTag")

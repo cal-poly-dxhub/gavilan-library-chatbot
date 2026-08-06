@@ -16,51 +16,63 @@ See [Why so few knobs](#why-so-few-knobs).
 
 ---
 
-## Where the file goes
+## Doing it
 
-One file, named exactly `theme.json`, at the **top level of the widget bucket** - the same
-place `widget.js` sits. The bucket name is generated per install, so read it off the stack
-output rather than guessing:
+Everything you need is in the AWS console, and both links come out of the stack itself -
+every install generates its own bucket and CDN names, so there is nothing here to copy by
+hand and no name to match by eye.
 
-```
-aws cloudformation describe-stacks --stack-name GavilanChatbotStack \
-  --query "Stacks[0].Outputs[?OutputKey=='WidgetThemeUpload'].OutputValue" --output text
-```
+Open **CloudFormation** → the **GavilanChatbotStack** stack → the **Outputs** tab. Two rows
+matter, and they are steps 1 and 2:
 
-That prints `s3://<the widget bucket>/theme.json`. `cdk deploy` prints the same thing at the
-end of a deploy.
+| Output | What it is |
+|---|---|
+| `WidgetThemeDownload` | a link that downloads `theme.json` |
+| `WidgetThemeUpload` | a link that opens the bucket you upload it back into |
 
-## Uploading it
+1. Click **`WidgetThemeDownload`**. It saves a file called `theme.json` - already the right
+   name - holding the current defaults. (If your browser shows the JSON in a tab instead of
+   saving it, use Save Page As and keep the name `theme.json`.)
+2. Edit the values you want in any text editor. Leave the `_readme` line alone or delete it;
+   the widget ignores it either way. **Then paste the whole file into a JSON validator**
+   (jsonlint.com, or anything similar). This matters more than it sounds - see below.
+3. Click **`WidgetThemeUpload`**. It opens the widget bucket in the S3 console, at the object
+   list. You should see `widget.js` and a `defaults/` folder there; that is how you know it
+   is the right bucket.
+4. Choose **Upload**, add your `theme.json`, and upload it. Leave it at the top level, next
+   to `widget.js` - not inside `defaults/`. You do not need to set permissions, metadata, or
+   anything else on the object.
+5. **Wait about a minute**, then reload a page that has the widget on it. Your colour should
+   be there on the first paint.
 
-1. In the same bucket you will upload to, find **`theme.example.json`** and download it. It
-   is the annotated copy: every key, what it does, what the valid values are, and the
-   defaults. It ships with the widget and is refreshed on every deploy.
-2. Edit the values you want. Delete the `_readme` block if you like - the widget ignores it
-   either way.
-3. Save it as **`theme.json`** (not `theme.example.json` - that one is overwritten on the
-   next deploy, so an edit to it is lost).
-4. In the S3 console, open the widget bucket, choose **Upload**, add your `theme.json`, and
-   upload. You do not need to set permissions, metadata, or anything else on the object.
-5. Wait about a minute, then reload a page that has the widget on it. Your colour should be
-   there on the first paint.
-
-To go back to the shipped look, delete `theme.json`.
+To go back to the shipped look, delete `theme.json` from the top level of the bucket. The
+copy under `defaults/` is not yours to manage - it is refreshed on every deploy and is only
+ever the download in step 1.
 
 ### A few things worth knowing
 
+- **Take the bucket from the `WidgetThemeUpload` link, never by name.** The account holds
+  around nineteen buckets and the demo site's sits right next to the widget's. Uploading
+  `theme.json` into the wrong one succeeds, reports nothing, and changes nothing - there is
+  no error to see, only a widget that stays maroon. The link is the only reliable way in.
+- **Malformed JSON fails silently.** One trailing comma, one missing quote, and the widget
+  ignores the entire file and renders the defaults - no error on the page, nothing to
+  notice. That is deliberate (a typo must never leave a blank widget on a library page), but
+  it does mean a broken file and a file that has not arrived yet look identical. Validate
+  before you upload; it takes ten seconds and it is the difference between the two.
+- **60 seconds, twice over.** The CDN holds the file for 60 seconds and so does the browser,
+  so allow about a minute end to end. If a change has not appeared, wait the minute out and
+  hard-reload (Cmd-Shift-R / Ctrl-F5) before assuming the file is wrong.
 - **A `theme.json` 404 in the browser console is normal until you upload one.** Every fresh
   install serves it, because there is no theme file until you make one. The widget treats a
   missing file as "no customisation" and renders the defaults. It is not an error to chase.
-- **About a minute, not instantly.** The CDN holds the file for 60 seconds, and so does the
-  browser. If a change has not appeared, wait a minute and hard-reload before assuming it
-  did not work.
 - **Your file survives deploys.** The deployment that ships `widget.js` is configured to
-  leave `theme.json` alone, so a future release cannot delete your colours. This is pinned by
-  a test (`test_the_theme_file_is_outside_the_prune_scope`), not just by care.
+  leave both your `theme.json` and the `defaults/` folder alone, so a future release cannot
+  delete your colours. This is pinned by a test
+  (`test_the_theme_file_is_outside_the_prune_scope`), not just by care.
 - **One bad value costs you that value and nothing else.** A colour it cannot read leaves the
-  colour alone; a font keyword it does not know leaves the font alone. The one exception is a
-  file that is not valid JSON at all, which is ignored entirely - if a change is not showing
-  up, paste the file into a JSON validator first. A trailing comma is the usual culprit.
+  colour alone; a font keyword it does not know leaves the font alone. Only a file that is
+  not valid JSON at all is ignored entirely.
 - **It cannot break the widget.** Nothing in the file becomes code. The colour is matched
   against a hex pattern, the font is looked up in a fixed list, and the questions are
   rendered as plain text.
@@ -144,10 +156,15 @@ against `#ffffff` and `#f1f3f6` before it goes live.
 
 ## For developers
 
-- The widget-side code is the `THEME` section of `frontend/widget.js`; the shipped example is
-  `frontend/theme.example.json`.
-- The CDN behaviour (CORS, the 60-second TTL) and the prune exclusion are in the widget
-  hosting section of `infra/infra/infra_stack.py`.
+- The widget-side code is the `THEME` section of `frontend/widget.js`; the downloadable copy
+  of the defaults is `frontend/defaults/theme.json`, deployed to `defaults/theme.json` in the
+  widget bucket by its own `BucketDeployment` (`prune=False`, prefix-scoped, and carrying the
+  `Content-Disposition: attachment` that makes the output link a download rather than a page).
+- The CDN behaviour (CORS, the 60-second TTL) and the prune exclusions are in the widget
+  hosting section of `infra/infra/infra_stack.py`. Note the prune exclusion needs **two**
+  patterns: `aws s3 sync --exclude` matches against the full path, so `theme.json` covers the
+  root object only and `defaults/*` is what keeps the download itself from being deleted on
+  every deploy.
 - The fetch is deliberately blocking on mount, capped by `CONFIG.themeTimeoutMs` (1.5s), so a
   themed install never shows the default colours first and a dead CDN never withholds the
   widget for longer than that.
