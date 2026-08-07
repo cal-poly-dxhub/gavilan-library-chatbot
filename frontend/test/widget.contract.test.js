@@ -3053,16 +3053,12 @@ test("the sign-in form is localized, and a switch does not strand it in the othe
 // defaults/theme.json is what the customer downloads from the stack's output link and edits
 // in place, so it is tested as code: it has to BE the defaults, and it has to document
 // itself, because once downloaded it travels alone and its reader has no GitHub access.
-// Its text is authored in docs/theme-settings-reference.md and shipped verbatim.
+// The file is its own source of truth; there is no separate authored copy.
 const THEME_DEFAULTS_PATH = path.join(__dirname, "..", "defaults", "theme.json");
 const THEME_DEFAULTS_TEXT = fs.readFileSync(THEME_DEFAULTS_PATH, "utf8");
 const THEME_DEFAULTS = JSON.parse(THEME_DEFAULTS_TEXT);
-const THEME_REFERENCE_DOC = fs.readFileSync(
-  path.join(__dirname, "..", "..", "docs", "theme-settings-reference.md"),
-  "utf8"
-);
-// The hosted guide page, served at the widget bucket root next to widget.js. Its copy is
-// authored in docs/theming-quickstart.md.
+// The hosted guide page, served at the widget bucket root next to widget.js. The page is
+// its own source of truth as well.
 const THEME_GUIDE_PAGE = fs.readFileSync(
   path.join(__dirname, "..", "theme-guide.html"),
   "utf8"
@@ -3397,13 +3393,27 @@ test("the theme adds no storage and no second request path", () => {
   });
 });
 
-test("defaults/theme.json is the reference doc's fenced block, byte for byte", () => {
-  // The file's text is authored in docs/theme-settings-reference.md and shipped verbatim.
-  // Byte equality, not parsed equality: the doc is the source of truth for wording,
-  // spacing and key order alike, so nothing here may be reformatted on the way through.
-  const fence = THEME_REFERENCE_DOC.match(/```json\n([\s\S]*?)```/);
-  assert.ok(fence, "the reference doc must carry the fenced settings file");
-  assert.strictEqual(THEME_DEFAULTS_TEXT, fence[1]);
+test("defaults/theme.json is canonical, byte for byte", () => {
+  // The shipped file is the source of truth for its own wording, spacing and key order,
+  // so its form is pinned directly. Byte equality against its canonical serialisation:
+  // two space indent, LF line endings, no BOM, one trailing newline. A hand edit that
+  // reformats the file cannot land silently.
+  assert.notStrictEqual(THEME_DEFAULTS_TEXT.charCodeAt(0), 0xfeff, "no BOM");
+  assert.ok(THEME_DEFAULTS_TEXT.indexOf("\r") < 0, "LF only");
+  assert.strictEqual(
+    THEME_DEFAULTS_TEXT,
+    JSON.stringify(THEME_DEFAULTS, null, 2) + "\n"
+  );
+  // Key order is part of the file's teaching: the _readme comes first so the
+  // documentation is the first thing its reader sees, then the three settings in the
+  // order the _readme explains them.
+  assert.deepStrictEqual(Object.keys(THEME_DEFAULTS), [
+    "_readme",
+    "highlightColor",
+    "fontFamily",
+    "starterQuestions",
+  ]);
+  assert.deepStrictEqual(Object.keys(THEME_DEFAULTS.starterQuestions), ["en", "es"]);
 });
 
 test("defaults/theme.json is valid, is the shipped default, and documents itself", () => {

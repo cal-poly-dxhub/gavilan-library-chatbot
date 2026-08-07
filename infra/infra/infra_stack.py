@@ -95,8 +95,8 @@ _WIDGET_THEME_DEFAULTS_DIR = _FRONTEND_DIR / _WIDGET_THEME_DEFAULTS_PREFIX
 # source, so the prune sees it as the deployment's own object and never deletes it, and
 # neither exclude list has to change. It must NOT ship under defaults/: that whole
 # deployment is served with Content-Disposition attachment, and a guide page that
-# downloads instead of rendering is no guide at all. The copy is rendered from
-# docs/theming-quickstart.md; edit it there first.
+# downloads instead of rendering is no guide at all. The page is its own source of
+# truth; edit frontend/theme-guide.html directly.
 _WIDGET_THEME_GUIDE_FILE = "theme-guide.html"
 
 # The shipped demo page and the two placeholders the deploy stamps into it. Keeping the
