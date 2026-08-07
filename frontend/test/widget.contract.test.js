@@ -3051,12 +3051,16 @@ test("the sign-in form is localized, and a switch does not strand it in the othe
 // render the rest", and the default install has to stay byte-identical.
 
 // defaults/theme.json is what the customer downloads from the stack's output link and edits
-// in place, so it is tested as code: it has to BE the defaults, and it has to carry the
-// pointer to the guide, because once downloaded it travels alone.
+// in place, so it is tested as code: it has to BE the defaults, and it has to document
+// itself, because once downloaded it travels alone and its reader has no GitHub access.
+// The file is its own source of truth; there is no separate authored copy.
 const THEME_DEFAULTS_PATH = path.join(__dirname, "..", "defaults", "theme.json");
-const THEME_DEFAULTS = JSON.parse(fs.readFileSync(THEME_DEFAULTS_PATH, "utf8"));
-const THEMING_DOC = fs.readFileSync(
-  path.join(__dirname, "..", "..", "docs", "widget-theming.md"),
+const THEME_DEFAULTS_TEXT = fs.readFileSync(THEME_DEFAULTS_PATH, "utf8");
+const THEME_DEFAULTS = JSON.parse(THEME_DEFAULTS_TEXT);
+// The hosted guide page, served at the widget bucket root next to widget.js. The page is
+// its own source of truth as well.
+const THEME_GUIDE_PAGE = fs.readFileSync(
+  path.join(__dirname, "..", "theme-guide.html"),
   "utf8"
 );
 
@@ -3389,34 +3393,57 @@ test("the theme adds no storage and no second request path", () => {
   });
 });
 
-test("defaults/theme.json is valid, is the shipped default, and points at the guide", () => {
-  // It is downloaded, edited and re-uploaded under the name it already has - so it must be
+test("defaults/theme.json is canonical, byte for byte", () => {
+  // The shipped file is the source of truth for its own wording, spacing and key order,
+  // so its form is pinned directly. Byte equality against its canonical serialisation:
+  // two space indent, LF line endings, no BOM, one trailing newline. A hand edit that
+  // reformats the file cannot land silently.
+  assert.notStrictEqual(THEME_DEFAULTS_TEXT.charCodeAt(0), 0xfeff, "no BOM");
+  assert.ok(THEME_DEFAULTS_TEXT.indexOf("\r") < 0, "LF only");
+  assert.strictEqual(
+    THEME_DEFAULTS_TEXT,
+    JSON.stringify(THEME_DEFAULTS, null, 2) + "\n"
+  );
+  // Key order is part of the file's teaching: the _readme comes first so the
+  // documentation is the first thing its reader sees, then the three settings in the
+  // order the _readme explains them.
+  assert.deepStrictEqual(Object.keys(THEME_DEFAULTS), [
+    "_readme",
+    "highlightColor",
+    "fontFamily",
+    "starterQuestions",
+  ]);
+  assert.deepStrictEqual(Object.keys(THEME_DEFAULTS.starterQuestions), ["en", "es"]);
+});
+
+test("defaults/theme.json is valid, is the shipped default, and documents itself", () => {
+  // It is downloaded, edited and re-uploaded under the name it already has, so it must be
   // a plain theme.json the widget reads, not a variant with a different name or shape.
   assert.strictEqual(path.basename(THEME_DEFAULTS_PATH), "theme.json");
 
-  // Once it is in someone's Downloads folder it is on its own, and JSON takes no comments,
-  // so one key carries the pointer back to the guide that documents every value.
-  assert.strictEqual(typeof THEME_DEFAULTS._readme, "string");
-  assert.ok(THEME_DEFAULTS._readme.indexOf("theme.json") >= 0, THEME_DEFAULTS._readme);
-  const url = (THEME_DEFAULTS._readme.match(/https?:\/\/\S+/) || [])[0];
-  assert.ok(url, "the _readme must carry the documentation URL");
-  assert.ok(url.endsWith("docs/widget-theming.md"), url);
-
-  // ...and that guide is now the ONLY documentation of the keys, so it is what gets tested
-  // for staying in step with the code.
+  // Once it is in someone's Downloads folder it is on its own, and JSON takes no
+  // comments, so the _readme array IS the documentation: every key, every font keyword
+  // and both caps, in the file itself. No URL: the old pointer went to GitHub, which the
+  // customer cannot open, and a file that explains itself needs no pointer at all.
+  assert.ok(Array.isArray(THEME_DEFAULTS._readme), "the _readme is an array of lines");
+  THEME_DEFAULTS._readme.forEach((line) => assert.strictEqual(typeof line, "string"));
+  const readme = THEME_DEFAULTS._readme.join("\n");
+  assert.ok(readme.indexOf("theme.json") >= 0, readme);
+  assert.ok(!/https?:\/\//.test(readme), "the readme must not depend on any external URL");
   ["highlightColor", "fontFamily", "starterQuestions"].forEach((key) => {
-    assert.ok(THEMING_DOC.indexOf(key) >= 0, "the guide documents " + key);
+    assert.ok(readme.indexOf(key) >= 0, "the readme documents " + key);
   });
   widget.FONT_KEYWORDS.forEach((keyword) => {
     assert.ok(
-      THEMING_DOC.indexOf('`"' + keyword + '"`') >= 0,
-      "the guide lists the font keyword " + keyword
+      readme.indexOf('\\"' + keyword + '\\"') >= 0 || readme.indexOf('"' + keyword + '"') >= 0,
+      "the readme lists the font keyword " + keyword
     );
   });
   assert.ok(
-    THEMING_DOC.indexOf(String(widget.MAX_STARTER_CHARS)) >= 0,
-    "the guide states the length cap"
+    readme.indexOf(String(widget.MAX_STARTER_CHARS)) >= 0,
+    "the readme states the length cap"
   );
+  assert.ok(/FOUR/.test(readme), "the readme states the count cap");
 
   // Every value in it equals a built-in default, so uploading it unchanged is a no-op...
   assert.strictEqual(THEME_DEFAULTS.highlightColor, widget.DEFAULT_HIGHLIGHT);
@@ -3429,12 +3456,39 @@ test("defaults/theme.json is valid, is the shipped default, and points at the gu
     THEME_DEFAULTS.starterQuestions.es,
     widget.STRINGS.es.suggestedQuestions
   );
-  // ...and the widget reads it without dropping anything, _readme included (unknown keys
-  // are ignored, so the pointer can live in the file it points from).
+  // ...and the widget reads it without tripping on anything, the _readme array included
+  // (unknown keys are ignored whatever their type, so the docs can live in the file).
   withTheme(THEME_DEFAULTS, () => {
     assert.strictEqual(widget.themeCss(), "", "the shipped defaults are the default theme");
     assert.deepStrictEqual(widget.starterQuestions(), widget.STRINGS.en.suggestedQuestions);
   });
+});
+
+test("the theme guide page is self-contained and names the outputs it teaches", () => {
+  // One file at the bucket root, rendered in a browser tab straight off the widget CDN.
+  // Nothing external: no scripts, no fonts, no stylesheets, no URLs at all, so it can
+  // never break, phone home, or depend on a host the customer's network blocks.
+  assert.ok(/<html lang="en">/.test(THEME_GUIDE_PAGE), "the page declares its language");
+  assert.ok(!/<script\b/i.test(THEME_GUIDE_PAGE), "no scripts");
+  assert.ok(!/<link\b/i.test(THEME_GUIDE_PAGE), "no external stylesheets");
+  assert.ok(!/\bsrc=/i.test(THEME_GUIDE_PAGE), "no embedded resources");
+  assert.ok(!/@import|url\(/i.test(THEME_GUIDE_PAGE), "no CSS fetches");
+  assert.ok(!/https?:/i.test(THEME_GUIDE_PAGE), "no absolute URLs anywhere");
+
+  // The one link on the page is the relative path to the settings file, which is what
+  // lets the page work on any distribution domain without being stamped at deploy.
+  const hrefs = THEME_GUIDE_PAGE.match(/href="[^"]*"/g) || [];
+  assert.ok(hrefs.length >= 1, "the download link exists");
+  hrefs.forEach((href) => assert.strictEqual(href, 'href="defaults/theme.json"'));
+
+  // It teaches the CloudFormation Outputs tab, so the two console links are named by
+  // their output names and never described in other words.
+  assert.ok(THEME_GUIDE_PAGE.indexOf("WidgetThemeDownload") >= 0);
+  assert.ok(THEME_GUIDE_PAGE.indexOf("WidgetThemeUpload") >= 0);
+  assert.ok(
+    THEME_GUIDE_PAGE.indexOf("Changing the chatbot's colours and questions") >= 0,
+    "the page carries its own title"
+  );
 });
 
 run();

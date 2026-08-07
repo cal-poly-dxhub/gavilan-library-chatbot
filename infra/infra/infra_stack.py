@@ -88,6 +88,17 @@ _WIDGET_THEME_FILE = "theme.json"
 _WIDGET_THEME_DEFAULTS_PREFIX = "defaults"
 _WIDGET_THEME_DEFAULTS_DIR = _FRONTEND_DIR / _WIDGET_THEME_DEFAULTS_PREFIX
 
+# The customer facing theming guide: one self contained HTML page at the widget bucket
+# root, served by the widget distribution and linked from the WidgetThemeGuide output. It
+# exists so the workflow explains itself from inside AWS (the settings file used to point
+# at a GitHub doc the client cannot open). It rides in the widget deployment as a SECOND
+# source, so the prune sees it as the deployment's own object and never deletes it, and
+# neither exclude list has to change. It must NOT ship under defaults/: that whole
+# deployment is served with Content-Disposition attachment, and a guide page that
+# downloads instead of rendering is no guide at all. The page is its own source of
+# truth; edit frontend/theme-guide.html directly.
+_WIDGET_THEME_GUIDE_FILE = "theme-guide.html"
+
 # The shipped demo page and the two placeholders the deploy stamps into it. Keeping the
 # names here (rather than inline) makes the synth-time assertion below the single place
 # that couples this stack to the page's markup.
@@ -1398,7 +1409,19 @@ class GavilanChatbotStack(Stack):
             self,
             "WidgetDeployment",
             destination_bucket=widget_bucket,
-            sources=[s3deploy.Source.asset(str(_FRONTEND_DIR), exclude=["*", "!widget.js"])],
+            # Two sources, merged into one sync: the widget itself, and the theming guide
+            # page. The guide is a second source rather than a "!" entry in the first
+            # one's include list so each source stays a one file asset with one job, and
+            # it belongs in THIS deployment (not a third one) because an object at the
+            # bucket root survives this deployment's prune only by being in its source or
+            # in its exclude list, and the exclude list is pinned to the two customer
+            # owned paths.
+            sources=[
+                s3deploy.Source.asset(str(_FRONTEND_DIR), exclude=["*", "!widget.js"]),
+                s3deploy.Source.asset(
+                    str(_FRONTEND_DIR), exclude=["*", f"!{_WIDGET_THEME_GUIDE_FILE}"]
+                ),
+            ],
             # TWO FILES IN THIS BUCKET SURVIVE EVERY DEPLOY, and this one line is the whole
             # reason. BucketDeployment prunes by default - `aws s3 sync --delete` - which
             # removes destination objects the source does not contain, and the source here is
@@ -1423,7 +1446,7 @@ class GavilanChatbotStack(Stack):
             # test_the_theme_file_is_outside_the_prune_scope pins the rendered property.
             exclude=[_WIDGET_THEME_FILE, f"{_WIDGET_THEME_DEFAULTS_PREFIX}/*"],
             distribution=widget_distribution,
-            distribution_paths=["/widget.js"],
+            distribution_paths=["/widget.js", f"/{_WIDGET_THEME_GUIDE_FILE}"],
         )
 
         # --- defaults/theme.json: the thing the customer clicks ------------------------
@@ -1561,35 +1584,45 @@ class GavilanChatbotStack(Stack):
             value=query_url,
             description="HTTP API POST /query endpoint the widget calls.",
         )
-        # The two ends of the theming flow, both as https:// URLs so the CloudFormation
+        # The theming flow's three outputs, all https:// URLs so the CloudFormation
         # Outputs tab renders them as links the customer can click. That is the entire
-        # design: a generated bucket name in a nineteen-bucket account is not something to
-        # match by eye, and the demo-site bucket sits right next to this one - an upload into
-        # the wrong one succeeds and changes nothing.
+        # design: a generated bucket name in a nineteen bucket account is not something to
+        # match by eye, and the demo site bucket sits right next to this one (an upload
+        # into the wrong one succeeds and changes nothing). The Outputs tab is the only
+        # entry point anyone has, so each output carries a Description that says what to
+        # do with it. The guide page is the one that teaches the other two.
+        CfnOutput(
+            self,
+            "WidgetThemeGuide",
+            value=(
+                f"https://{widget_distribution.distribution_domain_name}"
+                f"/{_WIDGET_THEME_GUIDE_FILE}"
+            ),
+            description="Start here: how to change the chatbot's colours and questions.",
+        )
         CfnOutput(
             self,
             "WidgetThemeDownload",
             value=f"https://{widget_distribution.distribution_domain_name}"
             f"/{_WIDGET_THEME_DEFAULTS_PREFIX}/{_WIDGET_THEME_FILE}",
             description=(
-                "Step 1: click to download theme.json (the current defaults, already "
-                "correctly named). Edit it, then upload it via WidgetThemeUpload. "
-                "See docs/widget-theming.md."
+                "Downloads the settings file, theme.json. The instructions are inside "
+                "the file. Edit it, then upload it via WidgetThemeUpload."
             ),
         )
         CfnOutput(
             self,
             "WidgetThemeUpload",
-            # Deep link to the objects view of THIS bucket, so the drag-and-drop target is
+            # Deep link to the objects view of THIS bucket, so the drag and drop target is
             # one click away and cannot be the wrong bucket.
             value=(
                 f"https://{self.region}.console.aws.amazon.com/s3/buckets/"
                 f"{widget_bucket.bucket_name}?region={self.region}&tab=objects"
             ),
             description=(
-                "Step 2: the widget bucket in the S3 console. Upload your edited theme.json "
-                "here, at the top level (next to widget.js), to restyle the widget with no "
-                "redeploy. Allow about a minute for the CDN."
+                "Opens the widget bucket in the S3 console. Upload your edited "
+                "theme.json here, at the top level, next to widget.js. The change is "
+                "live in about a minute, with no redeploy."
             ),
         )
         # --- Sign-in gate: the ids, and the two commands that create the one account ---

@@ -957,7 +957,7 @@ def test_the_theme_file_is_outside_the_prune_scope():
     frontend = pathlib.Path(__file__).resolve().parents[3] / "frontend"
     assert not (frontend / "theme.json").exists(), "the repo must not ship a theme.json"
     assert (frontend / "defaults" / "theme.json").exists()
-    assert props["DistributionPaths"] == ["/widget.js"]
+    assert props["DistributionPaths"] == ["/widget.js", "/theme-guide.html"]
 
 
 def test_the_defaults_file_is_a_download_not_a_page():
@@ -1076,6 +1076,57 @@ def test_the_stack_links_both_ends_of_the_theming_flow():
     assert "tab=objects" in upload, upload
     # It points at the BUCKET, not at an object key that does not exist until they upload one.
     assert "theme.json" not in upload, upload
+
+
+def test_the_guide_page_ships_at_the_bucket_root_and_renders_in_a_tab():
+    # The self serving requirement: the theming workflow explains itself from inside AWS,
+    # so the guide page is an object the widget deployment itself ships. It rides as a
+    # SECOND source of that deployment, which is what keeps it outside the prune argument
+    # entirely: the prune only deletes objects its own sources do not contain, so the page
+    # needs no entry in the pinned exclude list.
+    template = _template()
+    props = _widget_deployment(template)["Properties"]
+    assert len(props["SourceObjectKeys"]) == 2, props["SourceObjectKeys"]
+    assert "DestinationBucketKeyPrefix" not in props, "the page must land at the root"
+    # Invalidated on deploy alongside widget.js, so a copy edit shows up immediately.
+    assert props["DistributionPaths"] == ["/widget.js", "/theme-guide.html"]
+
+    # It must NOT ride the defaults deployment: everything in that one is served with
+    # Content-Disposition attachment, and a guide that downloads instead of rendering is
+    # no guide at all. One source there, and nothing named like a page in its directory.
+    defaults_props = _theme_defaults_deployment(template)["Properties"]
+    assert len(defaults_props["SourceObjectKeys"]) == 1, defaults_props["SourceObjectKeys"]
+
+    frontend = pathlib.Path(__file__).resolve().parents[3] / "frontend"
+    assert (frontend / "theme-guide.html").exists()
+    assert not (frontend / "defaults" / "theme-guide.html").exists()
+
+
+def test_the_guide_output_links_the_page_and_every_theme_output_is_described():
+    # The Outputs tab is the only entry point anyone has, so all three theme outputs say
+    # what to do with them, and the guide's description is the designated starting point.
+    outputs = _template().find_outputs("*")
+
+    def literals(name):
+        assert name in outputs, list(outputs)
+        return "".join(p for p in outputs[name]["Value"]["Fn::Join"][1] if isinstance(p, str))
+
+    guide = literals("WidgetThemeGuide")
+    assert guide.startswith("https://"), guide
+    assert guide.endswith("/theme-guide.html"), guide
+
+    assert outputs["WidgetThemeGuide"]["Description"] == (
+        "Start here: how to change the chatbot's colours and questions."
+    )
+    for name in ("WidgetThemeGuide", "WidgetThemeDownload", "WidgetThemeUpload"):
+        assert outputs[name].get("Description"), f"{name} needs a Description"
+
+    # The guide and the download are served by the same distribution: their values join
+    # over the same CloudFront domain attribute.
+    def domain_token(name):
+        return [p for p in outputs[name]["Value"]["Fn::Join"][1] if not isinstance(p, str)]
+
+    assert domain_token("WidgetThemeGuide") == domain_token("WidgetThemeDownload")
 
 
 def test_stack_outputs_ready_to_paste_embed_tag():
@@ -1321,11 +1372,15 @@ def test_demo_site_does_not_change_widget_delivery():
     )
     for key in keys:
         assert a.get(key) == b.get(key), (key, a.get(key), b.get(key))
-    # Still pruning its own bucket, still shipping exactly the one file it owns, still
+    # Still pruning its own bucket, still shipping exactly the two files it owns, still
     # invalidated on deploy.
     assert a["Prune"] is True
-    assert a["DistributionPaths"] == ["/widget.js"]
-    assert "SourceMarkers" not in a, "the widget upload must stay a plain asset copy"
+    assert a["DistributionPaths"] == ["/widget.js", "/theme-guide.html"]
+    # A plain asset copy, never a deploy-time substitution: with more than one source CDK
+    # always renders a SourceMarkers list, but every entry must stay empty (the demo page
+    # is the only stamped file, and it lives in its own deployment).
+    for markers in a.get("SourceMarkers", []):
+        assert markers == {}, ("the widget upload must stay a plain asset copy", markers)
 
     # The theme download is on the same path and is just as indifferent to the demo knob.
     c, d = (
