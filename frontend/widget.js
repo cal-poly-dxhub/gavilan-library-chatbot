@@ -1569,7 +1569,12 @@
     "  position: fixed; right: 20px; bottom: 20px; z-index: 2147483000;",
     "  display: flex; flex-direction: column;",
     "  width: min(384px, calc(100vw - 32px));",
+    // Two height declarations, ORDER LOAD-BEARING: 100vh is the LARGE viewport, so while
+    // mobile browser chrome is on screen the panel runs up to a toolbar's height too tall.
+    // dvh tracks the visible viewport; the vh line stays FIRST as the fallback an engine
+    // without dvh keeps after dropping the unknown unit.
     "  height: min(560px, calc(100vh - 64px));",
+    "  height: min(560px, calc(100dvh - 64px));",
     "  background: var(--bg); border: 1px solid var(--panel-border);",
     "  border-radius: 14px; overflow: hidden;",
     "  box-shadow: 0 12px 40px rgba(0,0,0,0.24);",
@@ -1579,7 +1584,9 @@
     // gain is mostly extra height - usable on desktop and mobile alike.
     ".panel--expanded {",
     "  width: min(720px, calc(100vw - 24px));",
+    // Same vh-then-dvh pair as .panel, same ordering rule.
     "  height: min(860px, calc(100vh - 32px));",
+    "  height: min(860px, calc(100dvh - 32px));",
     "}",
     // `hidden` is a UA-stylesheet `display: none`, and every one of these sets `display`
     // from a class - which wins on specificity and paints the element anyway. That is why
@@ -1635,14 +1642,20 @@
     // filled white pill, not merely a different text color, so the state reads without relying
     // on color perception - and it is exposed to assistive tech as aria-pressed, which is also
     // what drives the styling (one source of truth, no parallel class to fall out of sync).
+    // 1px of pill padding, not 2: the buttons inside are 24px tall (the WCAG 2.5.8 target
+    // floor), and 24 + 1 + 1 = 26 matches the close button, so the header stays 50px.
     ".header__lang {",
     "  display: inline-flex; align-items: center; gap: 2px; margin-right: 4px;",
-    "  background: color-mix(in srgb, currentColor 16%, transparent); border-radius: 999px; padding: 2px;",
+    "  background: color-mix(in srgb, currentColor 16%, transparent); border-radius: 999px; padding: 1px;",
     "}",
+    // min-height 24px: the button IS the touch target, and 11px type on 4px padding came to
+    // 19px, under the 24x24 CSS-pixel floor of WCAG 2.2 AA (2.5.8). inline-flex keeps the
+    // label centred in the taller box.
     ".header__lang-btn {",
     "  appearance: none; border: none; background: transparent; color: var(--accent-ink);",
     "  font: inherit; font-size: 11px; font-weight: 700; line-height: 1; white-space: nowrap;",
     "  cursor: pointer; padding: 4px 8px; border-radius: 999px;",
+    "  display: inline-flex; align-items: center; min-height: 24px;",
     "}",
     ".header__lang-btn:hover { background: color-mix(in srgb, currentColor 20%, transparent); }",
     // The active pill is the ink/highlight pair inverted, so it carries exactly the ratio
@@ -1650,10 +1663,14 @@
     // black and white guarantees.
     ".header__lang-btn[aria-pressed=\"true\"] { background: var(--accent-ink); color: var(--brand); }",
     ".header__lang-btn:focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 2px; }",
+    // min 24x24 for the same 2.5.8 floor (it measured 29x21); still under the close
+    // button's 26px, so the header height does not move.
     ".header__expand {",
     "  appearance: none; border: none; background: transparent;",
     "  color: var(--accent-ink); font-size: 17px; line-height: 1;",
     "  cursor: pointer; padding: 2px 6px; border-radius: 6px;",
+    "  display: inline-flex; align-items: center; justify-content: center;",
+    "  min-height: 24px; min-width: 24px;",
     "}",
     ".header__expand:hover { background: color-mix(in srgb, currentColor 18%, transparent); }",
     ".header__expand:focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 1px; }",
@@ -1677,8 +1694,9 @@
     ".msg--bot .bubble.bubble--error { background: var(--error-bg); color: var(--error-ink); }",
     // sources - per message, collapsed behind a disclosure toggle
     ".sources { margin-top: 8px; padding-top: 8px; border-top: 1px solid #dfe3e8; }",
+    // min-height 24px: at 20px tall this disclosure sat under the 2.5.8 target floor.
     ".sources__toggle {",
-    "  display: inline-flex; align-items: center; gap: 5px;",
+    "  display: inline-flex; align-items: center; gap: 5px; min-height: 24px;",
     "  appearance: none; border: none; background: transparent; cursor: pointer;",
     "  padding: 2px 0; color: var(--muted); font: inherit;",
     "  font-size: 11px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase;",
@@ -1765,7 +1783,9 @@
     ".composer__input {",
     "  flex: 1 1 auto; resize: none; max-height: 120px; min-height: 40px;",
     "  padding: 9px 11px; border: 1px solid var(--line); border-radius: 10px;",
-    "  font: inherit; color: inherit; background: #fff;",
+    // 16px, AFTER the font shorthand: iOS Safari zooms the whole page on focusing any
+    // field that computes under 16px, and this is the first thing a phone visitor touches.
+    "  font: inherit; font-size: 16px; color: inherit; background: #fff;",
     "}",
     // Two-tone ring, thinner than the buttons' so the text box still reads gently. The
     // brand-tinted border-color is kept from the old softened treatment: at 3.09:1 it
@@ -1816,7 +1836,8 @@
     ".signin__label { font-size: 12px; color: var(--muted); }",
     ".signin__input {",
     "  padding: 9px 11px; border: 1px solid var(--line); border-radius: 10px;",
-    "  font: inherit; color: inherit; background: #fff; min-height: 40px;",
+    // Same 16px iOS focus-zoom floor as the composer input.
+    "  font: inherit; font-size: 16px; color: inherit; background: #fff; min-height: 40px;",
     "}",
     ".signin__input:focus-visible {",
     "  outline: 2px solid var(--focus-ring);",

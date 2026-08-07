@@ -996,6 +996,50 @@ test("expanded dimensions clamp to the viewport (usable on mobile)", () => {
   assert.ok(/\.panel--expanded\s*\{[^}]*min\(/.test(SOURCE), "expanded width/height clamp with min()");
 });
 
+// --- mobile: focus-zoom floor, dynamic viewport, touch targets ----------
+test("text inputs compute to 16px so iOS Safari does not zoom the page on focus", () => {
+  var flat = SOURCE.replace(/\n/g, " ");
+  ["\\.composer__input", "\\.signin__input"].forEach(function (sel) {
+    var rule = new RegExp(sel + " \\{[^}]*\\}").exec(flat);
+    assert.ok(rule, sel + " has a base rule");
+    // AFTER `font: inherit`, which would otherwise reset the size back to the 15px root.
+    assert.ok(/font: inherit; font-size: 16px/.test(rule[0]), sel + " sets 16px after the font shorthand");
+  });
+});
+
+test("panel heights track the dynamic viewport, with plain vh kept first as the fallback", () => {
+  // 100vh is the LARGE viewport in current browsers: while mobile browser chrome shows,
+  // a vh-only panel is up to a toolbar's height too tall. Each height rule therefore
+  // declares vh then dvh, in that order, so engines without dvh keep the vh value.
+  var flat = SOURCE.replace(/\n/g, " ");
+  // The two declarations are adjacent string literals in the STYLES array, so the
+  // flattened source separates them with quotes and commas, not only whitespace.
+  [
+    /height: min\(560px, calc\(100vh - 64px\)\);[\s",]*height: min\(560px, calc\(100dvh - 64px\)\);/,
+    /height: min\(860px, calc\(100vh - 32px\)\);[\s",]*height: min\(860px, calc\(100dvh - 32px\)\);/
+  ].forEach(function (pair) {
+    assert.ok(pair.test(flat), "vh-then-dvh pair present: " + pair);
+  });
+  // Count declarations, not the bare token (comments may say "100vh" in prose).
+  assert.strictEqual((flat.match(/calc\(100vh/g) || []).length, 2, "no height rule is vh-only");
+  assert.strictEqual((flat.match(/calc\(100dvh/g) || []).length, 2, "each vh height has its dvh partner");
+});
+
+test("the small header and sources controls declare the 24px WCAG 2.2 target floor", () => {
+  var flat = SOURCE.replace(/\n/g, " ");
+  // The four controls the mobile audit measured under 24x24 (2.5.8): the two language
+  // buttons (one rule), the header expand button, and the sources disclosure.
+  ["\\.header__lang-btn", "\\.header__expand", "\\.sources__toggle"].forEach(function (sel) {
+    var rule = new RegExp(sel + " \\{[^}]*\\}").exec(flat);
+    assert.ok(rule, sel + " has a base rule");
+    assert.ok(/min-height: 24px/.test(rule[0]), sel + " declares min-height: 24px");
+  });
+  assert.ok(
+    /\.header__expand \{[^}]*min-width: 24px/.test(flat),
+    ".header__expand declares min-width: 24px (the only one that was also narrow-capable)"
+  );
+});
+
 // --- per-message, collapsible sources UI --------------------------------
 test("sources are per-message: each answer shows only its own sources, not a union", async () => {
   var calls = 0;
