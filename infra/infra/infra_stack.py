@@ -99,6 +99,31 @@ _WIDGET_THEME_DEFAULTS_DIR = _FRONTEND_DIR / _WIDGET_THEME_DEFAULTS_PREFIX
 # truth; edit frontend/theme-guide.html directly.
 _WIDGET_THEME_GUIDE_FILE = "theme-guide.html"
 
+# The settings editor: a second self contained page at the widget bucket root, linked from
+# the WidgetThemeEditor output. A form with pickers that downloads a ready-to-upload
+# theme.json, and - for a librarian signed in through the theme-admin pool below - saves it
+# straight to the live widget via PUT /theme. The console upload (WidgetThemeUpload) stays
+# as the fallback path. It ships exactly like the guide (a source of the widget deployment,
+# never under defaults/ whose attachment header would download it), and for the same
+# reason: the workflow has to explain and now also OPERATE itself from inside AWS. The page
+# is its own source of copy; edit frontend/theme-editor.html directly.
+_WIDGET_THEME_EDITOR_FILE = "theme-editor.html"
+# The editor's four deploy-time placeholders, stamped through the same s3deploy.Source.data
+# mechanism as the demo page: the PUT /theme endpoint, the managed-login base URL, the app
+# client id, and the regional cognito-idp endpoint the account panel calls. The committed
+# page carries only these bare markers - no account, region or URL - which is what keeps
+# its "no absolute URLs" contract intact. Source.data substitutes EVERY literal occurrence,
+# so none of these names may be spelled out inside the page itself.
+_THEME_SAVE_URL_TOKEN = "__THEME_SAVE_URL__"
+_THEME_AUTH_BASE_TOKEN = "__THEME_AUTH_BASE__"
+_THEME_CLIENT_ID_TOKEN = "__THEME_CLIENT_ID__"
+_THEME_COGNITO_IDP_TOKEN = "__THEME_COGNITO_IDP__"
+# The placeholder in the printed admin-create-user command. A NAME to substitute, not a
+# value: the librarian's address must never live in config.yaml or the template (an
+# AWS::Cognito::UserPoolUser is replacement-on-update on every property, so a template-owned
+# user could not change email without wiping the librarian's password).
+_THEME_ADMIN_EMAIL_PLACEHOLDER = "PROJECT_EMAIL_HERE"
+
 # The shipped demo page and the two placeholders the deploy stamps into it. Keeping the
 # names here (rather than inline) makes the synth-time assertion below the single place
 # that couples this stack to the page's markup.
@@ -843,6 +868,119 @@ class GavilanChatbotStack(Stack):
             # account allowlists its own demo domain automatically.
             demo_origins = [f"https://{demo_distribution.distribution_domain_name}"]
 
+        # --- Widget hosting (1/2): private S3 bucket + CloudFront (OAC) ----------------
+
+        # The production widget file is served from a private S3 bucket, reachable ONLY
+        # through CloudFront via Origin Access Control (OAC). It lives in THIS stack (not a
+        # separate one) so the whole thing installs with one `cdk deploy`: OAC has a known
+        # cross-stack cyclical-dependency problem, and one-click install wants a single
+        # deploy.
+        widget_bucket = s3.Bucket(
+            self,
+            "WidgetBucket",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            # OAC requires ACLs disabled (bucket-owner-enforced ownership). That is the
+            # default for freshly created buckets; we set it explicitly to keep the OAC
+            # requirement legible.
+            object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            enforce_ssl=True,
+            # One-click install implies one-click uninstall: on `cdk destroy`, remove the
+            # bucket and empty it first (auto_delete_objects adds a small custom resource).
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+        )
+
+        # OAC origin via the CURRENT L2 construct (NOT the deprecated S3Origin/OAI, NOT a
+        # hand-rolled CfnOriginAccessControl). with_origin_access_control provisions the
+        # OAC and wires the bucket policy so only this distribution can read the object.
+        widget_origin = origins.S3BucketOrigin.with_origin_access_control(widget_bucket)
+
+        # --- theme.json: its own behavior on the widget distribution -------------------
+        #
+        # The customer uploads theme.json through the S3 CONSOLE, which sets no metadata -
+        # so neither the freshness nor the CORS headers can come from the object. Both come
+        # from here instead, which is also what keeps "edit the file, reload the page" true
+        # without anyone having to know what Cache-Control is.
+        #
+        # Short TTL, both hops. CACHING_OPTIMIZED (the default behavior, for widget.js) is a
+        # 24-hour default TTL: correct for a versioned-by-deploy script, wrong for a file
+        # whose entire purpose is being edited by hand. 60 seconds is short enough that a
+        # colour change reads as immediate and long enough that the edge still absorbs the
+        # traffic. The explicit Cache-Control does the same job for the browser, which would
+        # otherwise apply heuristic freshness off S3's Last-Modified and could hold a stale
+        # theme for hours on an object that has not changed in a while.
+        widget_theme_cache_policy = cloudfront.CachePolicy(
+            self,
+            "WidgetThemeCachePolicy",
+            comment="Short TTL for the widget's customer-editable theme.json.",
+            default_ttl=Duration.seconds(60),
+            min_ttl=Duration.seconds(0),
+            max_ttl=Duration.seconds(60),
+        )
+
+        # CORS, because the fetch is cross-origin BY CONSTRUCTION: the widget runs on the
+        # library's page and theme.json lives on the CDN, so without an
+        # Access-Control-Allow-Origin the browser refuses to hand the body to widget.js and
+        # every install silently renders the default theme.
+        #
+        # `*` here, and that is NOT the wildcard config.yaml rejects for the API. That one
+        # guards a billable POST endpoint any page could otherwise drive from its visitors'
+        # browsers. This is a public, world-readable static file on the customer's own CDN,
+        # already served to anyone who requests it; an exact allowlist would add no secrecy
+        # and one real failure mode - the widget embedded on a staging or campus subdomain
+        # nobody thought to list, silently falling back to the default colours.
+        #
+        # Set from CloudFront rather than an S3 CORS rule for the same reason as the TTL:
+        # nothing about this may depend on how the object was uploaded.
+        widget_theme_headers_policy = cloudfront.ResponseHeadersPolicy(
+            self,
+            "WidgetThemeHeadersPolicy",
+            comment="CORS + short browser cache for the widget's theme.json.",
+            cors_behavior=cloudfront.ResponseHeadersCorsBehavior(
+                access_control_allow_credentials=False,
+                access_control_allow_headers=["*"],
+                access_control_allow_methods=["GET", "HEAD"],
+                access_control_allow_origins=["*"],
+                origin_override=True,
+            ),
+            custom_headers_behavior=cloudfront.ResponseCustomHeadersBehavior(
+                custom_headers=[
+                    cloudfront.ResponseCustomHeader(
+                        header="Cache-Control", value="public, max-age=60", override=True
+                    )
+                ]
+            ),
+        )
+
+        widget_distribution = cloudfront.Distribution(
+            self,
+            "WidgetDistribution",
+            comment="Gavilan Library chat widget CDN (serves widget.js).",
+            default_root_object="widget.js",
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=widget_origin,
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED,
+            ),
+            # Same origin and bucket, different caching and headers. Scoped to this one path
+            # so widget.js delivery is untouched: it keeps the 24-hour cache and gains no
+            # CORS header it has never needed (a <script src> is not a cross-origin fetch).
+            additional_behaviors={
+                _WIDGET_THEME_FILE: cloudfront.BehaviorOptions(
+                    origin=widget_origin,
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                    cache_policy=widget_theme_cache_policy,
+                    response_headers_policy=widget_theme_headers_policy,
+                )
+            },
+        )
+        # NOTE: do NOT add an explicit distribution->bucket dependency. The origin already
+        # references the bucket (GetAtt), so CloudFormation orders the bucket first. Adding
+        # node.add_dependency(bucket) instead pulls in ALL the bucket's children, including
+        # the auto-delete-objects custom resource, which DependsOn the OAC bucket policy,
+        # which DependsOn the distribution -> a synth-blocking dependency cycle.
+
         # --- Query path: Lambda + HTTP API --------------------------------------------
 
         generation_model_id = generation_cfg["model_id"]
@@ -1094,6 +1232,145 @@ class GavilanChatbotStack(Stack):
             disable_o_auth=True,
         )
 
+        # --- Theme-editor sign-in: its own Cognito pool + managed login ----------------
+        #
+        # PERMANENT, unlike the demo gate above: it survives go-live, because it gates a
+        # WRITE (the settings editor's Save rewrites the live theme.json) rather than demo
+        # spend. Its own pool on purpose - the demo pool is a shared throwaway login that
+        # is deleted at go-live, holds a plain-username account, and must not be touched
+        # (its sign-in options are immutable and its pool id is baked into every embed).
+        #
+        # This pool holds named librarian accounts and the whole lifecycle is self-service
+        # from the hosted editor page: sign-in, the forced first-password change and
+        # forgot-password all belong to Cognito MANAGED LOGIN (no sign-in or reset UI of
+        # ours anywhere), and change-password / change-email are user-scoped cognito-idp
+        # calls the page makes with the signed-in librarian's own access token. The only
+        # step that ever needs AWS credentials is creating an account - one printed
+        # admin-create-user command (see the ThemeAdminCreateUserCommand output). No user
+        # lives in CloudFormation: every AWS::Cognito::UserPoolUser property is
+        # replacement-on-update, so a template-owned user could not change email without
+        # wiping the librarian's password.
+        theme_admin_pool = cognito.UserPool(
+            self,
+            "ThemeAdminUserPool",
+            user_pool_name="gavilan-library-theme-admin",
+            # Accounts exist only through the printed admin-create-user command.
+            self_sign_up_enabled=False,
+            # EMAIL is the sign-in attribute: these are real, personal addresses (unlike
+            # the demo pool's word-of-mouth username), and the address doubles as the
+            # invitation and recovery channel. Sign-in options are immutable after pool
+            # creation, same as the demo pool - settled here or not cheaply at all.
+            sign_in_aliases=cognito.SignInAliases(email=True),
+            # Cognito sends a verification code when an email needs verifying; required
+            # alongside keep_original below.
+            auto_verify=cognito.AutoVerifiedAttrs(email=True),
+            # A changed email must be VERIFIED before it replaces the old one: the address
+            # is the sign-in name and the recovery channel, so an unverified typo would
+            # lock the librarian out of both at once. Until the code is entered, sign-in
+            # and recovery keep using the original address.
+            keep_original=cognito.KeepOriginalAttrs(email=True),
+            # Self-service forgot-password by verified email, priority one - the whole
+            # point of inviting by email with email_verified set true. Managed login hosts
+            # the flow; nothing of ours is involved.
+            account_recovery=cognito.AccountRecovery.EMAIL_ONLY,
+            password_policy=cognito.PasswordPolicy(
+                min_length=12,
+                require_lowercase=True,
+                require_uppercase=True,
+                require_digits=True,
+                require_symbols=True,
+                # The invitation's temporary password. 90 days, not the 7-day default: the
+                # installer runs the command at handover and a three-person library may not
+                # sit down with it that week. A lapsed invitation is re-sent by re-running
+                # the printed command with --message-action RESEND.
+                temp_password_validity=Duration.days(90),
+            ),
+            # The invitation Cognito emails when the command runs. {username} and {####}
+            # are Cognito's substitution slots for the address and the generated temporary
+            # password - BOTH are required in the template or nothing is delivered. The
+            # editor URL is a deploy-time token, so the email links straight to the page
+            # they sign in on.
+            user_invitation=cognito.UserInvitationConfig(
+                email_subject="Your Gavilan Library chatbot settings sign-in",
+                email_body=(
+                    "You can now manage the Gavilan Library chatbot's colours, font and "
+                    "starter questions.\n\n"
+                    "Open https://"
+                    f"{widget_distribution.distribution_domain_name}"
+                    f"/{_WIDGET_THEME_EDITOR_FILE} and choose Sign in. Your username is "
+                    "{username} and your temporary password is {####} - you will be asked "
+                    "to choose your own password the first time you sign in. This "
+                    "invitation is valid for 90 days."
+                ),
+            ),
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        # The hosted sign-in pages live on a Cognito domain. The prefix folds in the
+        # account id for uniqueness (domain prefixes are regional-global, like bucket
+        # names) and stays stable across deploys. MANAGED LOGIN (version 2), not the
+        # classic hosted UI - it is the current product and the branding resource below is
+        # what activates it for the client.
+        theme_admin_domain = theme_admin_pool.add_domain(
+            "ThemeAdminDomain",
+            cognito_domain=cognito.CognitoDomainOptions(
+                domain_prefix=f"gavilan-theme-{self.account}"
+            ),
+            managed_login_version=cognito.ManagedLoginVersion.NEWER_MANAGED_LOGIN,
+        )
+
+        # The editor page, which is the OAuth callback and logout landing page both: the
+        # page derives its own redirect_uri at runtime, so this registered URL is the one
+        # exact string it will send.
+        theme_editor_url = (
+            f"https://{widget_distribution.distribution_domain_name}"
+            f"/{_WIDGET_THEME_EDITOR_FILE}"
+        )
+
+        # Public client (no secret - the editor is JavaScript in a browser), authorization
+        # code + PKCE through managed login. No implicit grant: a token in a URL fragment
+        # lands in browser history, and this page runs on shared library machines.
+        # COGNITO_ADMIN (aws.cognito.signin.user.admin) is what lets the page's account
+        # panel call ChangePassword / UpdateUserAttributes / VerifyUserAttribute /GetUser
+        # with the access token managed login issued.
+        theme_admin_client = theme_admin_pool.add_client(
+            "ThemeAdminClient",
+            user_pool_client_name="gavilan-library-theme-editor",
+            generate_secret=False,
+            # SRP only (plus the refresh flow Cognito always appends): managed login does
+            # the actual sign-in, and no API password flow means the password never
+            # crosses in a request body the way the demo client's deliberately does.
+            auth_flows=cognito.AuthFlow(user_srp=True),
+            o_auth=cognito.OAuthSettings(
+                flows=cognito.OAuthFlows(authorization_code_grant=True),
+                scopes=[
+                    cognito.OAuthScope.OPENID,
+                    cognito.OAuthScope.EMAIL,
+                    cognito.OAuthScope.COGNITO_ADMIN,
+                ],
+                callback_urls=[theme_editor_url],
+                logout_urls=[theme_editor_url],
+            ),
+            access_token_validity=Duration.minutes(60),
+            id_token_validity=Duration.minutes(60),
+            # The page keeps its tokens in JS variables and drops the refresh token
+            # unread, so the copy it throws away cannot outlive the day.
+            refresh_token_validity=Duration.days(1),
+            prevent_user_existence_errors=True,
+        )
+
+        # Managed login v2 requires a branding assignment per client; Cognito's provided
+        # defaults are exactly the neutral hosted pages wanted here. Depends on the domain:
+        # branding attaches to the login surface the domain provides.
+        theme_admin_branding = cognito.CfnManagedLoginBranding(
+            self,
+            "ThemeAdminLoginBranding",
+            user_pool_id=theme_admin_pool.user_pool_id,
+            client_id=theme_admin_client.user_pool_client_id,
+            use_cognito_provided_values=True,
+        )
+        theme_admin_branding.node.add_dependency(theme_admin_domain)
+
         # HTTP API (API Gateway v2), NOT REST: ~71% cheaper for a Lambda-proxy job and we
         # need none of the REST-only features.
         #
@@ -1123,10 +1400,19 @@ class GavilanChatbotStack(Stack):
             "ChatbotHttpApi",
             api_name="gavilan-library-chatbot",
             cors_preflight=apigwv2.CorsPreflightOptions(
-                allow_origins=cors_allow_origins + demo_origins,
+                # The widget CDN origin rides along for the same reason the demo's does:
+                # the theme editor page is served from the widget distribution and PUTs
+                # /theme cross-origin, so the browser needs that origin listed. A deploy-
+                # time token on this stack's own distribution - still an explicit list,
+                # still never "*".
+                allow_origins=cors_allow_origins
+                + demo_origins
+                + [f"https://{widget_distribution.distribution_domain_name}"],
                 allow_methods=[
                     apigwv2.CorsHttpMethod.GET,
                     apigwv2.CorsHttpMethod.POST,
+                    # PUT is /theme only: a settings save is an idempotent replace.
+                    apigwv2.CorsHttpMethod.PUT,
                     apigwv2.CorsHttpMethod.OPTIONS,
                 ],
                 allow_headers=["Content-Type", "Authorization"],
@@ -1186,6 +1472,95 @@ class GavilanChatbotStack(Stack):
             throttling_rate_limit=http_api_cfg["throttling_rate_limit"],
             throttling_burst_limit=http_api_cfg["throttling_burst_limit"],
         )
+
+        # --- Theme save path: PUT /theme -> its own Lambda -> the one S3 object --------
+        #
+        # The settings editor's Save. Same native-JWT-authorizer pattern as the demo gate,
+        # against the theme-admin pool: API Gateway validates the librarian's access token
+        # (audience = the app client id, because a Cognito ACCESS token carries client_id
+        # rather than aud) before the Lambda ever runs. Its own small function, like the
+        # feedback path: this code needs PutObject on one key plus one invalidation, and
+        # nothing the query handler carries.
+        theme_admin_authorizer = apigwv2_authorizers.HttpJwtAuthorizer(
+            "ThemeAdminAuthorizer",
+            f"https://cognito-idp.{self.region}.amazonaws.com/{theme_admin_pool.user_pool_id}",
+            jwt_audience=[theme_admin_client.user_pool_client_id],
+            authorizer_name="gavilan-library-theme-admin",
+            identity_source=["$request.header.Authorization"],
+        )
+
+        theme_save_role = iam.Role(
+            self,
+            "ThemeSaveFunctionRole",
+            assumed_by=iam.ServicePrincipal("lambda.amazonaws.com"),
+            description="Execution role for the theme-save Lambda (write one theme.json).",
+            managed_policies=[
+                iam.ManagedPolicy.from_aws_managed_policy_name(
+                    "service-role/AWSLambdaBasicExecutionRole"
+                )
+            ],
+        )
+        # THE ONE OBJECT KEY, not a prefix and not the bucket: this function can overwrite
+        # the customer's theme.json and nothing else - not widget.js, not the defaults
+        # copy, not the hosted pages.
+        theme_save_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["s3:PutObject"],
+                resources=[widget_bucket.arn_for_objects(_WIDGET_THEME_FILE)],
+            )
+        )
+        # Invalidate /theme.json after a save so the change reads as immediate instead of
+        # up-to-60s stale. CreateInvalidation only scopes to a whole distribution ARN; the
+        # path restriction lives in the handler's request.
+        theme_save_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=["cloudfront:CreateInvalidation"],
+                resources=[
+                    f"arn:{self.partition}:cloudfront::{self.account}"
+                    f":distribution/{widget_distribution.distribution_id}"
+                ],
+            )
+        )
+
+        theme_save_log_group = logs.LogGroup(
+            self,
+            "ThemeSaveFunctionLogGroup",
+            retention=logs.RetentionDays.THREE_MONTHS,
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+
+        theme_save_lambda = _lambda.Function(
+            self,
+            "ThemeSaveFunction",
+            runtime=_LAMBDA_PYTHON,
+            handler="theme_handler.lambda_handler",
+            # ONLY theme_handler.py, same bundling shape as the feedback function: it
+            # shares app/ with the query handler but needs none of its prompt, catalog or
+            # link table.
+            code=_lambda.Code.from_asset(str(_APP_DIR), exclude=["*", "!theme_handler.py"]),
+            role=theme_save_role,
+            # One validate, one PutObject, one invalidation.
+            timeout=Duration.seconds(10),
+            memory_size=128,
+            log_group=theme_save_log_group,
+            environment={
+                "WIDGET_BUCKET": widget_bucket.bucket_name,
+                "WIDGET_THEME_KEY": _WIDGET_THEME_FILE,
+                "WIDGET_DISTRIBUTION_ID": widget_distribution.distribution_id,
+            },
+        )
+
+        # Same HTTP API, so /theme inherits the shared CORS allowlist (which now carries
+        # the widget CDN origin the editor page is served from) and the stage throttling.
+        http_api.add_routes(
+            path="/theme",
+            methods=[apigwv2.HttpMethod.PUT],
+            integration=apigwv2_integrations.HttpLambdaIntegration(
+                "ThemeSaveIntegration", theme_save_lambda
+            ),
+            authorizer=theme_admin_authorizer,
+        )
+        theme_save_url = f"{http_api.api_endpoint}/theme"
 
         # --- Feedback path: SNS topic + email subscription + Lambda + POST /feedback ----
         #
@@ -1288,118 +1663,52 @@ class GavilanChatbotStack(Stack):
             )
             feedback_url = f"{http_api.api_endpoint}/feedback"
 
-        # --- Widget hosting: private S3 bucket + CloudFront (OAC) ----------------------
-
-        # The production widget file is served from a private S3 bucket, reachable ONLY
-        # through CloudFront via Origin Access Control (OAC). It lives in THIS stack (not a
-        # separate one) so the whole thing installs with one `cdk deploy`: OAC has a known
-        # cross-stack cyclical-dependency problem, and one-click install wants a single
-        # deploy.
-        widget_bucket = s3.Bucket(
-            self,
-            "WidgetBucket",
-            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
-            # OAC requires ACLs disabled (bucket-owner-enforced ownership). That is the
-            # default for freshly created buckets; we set it explicitly to keep the OAC
-            # requirement legible.
-            object_ownership=s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
-            encryption=s3.BucketEncryption.S3_MANAGED,
-            enforce_ssl=True,
-            # One-click install implies one-click uninstall: on `cdk destroy`, remove the
-            # bucket and empty it first (auto_delete_objects adds a small custom resource).
-            removal_policy=RemovalPolicy.DESTROY,
-            auto_delete_objects=True,
-        )
-
-        # OAC origin via the CURRENT L2 construct (NOT the deprecated S3Origin/OAI, NOT a
-        # hand-rolled CfnOriginAccessControl). with_origin_access_control provisions the
-        # OAC and wires the bucket policy so only this distribution can read the object.
-        widget_origin = origins.S3BucketOrigin.with_origin_access_control(widget_bucket)
-
-        # --- theme.json: its own behavior on the widget distribution -------------------
+        # --- Widget hosting (2/2): the deployments -------------------------------------
         #
-        # The customer uploads theme.json through the S3 CONSOLE, which sets no metadata -
-        # so neither the freshness nor the CORS headers can come from the object. Both come
-        # from here instead, which is also what keeps "edit the file, reload the page" true
-        # without anyone having to know what Cache-Control is.
-        #
-        # Short TTL, both hops. CACHING_OPTIMIZED (the default behavior, for widget.js) is a
-        # 24-hour default TTL: correct for a versioned-by-deploy script, wrong for a file
-        # whose entire purpose is being edited by hand. 60 seconds is short enough that a
-        # colour change reads as immediate and long enough that the edge still absorbs the
-        # traffic. The explicit Cache-Control does the same job for the browser, which would
-        # otherwise apply heuristic freshness off S3's Last-Modified and could hold a stale
-        # theme for hours on an object that has not changed in a while.
-        widget_theme_cache_policy = cloudfront.CachePolicy(
-            self,
-            "WidgetThemeCachePolicy",
-            comment="Short TTL for the widget's customer-editable theme.json.",
-            default_ttl=Duration.seconds(60),
-            min_ttl=Duration.seconds(0),
-            max_ttl=Duration.seconds(60),
-        )
+        # The bucket and distribution are created ABOVE the HTTP API (part 1/2): the API's
+        # CORS allowlist names the widget CDN origin, and the theme-admin pool's invitation
+        # and callback URLs name the editor page on it - the same two-part split as the
+        # demo site. The deployments live down here because the stamped editor page needs
+        # the PUT /theme URL and the sign-in ids, which exist only once the API and the
+        # theme-admin pool do.
 
-        # CORS, because the fetch is cross-origin BY CONSTRUCTION: the widget runs on the
-        # library's page and theme.json lives on the CDN, so without an
-        # Access-Control-Allow-Origin the browser refuses to hand the body to widget.js and
-        # every install silently renders the default theme.
-        #
-        # `*` here, and that is NOT the wildcard config.yaml rejects for the API. That one
-        # guards a billable POST endpoint any page could otherwise drive from its visitors'
-        # browsers. This is a public, world-readable static file on the customer's own CDN,
-        # already served to anyone who requests it; an exact allowlist would add no secrecy
-        # and one real failure mode - the widget embedded on a staging or campus subdomain
-        # nobody thought to list, silently falling back to the default colours.
-        #
-        # Set from CloudFront rather than an S3 CORS rule for the same reason as the TTL:
-        # nothing about this may depend on how the object was uploaded.
-        widget_theme_headers_policy = cloudfront.ResponseHeadersPolicy(
-            self,
-            "WidgetThemeHeadersPolicy",
-            comment="CORS + short browser cache for the widget's theme.json.",
-            cors_behavior=cloudfront.ResponseHeadersCorsBehavior(
-                access_control_allow_credentials=False,
-                access_control_allow_headers=["*"],
-                access_control_allow_methods=["GET", "HEAD"],
-                access_control_allow_origins=["*"],
-                origin_override=True,
-            ),
-            custom_headers_behavior=cloudfront.ResponseCustomHeadersBehavior(
-                custom_headers=[
-                    cloudfront.ResponseCustomHeader(
-                        header="Cache-Control", value="public, max-age=60", override=True
-                    )
-                ]
-            ),
+        # The settings editor is STAMPED at deploy, exactly like the demo page: the page's
+        # Save and account panel need the PUT /theme endpoint, the managed-login base URL,
+        # the app client id and the regional cognito-idp endpoint, and a hardcoded any of
+        # them would break one-click install in a fresh account. The committed file carries
+        # only the bare markers; Source.data resolves the CDK tokens during deployment. A
+        # renamed marker fails the synth rather than shipping a page whose Save points at a
+        # literal placeholder.
+        theme_editor_html = (_FRONTEND_DIR / _WIDGET_THEME_EDITOR_FILE).read_text(
+            encoding="utf-8"
         )
-
-        widget_distribution = cloudfront.Distribution(
-            self,
-            "WidgetDistribution",
-            comment="Gavilan Library chat widget CDN (serves widget.js).",
-            default_root_object="widget.js",
-            default_behavior=cloudfront.BehaviorOptions(
-                origin=widget_origin,
-                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                cache_policy=cloudfront.CachePolicy.CACHING_OPTIMIZED,
-            ),
-            # Same origin and bucket, different caching and headers. Scoped to this one path
-            # so widget.js delivery is untouched: it keeps the 24-hour cache and gains no
-            # CORS header it has never needed (a <script src> is not a cross-origin fetch).
-            additional_behaviors={
-                _WIDGET_THEME_FILE: cloudfront.BehaviorOptions(
-                    origin=widget_origin,
-                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
-                    cache_policy=widget_theme_cache_policy,
-                    response_headers_policy=widget_theme_headers_policy,
-                )
-            },
+        _editor_missing = [
+            token
+            for token in (
+                _THEME_SAVE_URL_TOKEN,
+                _THEME_AUTH_BASE_TOKEN,
+                _THEME_CLIENT_ID_TOKEN,
+                _THEME_COGNITO_IDP_TOKEN,
+            )
+            if token not in theme_editor_html
+        ]
+        if _editor_missing:
+            raise ValueError(
+                f"frontend/{_WIDGET_THEME_EDITOR_FILE} is missing the deploy-time "
+                f"placeholder(s) {_editor_missing}. The stack stamps the save endpoint and "
+                "the sign-in configuration into those exact strings; renaming them here "
+                "without updating infra_stack.py would deploy an editor whose Save cannot "
+                "reach the backend."
+            )
+        theme_editor_html = (
+            theme_editor_html.replace(_THEME_SAVE_URL_TOKEN, theme_save_url)
+            .replace(_THEME_AUTH_BASE_TOKEN, theme_admin_domain.base_url())
+            .replace(_THEME_CLIENT_ID_TOKEN, theme_admin_client.user_pool_client_id)
+            .replace(
+                _THEME_COGNITO_IDP_TOKEN,
+                f"https://cognito-idp.{self.region}.amazonaws.com/",
+            )
         )
-        # NOTE: do NOT add an explicit distribution->bucket dependency. The origin already
-        # references the bucket (GetAtt), so CloudFormation orders the bucket first. Adding
-        # node.add_dependency(bucket) instead pulls in ALL the bucket's children, including
-        # the auto-delete-objects custom resource, which DependsOn the OAC bucket policy,
-        # which DependsOn the distribution -> a synth-blocking dependency cycle.
 
         # Upload ONLY frontend/widget.js. The include-only exclude pattern ("*" then the one
         # "!" entry) keeps mock.js, demo.html, and any future dev files out of production. On
@@ -1421,6 +1730,9 @@ class GavilanChatbotStack(Stack):
                 s3deploy.Source.asset(
                     str(_FRONTEND_DIR), exclude=["*", f"!{_WIDGET_THEME_GUIDE_FILE}"]
                 ),
+                # The stamped editor page (see above). Source.data, not Source.asset: the
+                # deployment custom resource substitutes the CDK tokens at deploy time.
+                s3deploy.Source.data(_WIDGET_THEME_EDITOR_FILE, theme_editor_html),
             ],
             # TWO FILES IN THIS BUCKET SURVIVE EVERY DEPLOY, and this one line is the whole
             # reason. BucketDeployment prunes by default - `aws s3 sync --delete` - which
@@ -1446,7 +1758,11 @@ class GavilanChatbotStack(Stack):
             # test_the_theme_file_is_outside_the_prune_scope pins the rendered property.
             exclude=[_WIDGET_THEME_FILE, f"{_WIDGET_THEME_DEFAULTS_PREFIX}/*"],
             distribution=widget_distribution,
-            distribution_paths=["/widget.js", f"/{_WIDGET_THEME_GUIDE_FILE}"],
+            distribution_paths=[
+                "/widget.js",
+                f"/{_WIDGET_THEME_GUIDE_FILE}",
+                f"/{_WIDGET_THEME_EDITOR_FILE}",
+            ],
         )
 
         # --- defaults/theme.json: the thing the customer clicks ------------------------
@@ -1602,6 +1918,18 @@ class GavilanChatbotStack(Stack):
         )
         CfnOutput(
             self,
+            "WidgetThemeEditor",
+            value=(
+                f"https://{widget_distribution.distribution_domain_name}"
+                f"/{_WIDGET_THEME_EDITOR_FILE}"
+            ),
+            description=(
+                "A form that fills in theme.json for you: pick the colour, font and "
+                "questions, download the file, then upload it via WidgetThemeUpload."
+            ),
+        )
+        CfnOutput(
+            self,
             "WidgetThemeDownload",
             value=f"https://{widget_distribution.distribution_domain_name}"
             f"/{_WIDGET_THEME_DEFAULTS_PREFIX}/{_WIDGET_THEME_FILE}",
@@ -1623,6 +1951,34 @@ class GavilanChatbotStack(Stack):
                 "Opens the widget bucket in the S3 console. Upload your edited "
                 "theme.json here, at the top level, next to widget.js. The change is "
                 "live in about a minute, with no redeploy."
+            ),
+        )
+        # The ONE step of the theme-admin account lifecycle that needs AWS credentials:
+        # everything after it (first sign-in with a forced password change, forgot
+        # password, change password, change email) is self-service on the hosted editor
+        # page. The command is printed ready to run rather than documented, because the
+        # pool id is generated per install.
+        CfnOutput(
+            self,
+            "ThemeAdminCreateUserCommand",
+            value=(
+                "aws cognito-idp admin-create-user"
+                f" --region {self.region}"
+                f" --user-pool-id {theme_admin_pool.user_pool_id}"
+                f" --username {_THEME_ADMIN_EMAIL_PLACEHOLDER}"
+                f" --user-attributes Name=email,Value={_THEME_ADMIN_EMAIL_PLACEHOLDER}"
+                " Name=email_verified,Value=true"
+                " --desired-delivery-mediums EMAIL"
+            ),
+            description=(
+                "Creates a settings-editor account: replace PROJECT_EMAIL_HERE (both "
+                "spots) with the librarian's address and run once - Cognito emails them "
+                "an invitation with a generated temporary password. EMAIL delivery is "
+                "spelled out because the default is SMS and nothing would arrive; "
+                "email_verified=true is what enables self-service password reset; no "
+                "--temporary-password keeps a password out of shell history. Run again "
+                "with another address for another librarian, or add --message-action "
+                "RESEND to refresh an expired invitation."
             ),
         )
         # --- Sign-in gate: the ids, and the two commands that create the one account ---

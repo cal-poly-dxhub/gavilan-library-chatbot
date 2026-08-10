@@ -1,0 +1,1372 @@
+<!doctype html>
+<!--
+  The settings editor: a form that fills in theme.json so nobody has to hand-edit JSON in
+  a text editor. Served at the widget bucket root next to theme-guide.html and linked from
+  the WidgetThemeEditor stack output. Two ways out of it: a signed-in librarian's Save
+  writes the live file directly (a PUT to the stack's save endpoint, gated by the
+  theme-admin Cognito pool), and the Download button still builds the same file for the
+  WidgetThemeUpload console route - which also remains the whole page for anyone unsigned.
+
+  Self-contained like the guide page: no external fonts, libraries or stylesheets, and no
+  absolute URLs in the committed file. The save endpoint and the sign-in configuration are
+  DEPLOY-STAMPED into the save-config JSON block below (the same substitution mechanism as
+  the demo page), so a copy of this page that was never deployed simply keeps Save and the
+  account panel hidden and behaves exactly as the download-only editor did.
+
+  Sign-in itself belongs to Cognito managed login - this page hosts no password form and
+  no reset flow, it only redirects (authorization code + PKCE) and exchanges the returned
+  code. Storage rules, pinned by the contract suite: nothing persistent and no cookies;
+  the tab-scoped session store holds exactly ONE key, the in-flight PKCE verifier +
+  state, written on the redirect out and removed on return. Tokens live in JS variables
+  only - the refresh token is dropped unread, and a reload signs in again.
+
+  Two things in here are deliberately copies of widget.js and are pinned against it by the
+  contract suite (frontend/test/widget.contract.test.js), so they cannot drift silently:
+    - the validation rules (hex pattern, font keyword table, question caps, ink derivation)
+    - the embedded defaults block below, byte-identical to frontend/defaults/theme.json
+  (The save Lambda revalidates server-side with the same rules; its copy is pinned by the
+  infra suite's test_theme_handler.py.)
+  The preview is a hand-built miniature of the widget, not the widget itself: reusing
+  widget.js here would need a network load plus a fetch-intercepting remount per edit,
+  because the widget reads theme.json once at boot and exposes applyTheme only to tests.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chatbot settings editor</title>
+<style>
+  :root {
+    --text: #1a1d21;
+    --muted: #5b6570;
+    --line: #c9ced6;
+    --maroon: #8a1c30;
+    --field-bg: #ffffff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--text);
+    background: #ffffff;
+    max-width: 66rem;
+    margin: 0 auto;
+    padding: 2rem 1.25rem 4rem;
+    line-height: 1.6;
+  }
+  h1 {
+    font-size: 1.7rem;
+    line-height: 1.25;
+    color: var(--maroon);
+    margin: 0 0 0.5rem;
+  }
+  h2 {
+    font-size: 1.15rem;
+    margin: 0 0 0.25rem;
+  }
+  p { margin: 0.5rem 0; }
+  a { color: var(--maroon); }
+  a:focus-visible, button:focus-visible, input:focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: 2px;
+  }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
+    font-size: 0.925em;
+    background: #f3f4f6;
+    border: 1px solid #e2e4e8;
+    border-radius: 4px;
+    padding: 0.1em 0.35em;
+  }
+  .lede { margin: 0 0 0.75rem; max-width: 44rem; }
+  .status { color: var(--muted); font-size: 0.9rem; margin: 0 0 1.5rem; }
+
+  .layout { display: block; }
+  @media (min-width: 920px) {
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 23rem;
+      gap: 2.5rem;
+      align-items: start;
+    }
+    .preview-col { position: sticky; top: 1rem; }
+  }
+
+  .field {
+    border: none;
+    margin: 0 0 2rem;
+    padding: 0;
+  }
+  .field legend { padding: 0; font-size: 1.15rem; font-weight: 700; }
+  .hint { color: var(--muted); font-size: 0.9rem; margin: 0.25rem 0 0.75rem; max-width: 40rem; }
+
+  .colour-row { display: flex; align-items: center; gap: 0.75rem; }
+  #colour-picker {
+    width: 3rem;
+    height: 3rem;
+    padding: 2px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--field-bg);
+    cursor: pointer;
+  }
+  #colour-hex {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
+    font-size: 1rem;
+    width: 7.5rem;
+    padding: 0.5rem 0.6rem;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+  .field-error { color: #8a1c12; font-size: 0.9rem; margin: 0.5rem 0 0; }
+  .contrast-note { font-size: 0.9rem; margin: 0.5rem 0 0; max-width: 40rem; }
+  .contrast-note--warn { color: #8a1c12; }
+  .contrast-note--ok { color: var(--muted); }
+
+  .font-option {
+    display: flex;
+    gap: 0.6rem;
+    align-items: baseline;
+    padding: 0.45rem 0;
+    cursor: pointer;
+  }
+  .font-option input { margin-top: 0.3rem; }
+  .font-option__name { font-weight: 600; }
+  .font-option__desc { color: var(--muted); font-size: 0.9rem; }
+  .font-option__sample { display: block; font-size: 1rem; color: var(--text); }
+
+  .qlang { border: none; padding: 0; margin: 0 0 1.25rem; }
+  .qlang legend { padding: 0; font-size: 1rem; font-weight: 600; }
+  .qlang input {
+    display: block;
+    width: 100%;
+    max-width: 34rem;
+    margin: 0.4rem 0;
+    padding: 0.5rem 0.6rem;
+    font: inherit;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+
+  .actions { margin: 2.5rem 0 0; }
+  #download, #save {
+    font: inherit;
+    font-weight: 600;
+    color: #ffffff;
+    background: var(--maroon);
+    border: none;
+    border-radius: 10px;
+    padding: 0.7rem 1.4rem;
+    cursor: pointer;
+  }
+  #save { margin-right: 0.6rem; }
+  #download:hover:not(:disabled), #save:hover:not(:disabled) { filter: brightness(1.07); }
+  #download:disabled, #save:disabled { opacity: 0.5; cursor: default; }
+
+  /* ---- account panel (hidden until the deploy-stamped page has a signed-in session) -- */
+  .account-block { margin: 1rem 0 0; }
+  .account-block input {
+    display: block;
+    width: 100%;
+    max-width: 22rem;
+    margin: 0.4rem 0;
+    padding: 0.5rem 0.6rem;
+    font: inherit;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+  button.minor {
+    font: inherit;
+    padding: 0.45rem 0.9rem;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--field-bg);
+    cursor: pointer;
+  }
+  button.linklike {
+    font: inherit;
+    color: var(--maroon);
+    background: none;
+    border: none;
+    padding: 0;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+
+  /* ---- preview: a miniature of the widget, sizes and colours from its stylesheet ---- */
+  .pv-stage {
+    background: #e8ebef;
+    border-radius: 14px;
+    padding: 1.25rem 1.25rem 1rem;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.9rem;
+  }
+  .pv-root {
+    --pv-brand: #8a1c30;
+    --pv-ink: #ffffff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 15px;
+    line-height: 1.45;
+    color: #1a1d21;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.9rem;
+  }
+  .pv-panel {
+    width: 100%;
+    max-width: 320px;
+    background: #ffffff;
+    border: 1px solid #d9dee5;
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.24);
+  }
+  .pv-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    row-gap: 8px;
+    gap: 8px;
+    padding: 12px 14px;
+    background: var(--pv-brand);
+    color: var(--pv-ink);
+  }
+  .pv-title {
+    font-family: "Bitter", Georgia, "Times New Roman", serif;
+    font-size: 15px;
+    font-weight: 700;
+    flex: 1 1 auto;
+  }
+  .pv-lang { display: inline-flex; gap: 2px; }
+  .pv-lang button {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: var(--pv-ink);
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 3px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .pv-lang button[aria-pressed="true"] {
+    background: var(--pv-ink);
+    color: var(--pv-brand);
+  }
+  .pv-lang button:focus-visible { outline: 2px solid var(--pv-ink); outline-offset: 2px; }
+  .pv-close { font-size: 22px; line-height: 1; padding: 2px 6px; }
+  .pv-thread {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 14px;
+    background: #fafbfc;
+  }
+  .pv-msg { display: flex; }
+  .pv-msg--user { justify-content: flex-end; }
+  .pv-msg--bot { justify-content: flex-start; }
+  .pv-bubble {
+    max-width: 82%;
+    padding: 9px 12px;
+    border-radius: 14px;
+  }
+  .pv-msg--user .pv-bubble {
+    background: var(--pv-brand);
+    color: var(--pv-ink);
+    border-bottom-right-radius: 4px;
+  }
+  .pv-msg--bot .pv-bubble {
+    background: #f1f3f6;
+    color: #1a1d21;
+    border-bottom-left-radius: 4px;
+  }
+  .pv-link { color: var(--pv-brand); text-decoration: underline; }
+  .pv-suggestions { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+  .pv-suggestions-label { font-size: 12px; color: #5b6570; }
+  .pv-chip {
+    background: #ffffff;
+    border: 1px solid #7d8894;
+    color: var(--pv-brand);
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.3;
+    padding: 8px 12px;
+    border-radius: 12px;
+    max-width: 100%;
+  }
+  .pv-composer {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding: 10px;
+    border-top: 1px solid #d9dee5;
+    background: #ffffff;
+  }
+  .pv-input {
+    flex: 1 1 auto;
+    min-height: 40px;
+    display: flex;
+    align-items: center;
+    padding: 9px 11px;
+    border: 1px solid #7d8894;
+    border-radius: 10px;
+    color: #5b6570;
+    font-size: 16px;
+    background: #ffffff;
+  }
+  .pv-send {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    background: var(--pv-brand);
+    color: var(--pv-ink);
+    font-weight: 600;
+    font-size: 14px;
+    padding: 0 16px;
+    height: 40px;
+    border-radius: 10px;
+  }
+  .pv-launcher {
+    display: inline-flex;
+    align-items: center;
+    padding: 12px 18px;
+    border-radius: 999px;
+    background: var(--pv-brand);
+    color: var(--pv-ink);
+    font-size: 15px;
+    font-weight: 600;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.22);
+  }
+</style>
+</head>
+<body>
+
+<h1>Chatbot settings editor</h1>
+
+<p class="lede">Pick the colour, font and starter questions here. Sign in and Save to put
+them on the live widget - or download the finished settings file and upload it through
+the same <code>WidgetThemeUpload</code> link as always.</p>
+
+<p class="status" id="load-status">Loading your current settings&hellip;</p>
+
+<div class="layout">
+<form id="editor" autocomplete="off">
+
+  <fieldset class="field" data-theme-key="highlightColor">
+    <legend>Highlight colour</legend>
+    <p class="hint">Used for the header, the launcher, Send, your visitors' own chat
+    bubbles, and links. The text that sits on it is not a setting: the widget picks black
+    or white on its own, whichever reads better on your colour.</p>
+    <div class="colour-row">
+      <input type="color" id="colour-picker" value="#8a1c30"
+             aria-label="Pick the highlight colour">
+      <input type="text" id="colour-hex" value="#8a1c30" maxlength="7" spellcheck="false"
+             aria-label="Highlight colour as a hex value, for example #8a1c30">
+    </div>
+    <p class="field-error" id="colour-error" hidden>Not a colour the widget can read. Use
+    a hex value: six digits like <code>#1e4b8f</code>, or three like <code>#a13</code>.</p>
+    <p class="contrast-note" id="contrast-note" hidden></p>
+  </fieldset>
+
+  <fieldset class="field" data-theme-key="fontFamily">
+    <legend>Font</legend>
+    <p class="hint">Only the typeface changes. Sizes and spacing are fixed so the widget
+    stays readable when visitors zoom. No fonts are downloaded, so the choices are limited
+    to what every Mac and Windows machine already has.</p>
+    <label class="font-option">
+      <input type="radio" name="fontFamily" value="system" checked>
+      <span>
+        <span class="font-option__name">System</span>
+        <span class="font-option__desc">the visitor's own interface font (the default)</span>
+        <span class="font-option__sample" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">Library hours, textbooks and research databases.</span>
+      </span>
+    </label>
+    <label class="font-option">
+      <input type="radio" name="fontFamily" value="sans">
+      <span>
+        <span class="font-option__name">Sans</span>
+        <span class="font-option__desc">Arial or Helvetica</span>
+        <span class="font-option__sample" style="font-family: Arial, Helvetica, 'Helvetica Neue', sans-serif">Library hours, textbooks and research databases.</span>
+      </span>
+    </label>
+    <label class="font-option">
+      <input type="radio" name="fontFamily" value="serif">
+      <span>
+        <span class="font-option__name">Serif</span>
+        <span class="font-option__desc">Georgia or Times New Roman</span>
+        <span class="font-option__sample" style="font-family: Georgia, 'Times New Roman', Times, serif">Library hours, textbooks and research databases.</span>
+      </span>
+    </label>
+    <label class="font-option">
+      <input type="radio" name="fontFamily" value="mono">
+      <span>
+        <span class="font-option__name">Mono</span>
+        <span class="font-option__desc">a fixed-width font, Menlo or Consolas</span>
+        <span class="font-option__sample" style="font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Courier New', monospace">Library hours, textbooks and research databases.</span>
+      </span>
+    </label>
+    <label class="font-option">
+      <input type="radio" name="fontFamily" value="inherit">
+      <span>
+        <span class="font-option__name">Match the page</span>
+        <span class="font-option__desc">whatever font the library website already uses</span>
+        <span class="font-option__sample">Library hours, textbooks and research databases.</span>
+      </span>
+    </label>
+  </fieldset>
+
+  <fieldset class="field" data-theme-key="starterQuestions">
+    <legend>Starter questions</legend>
+    <p class="hint">The example questions offered before anyone types, up to four per
+    language, 120 characters each. Leave every Spanish field empty and Spanish-speaking
+    visitors see your English questions - nothing is machine-translated. Leave both
+    languages empty to keep the built-in questions.</p>
+    <fieldset class="qlang">
+      <legend>English</legend>
+      <input type="text" maxlength="120" data-question-slot="en-1" aria-label="English starter question 1">
+      <input type="text" maxlength="120" data-question-slot="en-2" aria-label="English starter question 2">
+      <input type="text" maxlength="120" data-question-slot="en-3" aria-label="English starter question 3">
+      <input type="text" maxlength="120" data-question-slot="en-4" aria-label="English starter question 4">
+    </fieldset>
+    <fieldset class="qlang">
+      <legend>Espa&ntilde;ol</legend>
+      <input type="text" maxlength="120" data-question-slot="es-1" aria-label="Spanish starter question 1">
+      <input type="text" maxlength="120" data-question-slot="es-2" aria-label="Spanish starter question 2">
+      <input type="text" maxlength="120" data-question-slot="es-3" aria-label="Spanish starter question 3">
+      <input type="text" maxlength="120" data-question-slot="es-4" aria-label="Spanish starter question 4">
+    </fieldset>
+  </fieldset>
+
+  <div class="actions">
+    <button type="button" id="save" hidden>Sign in to save</button>
+    <button type="button" id="download">Download theme.json</button>
+    <p class="hint" id="save-status" role="status" hidden></p>
+    <p class="hint">Save puts your settings on the live widget within about a minute.
+    Or download: the file saves as <code>theme.json</code>, ready to upload. Open the
+    <code>WidgetThemeUpload</code> link in the CloudFormation Outputs tab and upload it at
+    the top level, next to <code>widget.js</code>. <a href="theme-guide.html">The
+    guide</a> walks through that step.</p>
+  </div>
+
+  <fieldset class="field" id="account" hidden>
+    <legend>Your account</legend>
+    <p class="hint">Signed in as <strong id="account-email">&hellip;</strong>.
+      <button type="button" class="linklike" id="sign-out">Sign out</button></p>
+
+    <div class="account-block">
+      <h2>Change password</h2>
+      <input type="password" id="pw-current" autocomplete="current-password"
+             aria-label="Current password" placeholder="Current password">
+      <input type="password" id="pw-new" autocomplete="new-password"
+             aria-label="New password" placeholder="New password">
+      <button type="button" class="minor" id="pw-change">Change password</button>
+      <p class="hint" id="pw-status" role="status" hidden></p>
+    </div>
+
+    <div class="account-block">
+      <h2>Change email</h2>
+      <p class="hint">A confirmation code goes to the new address, and your sign-in keeps
+      using the old one until you enter the code below.</p>
+      <input type="text" id="email-new" autocomplete="email"
+             aria-label="New email address" placeholder="New email address">
+      <button type="button" class="minor" id="email-change">Send confirmation code</button>
+      <div id="email-verify" hidden>
+        <input type="text" id="email-code" inputmode="numeric" autocomplete="one-time-code"
+               aria-label="Confirmation code" placeholder="Confirmation code">
+        <button type="button" class="minor" id="email-confirm">Confirm new email</button>
+      </div>
+      <p class="hint" id="email-status" role="status" hidden></p>
+    </div>
+  </fieldset>
+
+</form>
+
+<aside class="preview-col" aria-label="Preview">
+  <h2>Preview</h2>
+  <p class="hint">A picture of the widget with your settings - it updates as you type,
+  and it does not answer questions. Switch it to Espa&ntilde;ol to see what
+  Spanish-speaking visitors get.</p>
+  <div class="pv-stage">
+    <div class="pv-root" id="pv-root">
+      <div class="pv-panel">
+        <div class="pv-header">
+          <span class="pv-title" id="pv-title">Library Help</span>
+          <span class="pv-lang" role="group" aria-label="Preview language">
+            <button type="button" id="pv-lang-en" aria-pressed="true">English</button>
+            <button type="button" id="pv-lang-es" aria-pressed="false">Espa&ntilde;ol</button>
+          </span>
+          <span class="pv-close" aria-hidden="true">&times;</span>
+        </div>
+        <div class="pv-thread">
+          <div class="pv-msg pv-msg--bot"><span class="pv-bubble" id="pv-greeting"></span></div>
+          <div class="pv-suggestions" id="pv-suggestions">
+            <span class="pv-suggestions-label" id="pv-suggestions-label">Try asking:</span>
+          </div>
+          <div class="pv-msg pv-msg--user"><span class="pv-bubble" id="pv-user-bubble"></span></div>
+          <div class="pv-msg pv-msg--bot"><span class="pv-bubble" id="pv-bot-bubble"></span></div>
+        </div>
+        <div class="pv-composer">
+          <span class="pv-input" id="pv-input"></span>
+          <span class="pv-send" id="pv-send"></span>
+        </div>
+      </div>
+      <span class="pv-launcher" id="pv-launcher"></span>
+    </div>
+  </div>
+</aside>
+</div>
+
+<!-- The shipped defaults, byte-identical to frontend/defaults/theme.json (pinned by the
+     contract suite). The form's built-in fallback values and the _readme block of every
+     downloaded file both come from here, so the editor cannot invent its own copy. -->
+<script type="application/json" id="theme-defaults">
+{
+  "_readme": [
+    "START INSTRUCTIONS",
+    "This is the widget's settings file, named theme.json.",
+    "You can change the highlight color, font, and starter questions.",
+    "Instructions for changing each one are listed below.",
+    "",
+    "highlightColor:",
+    "  A hex color and nothing else: six digits (\"#8a1c30\") or three (\"#a13\").",
+    "  Color names (\"maroon\") and rgb() values are NOT read.",
+    "",
+    "fontFamily:",
+    "  One of these five words. Fonts are not downloaded, so",
+    "  the choice is limited to what every Mac and Windows machine already has:",
+    "    \"system\":  the visitor's own operating system interface font. This is the default.",
+    "    \"sans\":    Arial or Helvetica.",
+    "    \"serif\":   Georgia or Times New Roman.",
+    "    \"mono\":    a fixed width font, Menlo or Consolas.",
+    "    \"inherit\": whatever font the page the widget sits on is already using.",
+    "",
+    "starterQuestions: the example questions offered under the greeting, before anyone",
+    "  has typed anything. Up to FOUR per language, each up to 120 characters; extra or",
+    "  over-long ones are dropped. \"es\" is optional. Leave it out and Spanish visitors",
+    "  see your English list, because nothing here is machine-translated. Remove the whole",
+    "  starterQuestions block to keep the built-in questions in both languages.",
+    "END INSTRUCTIONS"
+  ],
+  "highlightColor": "#8a1c30",
+  "fontFamily": "system",
+  "starterQuestions": {
+    "en": [
+      "What are the library hours?",
+      "How do I check out a book?",
+      "Where do I find my textbook?",
+      "What research databases are available?"
+    ],
+    "es": [
+      "¿Cuál es el horario de la biblioteca?",
+      "¿Cómo pido prestado un libro?",
+      "¿Dónde encuentro mi libro de texto?",
+      "¿Qué bases de datos de investigación hay?"
+    ]
+  }
+}
+</script>
+
+<!-- Deploy-stamped save + sign-in configuration. The stack substitutes the four markers
+     with the PUT endpoint, the managed-login base URL, the app client id and the regional
+     cognito-idp endpoint during deployment. In the committed file they are bare markers,
+     which the script detects and treats as "this copy cannot save" - Save and the account
+     panel stay hidden and the page is the download-only editor it always was. -->
+<script type="application/json" id="save-config">
+{
+  "saveUrl": "__THEME_SAVE_URL__",
+  "authBase": "__THEME_AUTH_BASE__",
+  "clientId": "__THEME_CLIENT_ID__",
+  "cognitoIdp": "__THEME_COGNITO_IDP__"
+}
+</script>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---- rules copied from widget.js, pinned equal by the contract suite ----------------
+  // The editor validates with the widget's own rules so it can never produce a file the
+  // widget reads differently than the preview showed.
+
+  var DEFAULT_HIGHLIGHT = "#8a1c30";
+  var DEFAULT_FONT = "system";
+  var LANGUAGES = ["en", "es"];
+  var FONT_KEYWORDS = ["system", "sans", "serif", "mono", "inherit"];
+  var FONT_STACKS = {
+    system:
+      "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
+    sans: "Arial, Helvetica, 'Helvetica Neue', sans-serif",
+    serif: "Georgia, 'Times New Roman', Times, serif",
+    mono: "ui-monospace, SFMono-Regular, Menlo, Consolas, 'Courier New', monospace",
+    inherit: null
+  };
+  var MAX_STARTER_QUESTIONS = 4;
+  var MAX_STARTER_CHARS = 120;
+
+  function normalizeHex(value) {
+    if (typeof value !== "string") return null;
+    var hex = value.trim().toLowerCase();
+    if (!/^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/.test(hex)) return null;
+    if (hex.length === 4) {
+      hex = "#" + hex[1] + hex[1] + hex[2] + hex[2] + hex[3] + hex[3];
+    }
+    return hex;
+  }
+
+  function relativeLuminance(hex) {
+    var channels = [
+      parseInt(hex.slice(1, 3), 16),
+      parseInt(hex.slice(3, 5), 16),
+      parseInt(hex.slice(5, 7), 16)
+    ].map(function (v) {
+      var c = v / 255;
+      return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+  }
+
+  function inkFor(hex) {
+    return relativeLuminance(hex) > 0.1791 ? "#000000" : "#ffffff";
+  }
+
+  function contrastRatio(a, b) {
+    var la = relativeLuminance(a);
+    var lb = relativeLuminance(b);
+    var hi = Math.max(la, lb);
+    var lo = Math.min(la, lb);
+    return (hi + 0.05) / (lo + 0.05);
+  }
+
+  // The widget's readQuestionList: collapse whitespace, drop empties and over-long
+  // entries rather than truncating, cap the count. Null when nothing usable remains.
+  function cleanQuestionList(value) {
+    if (!Array.isArray(value)) return null;
+    var out = [];
+    for (var i = 0; i < value.length && out.length < MAX_STARTER_QUESTIONS; i++) {
+      if (typeof value[i] !== "string") continue;
+      var q = value[i].replace(/\s+/g, " ").trim();
+      if (!q || q.length > MAX_STARTER_CHARS) continue;
+      out.push(q);
+    }
+    return out.length ? out : null;
+  }
+
+  /**
+   * Merge a parsed theme.json over a base state, per key, with the widget's validation -
+   * the same semantics as widget.js applyTheme, reshaped to seed a form. A file that
+   * customises only some keys keeps the base for the rest; a file with a usable
+   * starterQuestions block replaces BOTH language lists (an absent language means "fall
+   * back to English at render time", so its fields must seed empty, not with built-ins
+   * the live widget is not showing).
+   */
+  function stateFrom(data, base) {
+    var state = {
+      highlight: base.highlight,
+      font: base.font,
+      questions: {
+        en: (base.questions.en || []).slice(),
+        es: (base.questions.es || []).slice()
+      }
+    };
+    var changed = false;
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      return { state: state, changed: changed };
+    }
+    var hex = normalizeHex(data.highlightColor);
+    if (hex) {
+      state.highlight = hex;
+      changed = true;
+    }
+    if (typeof data.fontFamily === "string") {
+      var font = data.fontFamily.trim().toLowerCase();
+      if (FONT_KEYWORDS.indexOf(font) >= 0) {
+        state.font = font;
+        changed = true;
+      }
+    }
+    var sq = data.starterQuestions;
+    if (sq && typeof sq === "object" && !Array.isArray(sq)) {
+      var read = {};
+      var any = false;
+      for (var i = 0; i < LANGUAGES.length; i++) {
+        var list = cleanQuestionList(sq[LANGUAGES[i]]);
+        if (!list) continue;
+        read[LANGUAGES[i]] = list;
+        any = true;
+      }
+      if (any) {
+        state.questions = { en: read.en || [], es: read.es || [] };
+        changed = true;
+      }
+    }
+    return { state: state, changed: changed };
+  }
+
+  /**
+   * The downloaded file, as text. Matches the repo's pinned serialisation exactly: the
+   * _readme first, then the three settings, two-space indent, one trailing newline - so
+   * an untouched form downloads a file byte-identical to defaults/theme.json. A language
+   * with no questions is omitted rather than written as an empty list, and when neither
+   * language has any the whole starterQuestions block is left out, which is the file
+   * shape that keeps the built-in questions.
+   */
+  function buildFileText(state, readmeLines) {
+    var file = { _readme: readmeLines.slice() };
+    file.highlightColor = state.highlight;
+    file.fontFamily = state.font;
+    var en = cleanQuestionList(state.questions.en);
+    var es = cleanQuestionList(state.questions.es);
+    if (en || es) {
+      var questions = {};
+      if (en) questions.en = en;
+      if (es) questions.es = es;
+      file.starterQuestions = questions;
+    }
+    return JSON.stringify(file, null, 2) + "\n";
+  }
+
+  // ---- sign-in plumbing (managed login does the real work; this page only redirects) --
+
+  // The ONE sessionStorage key this page ever touches: the in-flight PKCE verifier and
+  // state, written when the sign-in redirect leaves and removed the moment it returns.
+  // Nothing else is stored anywhere - tokens live in variables and die with the tab.
+  var OAUTH_STORAGE_KEY = "gavtheme-oauth";
+
+  function b64url(bytes) {
+    var s = "";
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  // ---- preview copy (cosmetic only - the widget's own STRINGS stay authoritative) -----
+
+  var PREVIEW_STRINGS = {
+    en: {
+      title: "Library Help",
+      launcher: "Ask the Library",
+      greeting:
+        "Hi! I'm the Gavilan College Library assistant. I can help with hours, " +
+        "checking out materials, textbooks, and what the library offers. " +
+        "What can I help you find?",
+      suggestionsLabel: "Try asking:",
+      userSample: "Do you have laptop chargers?",
+      botSample: "Yes - laptop chargers can be borrowed at the front desk. See ",
+      botSampleLink: "equipment lending",
+      botSampleEnd: " for the full list.",
+      placeholder: "Ask a question…",
+      send: "Send"
+    },
+    es: {
+      title: "Ayuda de la biblioteca",
+      launcher: "Pregunta a la biblioteca",
+      greeting:
+        "¡Hola! Soy el asistente de la Biblioteca de Gavilan College. Te puedo " +
+        "ayudar con los horarios, cómo pedir prestados materiales, los libros de " +
+        "texto y lo que ofrece la biblioteca. ¿Qué buscas?",
+      suggestionsLabel: "Prueba preguntando:",
+      userSample: "¿Prestan cargadores de portátil?",
+      botSample: "Sí - puedes pedir un cargador en el mostrador. Consulta ",
+      botSampleLink: "préstamo de equipos",
+      botSampleEnd: " para la lista completa.",
+      placeholder: "Haz una pregunta…",
+      send: "Enviar"
+    }
+  };
+
+  // ---- the page itself (never runs under the test harness's stub document) ------------
+
+  function init() {
+    var builtin;
+    try {
+      builtin = JSON.parse(document.getElementById("theme-defaults").textContent);
+    } catch (e) {
+      builtin = {};
+    }
+    var readme = Array.isArray(builtin._readme) ? builtin._readme : [];
+    var hardBase = {
+      highlight: DEFAULT_HIGHLIGHT,
+      font: DEFAULT_FONT,
+      questions: { en: [], es: [] }
+    };
+    var builtinState = stateFrom(builtin, hardBase).state;
+    var builtinQuestions = {
+      en: builtinState.questions.en.slice(),
+      es: builtinState.questions.es.slice()
+    };
+
+    var form = document.getElementById("editor");
+    var picker = document.getElementById("colour-picker");
+    var hexInput = document.getElementById("colour-hex");
+    var colourError = document.getElementById("colour-error");
+    var contrastNote = document.getElementById("contrast-note");
+    var downloadBtn = document.getElementById("download");
+    var status = document.getElementById("load-status");
+    var pvRoot = document.getElementById("pv-root");
+    var pvTitle = document.getElementById("pv-title");
+    var pvSuggestions = document.getElementById("pv-suggestions");
+    var slots = { en: [], es: [] };
+    var inputs = form.querySelectorAll("[data-question-slot]");
+    for (var i = 0; i < inputs.length; i++) {
+      slots[inputs[i].getAttribute("data-question-slot").slice(0, 2)].push(inputs[i]);
+    }
+
+    // The one piece of state the DOM cannot hold: the last VALID colour, kept so a
+    // half-typed hex never reaches the preview or a downloaded file.
+    var currentHighlight = builtinState.highlight;
+    var pvLang = "en";
+
+    function formState() {
+      var font = DEFAULT_FONT;
+      var radios = form.querySelectorAll('input[name="fontFamily"]');
+      for (var i = 0; i < radios.length; i++) {
+        if (radios[i].checked) font = radios[i].value;
+      }
+      function values(lang) {
+        var out = [];
+        for (var i = 0; i < slots[lang].length; i++) out.push(slots[lang][i].value);
+        return out;
+      }
+      return {
+        highlight: currentHighlight,
+        font: font,
+        questions: { en: values("en"), es: values("es") }
+      };
+    }
+
+    function seedForm(state) {
+      currentHighlight = state.highlight;
+      picker.value = state.highlight;
+      hexInput.value = state.highlight;
+      var radios = form.querySelectorAll('input[name="fontFamily"]');
+      for (var i = 0; i < radios.length; i++) {
+        radios[i].checked = radios[i].value === state.font;
+      }
+      LANGUAGES.forEach(function (lang) {
+        for (var i = 0; i < slots[lang].length; i++) {
+          slots[lang][i].value = state.questions[lang][i] || "";
+        }
+      });
+    }
+
+    // The widget's starterQuestions() fallback chain: the language's own list, else the
+    // customer's English list, else the built-in questions for that language.
+    function questionsFor(lang, state) {
+      return (
+        cleanQuestionList(state.questions[lang]) ||
+        cleanQuestionList(state.questions.en) ||
+        builtinQuestions[lang]
+      );
+    }
+
+    function renderPreview() {
+      var state = formState();
+      var ink = inkFor(state.highlight);
+      var S = PREVIEW_STRINGS[pvLang];
+      pvRoot.style.setProperty("--pv-brand", state.highlight);
+      pvRoot.style.setProperty("--pv-ink", ink);
+
+      // Font: the miniature mirrors themeCss. The default keeps the widget's title face
+      // (Bitter, which the real widget downloads; here it falls back to Georgia, the
+      // same fallback the widget shows before the download lands). Any other keyword
+      // replaces the title family too, and "inherit" hands both to this page's font.
+      if (state.font === DEFAULT_FONT) {
+        pvRoot.style.fontFamily = FONT_STACKS.system;
+        pvTitle.style.fontFamily = "";
+      } else if (state.font === "inherit") {
+        pvRoot.style.fontFamily = "inherit";
+        pvTitle.style.fontFamily = "inherit";
+      } else {
+        pvRoot.style.fontFamily = FONT_STACKS[state.font];
+        pvTitle.style.fontFamily = FONT_STACKS[state.font];
+      }
+
+      pvTitle.textContent = S.title;
+      document.getElementById("pv-greeting").textContent = S.greeting;
+      document.getElementById("pv-suggestions-label").textContent = S.suggestionsLabel;
+      document.getElementById("pv-user-bubble").textContent = S.userSample;
+      document.getElementById("pv-input").textContent = S.placeholder;
+      document.getElementById("pv-send").textContent = S.send;
+      document.getElementById("pv-launcher").textContent = S.launcher;
+      document.getElementById("pv-lang-en").setAttribute(
+        "aria-pressed", pvLang === "en" ? "true" : "false");
+      document.getElementById("pv-lang-es").setAttribute(
+        "aria-pressed", pvLang === "es" ? "true" : "false");
+
+      // The bot answer, rebuilt as text nodes (no innerHTML) so the link colour shows.
+      var bot = document.getElementById("pv-bot-bubble");
+      while (bot.firstChild) bot.removeChild(bot.firstChild);
+      bot.appendChild(document.createTextNode(S.botSample));
+      var link = document.createElement("span");
+      link.className = "pv-link";
+      link.textContent = S.botSampleLink;
+      bot.appendChild(link);
+      bot.appendChild(document.createTextNode(S.botSampleEnd));
+
+      // Starter chips, from the form via the widget's fallback chain.
+      var chips = pvSuggestions.querySelectorAll(".pv-chip");
+      for (var i = 0; i < chips.length; i++) pvSuggestions.removeChild(chips[i]);
+      questionsFor(pvLang, state).forEach(function (q) {
+        var chip = document.createElement("span");
+        chip.className = "pv-chip";
+        chip.textContent = q;
+        pvSuggestions.appendChild(chip);
+      });
+
+      // The one contrast the customer owns (docs/widget-theming.md): the highlight as
+      // TEXT on the widget's light surfaces. Header text is derived and always safe.
+      var worst = Math.min(
+        contrastRatio(state.highlight, "#ffffff"),
+        contrastRatio(state.highlight, "#f1f3f6")
+      );
+      contrastNote.hidden = false;
+      if (worst < 4.5) {
+        contrastNote.className = "contrast-note contrast-note--warn";
+        contrastNote.textContent =
+          "As link text on the widget's light backgrounds this colour measures " +
+          worst.toFixed(2) + ":1, below the 4.5:1 readability guideline. The header " +
+          "stays readable automatically, but check links and the starter questions " +
+          "with a contrast tool before going live.";
+      } else {
+        contrastNote.className = "contrast-note contrast-note--ok";
+        contrastNote.textContent =
+          "Links on the widget's light backgrounds measure " + worst.toFixed(2) +
+          ":1 with this colour, which clears the 4.5:1 readability guideline.";
+      }
+    }
+
+    function onHexTyped() {
+      var hex = normalizeHex(hexInput.value);
+      if (hex) {
+        currentHighlight = hex;
+        picker.value = hex;
+        colourError.hidden = true;
+        downloadBtn.disabled = false;
+        saveBtn.disabled = false;
+        renderPreview();
+      } else {
+        colourError.hidden = false;
+        downloadBtn.disabled = true;
+        saveBtn.disabled = true;
+      }
+    }
+
+    function onPicked() {
+      currentHighlight = picker.value;
+      hexInput.value = picker.value;
+      colourError.hidden = true;
+      downloadBtn.disabled = false;
+      saveBtn.disabled = false;
+      renderPreview();
+    }
+
+    function download() {
+      var text = buildFileText(formState(), readme);
+      var blob = new Blob([text], { type: "application/json" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = "theme.json";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+    }
+
+    // ---- Save + account panel (deploy-stamped pages only) -------------------------
+    //
+    // Unsigned, this whole section is one visible button reading "Sign in to save";
+    // everything else about the page is the download-only editor. Sign-in, the forced
+    // first-password change and forgot-password are all Cognito managed login's own
+    // hosted pages - this code only redirects out (authorization code + PKCE) and
+    // exchanges the code it comes back with.
+    var saveBtn = document.getElementById("save");
+    var saveStatus = document.getElementById("save-status");
+    var accountPanel = document.getElementById("account");
+    var accountEmail = document.getElementById("account-email");
+
+    var saveCfg = null;
+    try {
+      var rawCfg = JSON.parse(document.getElementById("save-config").textContent);
+      var stampedOk = ["saveUrl", "authBase", "clientId", "cognitoIdp"].every(function (k) {
+        // An unstamped copy still carries the bare __...__ markers; treat it as unable
+        // to save rather than letting Save point at a placeholder.
+        return typeof rawCfg[k] === "string" && rawCfg[k] && !/^__[A-Z_]+__$/.test(rawCfg[k]);
+      });
+      if (stampedOk) saveCfg = rawCfg;
+    } catch (e) {
+      saveCfg = null;
+    }
+
+    // The session: variables only, gone on reload. Expiry is tracked because an expired
+    // token's rejection is unreadable cross-origin (the authorizer's 401 carries no CORS
+    // headers), so the page must refuse to send a doomed request rather than inspect
+    // the failure afterwards.
+    var accessToken = null;
+    var tokenExpiresAt = 0;
+
+    function signedIn() {
+      return !!accessToken && Date.now() < tokenExpiresAt;
+    }
+
+    function pageUrl() {
+      return location.origin + location.pathname;
+    }
+
+    function setSaveStatus(message) {
+      saveStatus.hidden = !message;
+      saveStatus.textContent = message || "";
+    }
+
+    function renderAuthState() {
+      if (!saveCfg) return;
+      saveBtn.hidden = false;
+      saveBtn.textContent = signedIn() ? "Save to the live widget" : "Sign in to save";
+      accountPanel.hidden = !signedIn();
+    }
+
+    // One unsigned fetch per user-scoped Cognito call (GetUser, ChangePassword,
+    // UpdateUserAttributes, VerifyUserAttribute) - same dependency-free shape as the
+    // widget's own sign-in call, authorized by the access token in the body.
+    function idpCall(target, payload) {
+      return fetch(saveCfg.cognitoIdp, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-amz-json-1.1",
+          "X-Amz-Target": "AWSCognitoIdentityProviderService." + target
+        },
+        body: JSON.stringify(payload)
+      }).then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (data) {
+          if (res.ok) return data;
+          var err = new Error(data.message || data.Message || "The request failed.");
+          err.code = data.__type || "";
+          throw err;
+        });
+      });
+    }
+
+    function beginSignIn() {
+      var verifierBytes = new Uint8Array(32);
+      crypto.getRandomValues(verifierBytes);
+      var verifier = b64url(verifierBytes);
+      var stateBytes = new Uint8Array(16);
+      crypto.getRandomValues(stateBytes);
+      var state = b64url(stateBytes);
+      crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)).then(
+        function (digest) {
+          var challenge = b64url(new Uint8Array(digest));
+          sessionStorage.setItem(
+            OAUTH_STORAGE_KEY, JSON.stringify({ verifier: verifier, state: state })
+          );
+          location.assign(
+            saveCfg.authBase + "/oauth2/authorize" +
+            "?client_id=" + encodeURIComponent(saveCfg.clientId) +
+            "&response_type=code" +
+            "&scope=" + encodeURIComponent("openid email aws.cognito.signin.user.admin") +
+            "&redirect_uri=" + encodeURIComponent(pageUrl()) +
+            "&state=" + encodeURIComponent(state) +
+            "&code_challenge_method=S256" +
+            "&code_challenge=" + encodeURIComponent(challenge)
+          );
+        }
+      );
+    }
+
+    function loadAccountEmail() {
+      idpCall("GetUser", { AccessToken: accessToken }).then(function (user) {
+        var attrs = user.UserAttributes || [];
+        for (var i = 0; i < attrs.length; i++) {
+          if (attrs[i].Name === "email") accountEmail.textContent = attrs[i].Value;
+        }
+      }).catch(function () {});
+    }
+
+    // The return leg of the redirect: verify the state echo against the stored
+    // handshake, clean the address bar, exchange the code for tokens. The refresh
+    // token in the response is dropped unread.
+    function finishSignIn() {
+      var params = new URLSearchParams(location.search);
+      var code = params.get("code");
+      if (!code) {
+        if (params.get("error")) {
+          setSaveStatus("Sign-in did not complete. You can try again.");
+          history.replaceState(null, "", pageUrl());
+        }
+        return;
+      }
+      var handshake = null;
+      try {
+        handshake = JSON.parse(sessionStorage.getItem(OAUTH_STORAGE_KEY));
+      } catch (e) { handshake = null; }
+      sessionStorage.removeItem(OAUTH_STORAGE_KEY);
+      var state = params.get("state");
+      history.replaceState(null, "", pageUrl());
+      if (!handshake || !handshake.verifier || handshake.state !== state) {
+        setSaveStatus("Sign-in did not complete. You can try again.");
+        return;
+      }
+      fetch(saveCfg.authBase + "/oauth2/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body:
+          "grant_type=authorization_code" +
+          "&client_id=" + encodeURIComponent(saveCfg.clientId) +
+          "&code=" + encodeURIComponent(code) +
+          "&redirect_uri=" + encodeURIComponent(pageUrl()) +
+          "&code_verifier=" + encodeURIComponent(handshake.verifier)
+      })
+        .then(function (res) { return res.json(); })
+        .then(function (data) {
+          if (!data || typeof data.access_token !== "string") {
+            throw new Error("no token in the exchange response");
+          }
+          accessToken = data.access_token;
+          var ttl = typeof data.expires_in === "number" ? data.expires_in : 3600;
+          // A minute early, so a token that would die mid-flight counts as expired.
+          tokenExpiresAt = Date.now() + Math.max(0, ttl - 60) * 1000;
+          setSaveStatus("");
+          renderAuthState();
+          loadAccountEmail();
+        })
+        .catch(function () {
+          setSaveStatus("Sign-in did not complete. You can try again.");
+          renderAuthState();
+        });
+    }
+
+    function save() {
+      if (!signedIn()) {
+        // Covers both "never signed in" and "session expired while the tab sat open":
+        // managed login round-trips and the page comes back signed in.
+        beginSignIn();
+        return;
+      }
+      saveBtn.disabled = true;
+      setSaveStatus("Saving…");
+      fetch(saveCfg.saveUrl, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + accessToken
+        },
+        // Exactly the bytes the Download button would produce - one serialisation,
+        // whichever way the file leaves the page. The server revalidates and rewrites
+        // the same canonical form regardless.
+        body: buildFileText(formState(), readme)
+      })
+        .then(function (res) {
+          return res.json().catch(function () { return {}; }).then(function (data) {
+            if (res.ok) {
+              setSaveStatus("Saved. The live widget picks this up within about a minute.");
+            } else {
+              setSaveStatus(
+                (data && data.error) ||
+                "The settings could not be saved (HTTP " + res.status + ")."
+              );
+            }
+          });
+        })
+        .catch(function () {
+          setSaveStatus("Could not reach the server. Check your connection and try again.");
+        })
+        .then(function () {
+          saveBtn.disabled = downloadBtn.disabled;
+          renderAuthState();
+        });
+    }
+
+    function signOut() {
+      accessToken = null;
+      tokenExpiresAt = 0;
+      // Managed login's own sign-out, so the hosted session dies too; it lands back on
+      // this page (the registered logout URL).
+      location.assign(
+        saveCfg.authBase + "/logout" +
+        "?client_id=" + encodeURIComponent(saveCfg.clientId) +
+        "&logout_uri=" + encodeURIComponent(pageUrl())
+      );
+    }
+
+    function initAccountPanel() {
+      var pwCurrent = document.getElementById("pw-current");
+      var pwNew = document.getElementById("pw-new");
+      var pwStatus = document.getElementById("pw-status");
+      var emailNew = document.getElementById("email-new");
+      var emailVerify = document.getElementById("email-verify");
+      var emailCode = document.getElementById("email-code");
+      var emailStatus = document.getElementById("email-status");
+
+      function setStatus(node, message) {
+        node.hidden = !message;
+        node.textContent = message || "";
+      }
+
+      document.getElementById("sign-out").addEventListener("click", signOut);
+
+      document.getElementById("pw-change").addEventListener("click", function () {
+        if (!signedIn()) { renderAuthState(); return; }
+        if (!pwCurrent.value || !pwNew.value) {
+          setStatus(pwStatus, "Enter your current password and the new one.");
+          return;
+        }
+        setStatus(pwStatus, "Changing…");
+        idpCall("ChangePassword", {
+          AccessToken: accessToken,
+          PreviousPassword: pwCurrent.value,
+          ProposedPassword: pwNew.value
+        }).then(function () {
+          pwCurrent.value = "";
+          pwNew.value = "";
+          setStatus(pwStatus, "Password changed.");
+        }).catch(function (err) {
+          setStatus(pwStatus, err.message || "The password could not be changed.");
+        });
+      });
+
+      document.getElementById("email-change").addEventListener("click", function () {
+        if (!signedIn()) { renderAuthState(); return; }
+        var address = emailNew.value.trim();
+        if (!address) {
+          setStatus(emailStatus, "Enter the new email address first.");
+          return;
+        }
+        setStatus(emailStatus, "Sending the confirmation code…");
+        idpCall("UpdateUserAttributes", {
+          AccessToken: accessToken,
+          UserAttributes: [{ Name: "email", Value: address }]
+        }).then(function () {
+          emailVerify.hidden = false;
+          setStatus(
+            emailStatus,
+            "A confirmation code was sent to the new address. Enter it below - until " +
+            "then you keep signing in with the old one."
+          );
+        }).catch(function (err) {
+          setStatus(emailStatus, err.message || "The email could not be changed.");
+        });
+      });
+
+      document.getElementById("email-confirm").addEventListener("click", function () {
+        if (!signedIn()) { renderAuthState(); return; }
+        var code = emailCode.value.trim();
+        if (!code) {
+          setStatus(emailStatus, "Enter the confirmation code from the email.");
+          return;
+        }
+        setStatus(emailStatus, "Confirming…");
+        idpCall("VerifyUserAttribute", {
+          AccessToken: accessToken,
+          AttributeName: "email",
+          Code: code
+        }).then(function () {
+          emailVerify.hidden = true;
+          emailNew.value = "";
+          emailCode.value = "";
+          setStatus(emailStatus, "Email updated. Use the new address next time you sign in.");
+          loadAccountEmail();
+        }).catch(function (err) {
+          setStatus(emailStatus, err.message || "The code was not accepted.");
+        });
+      });
+    }
+
+    // Seed from the LIVE theme so the form edits what is actually deployed: the
+    // customer's root theme.json first, the shipped defaults file next, the embedded
+    // built-ins last (reached only when both fetches fail, e.g. opened from disk).
+    function fetchJson(file) {
+      return fetch(file, { method: "GET" })
+        .then(function (res) { return res && res.ok ? res.json() : null; })
+        .catch(function () { return null; });
+    }
+
+    function seed(state, message) {
+      seedForm(state);
+      status.textContent = message;
+      renderPreview();
+    }
+
+    fetchJson("theme.json").then(function (live) {
+      if (live && typeof live === "object" && !Array.isArray(live)) {
+        seed(
+          stateFrom(live, builtinState).state,
+          "Editing your uploaded settings. Downloading keeps anything you don't change."
+        );
+        return null;
+      }
+      return fetchJson("defaults/theme.json").then(function (defaults) {
+        if (defaults) {
+          seed(
+            stateFrom(defaults, builtinState).state,
+            "No uploaded settings file found - starting from the shipped defaults."
+          );
+        } else {
+          seed(builtinState, "Starting from the built-in defaults.");
+        }
+      });
+    });
+
+    picker.addEventListener("input", onPicked);
+    hexInput.addEventListener("input", onHexTyped);
+    function onFormEdited(event) {
+      if (event.target === picker || event.target === hexInput) return;
+      // The account panel's fields are not theme settings; a keystroke there is not a
+      // preview change.
+      if (accountPanel.contains(event.target)) return;
+      renderPreview();
+    }
+    // Both events: text fields repaint per keystroke via "input"; "change" covers radio
+    // selection in engines that fire no "input" for radios.
+    form.addEventListener("input", onFormEdited);
+    form.addEventListener("change", onFormEdited);
+    // The form is buttons-only, but Enter in a text field can still trigger an implicit
+    // submission in some engines, which would reload the page and drop the session.
+    form.addEventListener("submit", function (event) { event.preventDefault(); });
+    downloadBtn.addEventListener("click", download);
+    if (saveCfg) {
+      saveBtn.addEventListener("click", save);
+      initAccountPanel();
+      renderAuthState();
+      finishSignIn();
+    }
+    document.getElementById("pv-lang-en").addEventListener("click", function () {
+      pvLang = "en";
+      renderPreview();
+    });
+    document.getElementById("pv-lang-es").addEventListener("click", function () {
+      pvLang = "es";
+      renderPreview();
+    });
+  }
+
+  // Exposed for the contract suite (which pins every rule above against widget.js) and
+  // for the headless-browser byte check. Harmless in a real browser.
+  window.__themeEditor = {
+    DEFAULT_HIGHLIGHT: DEFAULT_HIGHLIGHT,
+    DEFAULT_FONT: DEFAULT_FONT,
+    LANGUAGES: LANGUAGES,
+    FONT_KEYWORDS: FONT_KEYWORDS,
+    FONT_STACKS: FONT_STACKS,
+    MAX_STARTER_QUESTIONS: MAX_STARTER_QUESTIONS,
+    MAX_STARTER_CHARS: MAX_STARTER_CHARS,
+    normalizeHex: normalizeHex,
+    inkFor: inkFor,
+    cleanQuestionList: cleanQuestionList,
+    stateFrom: stateFrom,
+    buildFileText: buildFileText
+  };
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+</script>
+
+</body>
+</html>

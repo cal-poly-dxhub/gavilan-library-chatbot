@@ -3519,11 +3519,13 @@ test("the theme guide page is self-contained and names the outputs it teaches", 
   assert.ok(!/@import|url\(/i.test(THEME_GUIDE_PAGE), "no CSS fetches");
   assert.ok(!/https?:/i.test(THEME_GUIDE_PAGE), "no absolute URLs anywhere");
 
-  // The one link on the page is the relative path to the settings file, which is what
-  // lets the page work on any distribution domain without being stamped at deploy.
+  // Every link on the page is a relative path to a sibling object - the settings file,
+  // and the settings editor page - which is what lets the page work on any distribution
+  // domain without being stamped at deploy.
   const hrefs = THEME_GUIDE_PAGE.match(/href="[^"]*"/g) || [];
-  assert.ok(hrefs.length >= 1, "the download link exists");
-  hrefs.forEach((href) => assert.strictEqual(href, 'href="defaults/theme.json"'));
+  const allowed = ['href="defaults/theme.json"', 'href="theme-editor.html"'];
+  hrefs.forEach((href) => assert.ok(allowed.includes(href), href));
+  allowed.forEach((href) => assert.ok(hrefs.includes(href), "missing link: " + href));
 
   // It teaches the CloudFormation Outputs tab, so the two console links are named by
   // their output names and never described in other words.
@@ -3533,6 +3535,316 @@ test("the theme guide page is self-contained and names the outputs it teaches", 
     THEME_GUIDE_PAGE.indexOf("Changing the chatbot's colours and questions") >= 0,
     "the page carries its own title"
   );
+});
+
+// ==========================================================================
+// theme-editor.html - the settings editor page
+// ==========================================================================
+//
+// The editor is a form that writes theme.json so nobody has to hand-edit JSON, which
+// means it holds COPIES of the widget's validation rules and of the shipped defaults.
+// A copy is a drift hazard, so everything copied is pinned here against widget.js and
+// defaults/theme.json directly: the rule tables must be equal, the embedded defaults
+// must be the shipped file byte for byte, and the file the download builds must be the
+// pinned serialisation and a file applyTheme accepts. The page's inline script exposes
+// its rules on window.__themeEditor, and these tests run it against a stub document
+// (readyState "loading", so init() never fires and no DOM is needed).
+
+const THEME_EDITOR_PATH = path.join(__dirname, "..", "theme-editor.html");
+const THEME_EDITOR_PAGE = fs.readFileSync(THEME_EDITOR_PATH, "utf8");
+
+let cachedEditor = null;
+function editorRules() {
+  if (cachedEditor) return cachedEditor;
+  // The page's one attribute-less <script> is the editor's own code; the JSON block
+  // above it carries attributes, so this match cannot land on it.
+  const m = THEME_EDITOR_PAGE.match(/<script>\n?([\s\S]*?)<\/script>/);
+  assert.ok(m, "found the editor's inline script");
+  const win = {};
+  const doc = {
+    readyState: "loading",
+    addEventListener() {},
+    getElementById() { return null; }
+  };
+  new Function("window", "document", m[1])(win, doc);
+  assert.ok(win.__themeEditor, "the editor exposes its rules for pinning");
+  cachedEditor = win.__themeEditor;
+  return cachedEditor;
+}
+
+// What the widget actually does with a highlightColor value, read back out of the CSS it
+// emits - the behavioural truth the editor's copy of normalizeHex has to match.
+function widgetNormalizedHighlight(value) {
+  return withTheme({ highlightColor: value }, () => {
+    const m2 = widget.themeCss().match(/--brand:\s*(#[0-9a-f]{6})/);
+    return m2 ? m2[1] : null;
+  });
+}
+
+test("the settings editor page is self-contained; its save path is deploy-stamped", () => {
+  assert.ok(/<html lang="en">/.test(THEME_EDITOR_PAGE), "the page declares its language");
+  assert.ok(/<title>/.test(THEME_EDITOR_PAGE), "the page carries a title");
+  // Nothing external, same rule as the guide: no embedded resources, no absolute URLs,
+  // so it renders on any distribution domain and can never phone home. The save
+  // endpoint and the sign-in configuration are NOT an exception: they reach the page as
+  // deploy-time substitution markers in the save-config block, so the committed file
+  // still names no host anywhere.
+  assert.ok(!/\bsrc=/i.test(THEME_EDITOR_PAGE), "no embedded resources");
+  assert.ok(!/<link\b/i.test(THEME_EDITOR_PAGE), "no external stylesheets");
+  // The CSS-fetch scan is scoped to the stylesheet: the page's script legitimately says
+  // URL.createObjectURL( for the download, which a page-wide /url\(/i would match.
+  const styleBlock = THEME_EDITOR_PAGE.match(/<style>([\s\S]*?)<\/style>/);
+  assert.ok(styleBlock, "found the stylesheet");
+  assert.ok(!/@import|url\(/i.test(styleBlock[1]), "no CSS fetches");
+  assert.ok(!/@import/i.test(THEME_EDITOR_PAGE), "no @import anywhere");
+  assert.ok(!/https?:/i.test(THEME_EDITOR_PAGE), "no absolute URLs anywhere");
+
+  // The save-config block: exactly the four stamped values, each marker appearing
+  // exactly once in the whole page (Source.data substitutes EVERY occurrence, so a
+  // second one - a comment spelling a marker out - would get stamped too). The infra
+  // suite pins the other end: what each marker resolves to at deploy.
+  const cfgBlock = THEME_EDITOR_PAGE.match(
+    /<script type="application\/json" id="save-config">([\s\S]*?)<\/script>/
+  );
+  assert.ok(cfgBlock, "found the save-config block");
+  const cfg = JSON.parse(cfgBlock[1]);
+  assert.deepStrictEqual(
+    Object.keys(cfg).sort(), ["authBase", "clientId", "cognitoIdp", "saveUrl"]
+  );
+  [
+    "__THEME_SAVE_URL__", "__THEME_AUTH_BASE__", "__THEME_CLIENT_ID__",
+    "__THEME_COGNITO_IDP__"
+  ].forEach((token) => {
+    assert.strictEqual(
+      THEME_EDITOR_PAGE.split(token).length - 1, 1,
+      token + " must appear exactly once, in the save-config block"
+    );
+  });
+
+  // Storage: nothing persistent and no cookies. The one tab-scoped exception is the
+  // in-flight PKCE handshake (managed login is a full-page redirect, so the verifier
+  // has to survive one navigation): a single session-store key, removed on return, and
+  // no token may ever be a stored value - tokens live in variables and die with the tab.
+  ["localStorage", "document.cookie", "indexedDB"].forEach((sink) => {
+    assert.ok(THEME_EDITOR_PAGE.indexOf(sink) < 0, "editor must not touch " + sink);
+  });
+  const storageCalls = THEME_EDITOR_PAGE.match(/sessionStorage\.\w+\([^),]*/g) || [];
+  assert.ok(storageCalls.length > 0, "the PKCE handshake uses the session store");
+  storageCalls.forEach((call) => {
+    assert.ok(
+      /sessionStorage\.(setItem|getItem|removeItem)\(\s*OAUTH_STORAGE_KEY/.test(call),
+      "session store access outside the handshake key: " + call
+    );
+  });
+  assert.ok(/OAUTH_STORAGE_KEY = "gavtheme-oauth"/.test(THEME_EDITOR_PAGE));
+  assert.ok(
+    /sessionStorage\.removeItem\(OAUTH_STORAGE_KEY\)/.test(THEME_EDITOR_PAGE),
+    "the handshake is removed on return"
+  );
+  assert.ok(
+    !/sessionStorage\.setItem\([^)]*[Tt]oken/.test(THEME_EDITOR_PAGE),
+    "tokens never reach storage"
+  );
+
+  assert.ok(
+    !/\.innerHTML|\.outerHTML|insertAdjacentHTML|document\.write\b/.test(THEME_EDITOR_PAGE),
+    "no HTML-from-strings"
+  );
+  // Its links are relative paths to siblings, and the only one is the guide. Sign-in
+  // navigation goes through location.assign to the stamped managed-login URL, never an
+  // anchor, so no href can name a host.
+  const hrefs = THEME_EDITOR_PAGE.match(/href="[^"]*"/g) || [];
+  hrefs.forEach((href) => assert.strictEqual(href, 'href="theme-guide.html"'));
+  // The no-sign-in path is intact: the console upload is still taught by its output
+  // name, and the committed Save button ships hidden, reading "Sign in to save" - the
+  // unsigned page is the download-only editor it always was.
+  assert.ok(THEME_EDITOR_PAGE.indexOf("WidgetThemeUpload") >= 0);
+  assert.ok(
+    /<button type="button" id="save" hidden>Sign in to save<\/button>/.test(
+      THEME_EDITOR_PAGE
+    ),
+    "Save ships hidden and unsigned"
+  );
+});
+
+test("the editor offers every setting in the shipped file, at the widget's caps", () => {
+  // THE contract this page exists under: a key added to defaults/theme.json without a
+  // control here would silently miss the editor, and a control without a key would edit
+  // nothing. data-theme-key markers make the correspondence checkable both ways.
+  const fileKeys = Object.keys(THEME_DEFAULTS).filter((k) => k !== "_readme").sort();
+  const pageKeys = (THEME_EDITOR_PAGE.match(/data-theme-key="[^"]*"/g) || [])
+    .map((m2) => m2.slice('data-theme-key="'.length, -1))
+    .sort();
+  assert.deepStrictEqual(pageKeys, fileKeys);
+
+  // The form cannot produce what the widget would drop: exactly one input per allowed
+  // question (so a fifth cannot be typed), each capped at the widget's character limit
+  // (so an over-long one cannot be typed either).
+  const slots = THEME_EDITOR_PAGE.match(/data-question-slot="[^"]*"/g) || [];
+  assert.strictEqual(slots.length, widget.MAX_STARTER_QUESTIONS * widget.LANGUAGES.length);
+  const caps = THEME_EDITOR_PAGE.match(/maxlength="120"/g) || [];
+  assert.strictEqual(caps.length, slots.length, "every slot carries the widget's cap");
+  assert.strictEqual(String(widget.MAX_STARTER_CHARS), "120");
+
+  // Every font keyword is offered, and nothing else is.
+  const fontValues = (THEME_EDITOR_PAGE.match(/name="fontFamily" value="[^"]*"/g) || [])
+    .map((m2) => m2.match(/value="([^"]*)"/)[1]);
+  assert.deepStrictEqual(fontValues.sort(), widget.FONT_KEYWORDS.slice().sort());
+});
+
+test("the editor's embedded defaults are the shipped file, byte for byte", () => {
+  // The _readme of every downloaded file and the form's built-in fallback values both
+  // come from this block, so it must BE frontend/defaults/theme.json, not a paraphrase.
+  const m = THEME_EDITOR_PAGE.match(
+    /<script type="application\/json" id="theme-defaults">([\s\S]*?)<\/script>/
+  );
+  assert.ok(m, "found the embedded defaults block");
+  assert.strictEqual(m[1], "\n" + THEME_DEFAULTS_TEXT);
+});
+
+test("the editor validates with the widget's own rules", () => {
+  const editor = editorRules();
+  // The tables are copies and must stay equal - a keyword or stack that moves in
+  // widget.js without moving here would preview one thing and ship another.
+  assert.deepStrictEqual(editor.FONT_KEYWORDS, widget.FONT_KEYWORDS);
+  assert.deepStrictEqual(editor.FONT_STACKS, widget.FONT_STACKS);
+  assert.deepStrictEqual(editor.LANGUAGES, widget.LANGUAGES);
+  assert.strictEqual(editor.DEFAULT_HIGHLIGHT, widget.DEFAULT_HIGHLIGHT);
+  assert.strictEqual(editor.DEFAULT_FONT, widget.DEFAULT_FONT);
+  assert.strictEqual(editor.MAX_STARTER_QUESTIONS, widget.MAX_STARTER_QUESTIONS);
+  assert.strictEqual(editor.MAX_STARTER_CHARS, widget.MAX_STARTER_CHARS);
+
+  // The colour rule, compared behaviourally against what applyTheme actually accepts.
+  // The one value the widget reads but emits no CSS for is the default itself.
+  assert.strictEqual(editor.normalizeHex("#8A1C30"), widget.DEFAULT_HIGHLIGHT);
+  [
+    "#1E4B8F", "#a13", "#A13", " #ffd400 ",
+    "maroon", "rgb(138, 28, 48)", "8a1c30", "#8a1c3", "#gggggg", "",
+    "#fff; } .panel { display: none } .x {", "var(--anything)", 42, null
+  ].forEach((value) => {
+    assert.strictEqual(
+      editor.normalizeHex(value),
+      widgetNormalizedHighlight(value),
+      "normalizeHex diverges on " + JSON.stringify(value)
+    );
+  });
+
+  // The ink derivation, swept across the sRGB cube like the widget's own test.
+  for (let r = 0; r < 256; r += 15) {
+    for (let g = 0; g < 256; g += 15) {
+      for (let b = 0; b < 256; b += 15) {
+        const hex = "#" + [r, g, b].map((v) => v.toString(16).padStart(2, "0")).join("");
+        assert.strictEqual(editor.inkFor(hex), widget.inkFor(hex), hex);
+      }
+    }
+  }
+
+  // The question cleaning, compared behaviourally against what the widget renders.
+  [
+    ["One?", "Two?", "Three?", "Four?", "Five?"],
+    ["  Dos  ?  ", ""],
+    ["x".repeat(widget.MAX_STARTER_CHARS + 1)],
+    [null, 3, ""],
+    ["ok", "x".repeat(widget.MAX_STARTER_CHARS + 1), "also ok"]
+  ].forEach((list) => {
+    const widgetSees = withTheme({ starterQuestions: { en: list } }, () =>
+      widget.starterQuestions()
+    );
+    const editorSees =
+      editor.cleanQuestionList(list) || widget.STRINGS.en.suggestedQuestions;
+    assert.deepStrictEqual(editorSees, widgetSees, JSON.stringify(list));
+  });
+});
+
+test("the editor's download is the pinned serialisation, and the widget accepts it", () => {
+  const editor = editorRules();
+  // An untouched form downloads the shipped defaults file, byte for byte - the same
+  // canonical form (key order, two-space indent, trailing newline) this suite pins on
+  // defaults/theme.json itself.
+  const defaultState = {
+    highlight: THEME_DEFAULTS.highlightColor,
+    font: THEME_DEFAULTS.fontFamily,
+    questions: {
+      en: THEME_DEFAULTS.starterQuestions.en.slice(),
+      es: THEME_DEFAULTS.starterQuestions.es.slice()
+    }
+  };
+  assert.strictEqual(
+    editor.buildFileText(defaultState, THEME_DEFAULTS._readme),
+    THEME_DEFAULTS_TEXT
+  );
+
+  // An edited form downloads a file the widget reads back EXACTLY as edited.
+  const edited = editor.buildFileText(
+    { highlight: "#1e4b8f", font: "serif", questions: { en: ["Where is the makerspace?"], es: [] } },
+    THEME_DEFAULTS._readme
+  );
+  assert.ok(edited.endsWith("}\n"), "one trailing newline");
+  const parsed = JSON.parse(edited);
+  assert.deepStrictEqual(Object.keys(parsed), [
+    "_readme", "highlightColor", "fontFamily", "starterQuestions"
+  ]);
+  assert.deepStrictEqual(parsed._readme, THEME_DEFAULTS._readme);
+  // A language with no questions is OMITTED, never written as an empty list: an absent
+  // "es" is what makes the widget fall back to the customer's English questions.
+  assert.deepStrictEqual(Object.keys(parsed.starterQuestions), ["en"]);
+  withTheme(parsed, () => {
+    const css = widget.themeCss();
+    assert.ok(/--brand:\s*#1e4b8f/.test(css), css);
+    assert.ok(css.indexOf(widget.FONT_STACKS.serif) >= 0, css);
+    assert.deepStrictEqual(widget.starterQuestions(), ["Where is the makerspace?"]);
+  });
+
+  // No questions at all means NO starterQuestions block - the file shape that keeps the
+  // widget's built-in questions in both languages.
+  const noQuestions = JSON.parse(
+    editor.buildFileText(
+      { highlight: "#1e4b8f", font: "system", questions: { en: ["", "   "], es: [] } },
+      THEME_DEFAULTS._readme
+    )
+  );
+  assert.ok(!("starterQuestions" in noQuestions), JSON.stringify(noQuestions));
+  withTheme(noQuestions, () => {
+    assert.deepStrictEqual(widget.starterQuestions(), widget.STRINGS.en.suggestedQuestions);
+  });
+});
+
+test("the editor seeds its form the way the widget reads a live file", () => {
+  const editor = editorRules();
+  const base = {
+    highlight: widget.DEFAULT_HIGHLIGHT,
+    font: widget.DEFAULT_FONT,
+    questions: {
+      en: THEME_DEFAULTS.starterQuestions.en.slice(),
+      es: THEME_DEFAULTS.starterQuestions.es.slice()
+    }
+  };
+
+  // A file that customises one key keeps the live behaviour for the rest.
+  const colourOnly = editor.stateFrom({ highlightColor: "#1E4B8F" }, base);
+  assert.strictEqual(colourOnly.changed, true);
+  assert.strictEqual(colourOnly.state.highlight, "#1e4b8f");
+  assert.strictEqual(colourOnly.state.font, widget.DEFAULT_FONT);
+  assert.deepStrictEqual(colourOnly.state.questions.en, base.questions.en);
+
+  // A usable starterQuestions block replaces BOTH language lists: the widget shows a
+  // missing language by falling back to English at render time, so seeding its fields
+  // with built-in Spanish would download a file that CHANGES the live behaviour.
+  const enOnly = editor.stateFrom(
+    { starterQuestions: { en: ["Where is the makerspace?"] } }, base
+  );
+  assert.deepStrictEqual(enOnly.state.questions.en, ["Where is the makerspace?"]);
+  assert.deepStrictEqual(enOnly.state.questions.es, []);
+
+  // Per-key soft-fail, same as applyTheme: a bad value costs that value and nothing else.
+  const fatFingered = editor.stateFrom(
+    { highlightColor: "maroon", fontFamily: "serif", starterQuestions: 5 }, base
+  );
+  assert.strictEqual(fatFingered.state.highlight, widget.DEFAULT_HIGHLIGHT);
+  assert.strictEqual(fatFingered.state.font, "serif");
+  // ...and a file that is not an object at all changes nothing.
+  assert.strictEqual(editor.stateFrom([1, 2, 3], base).changed, false);
+  assert.strictEqual(editor.stateFrom(null, base).changed, false);
 });
 
 run();
