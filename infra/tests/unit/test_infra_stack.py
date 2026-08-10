@@ -233,20 +233,22 @@ def test_warm_route_exists():
     )
 
 
-def test_query_and_warm_are_the_only_routes_and_share_one_lambda_integration():
+def test_query_warm_and_theme_are_the_only_routes_and_the_query_pair_share_one_integration():
     # With config.yaml as shipped - feedback enabled but with no destination address, so no
     # /feedback route exists (see the feedback section below for both states).
     template = _template()
     routes = template.find_resources("AWS::ApiGatewayV2::Route")
-    keys = {r["Properties"]["RouteKey"] for r in routes.values()}
-    assert keys == {"POST /query", "GET /warm"}, keys
-    # Both routes reuse a single Lambda integration (same integration id in each Target).
+    by_key = {r["Properties"]["RouteKey"]: r["Properties"] for r in routes.values()}
+    assert set(by_key) == {"POST /query", "GET /warm", "PUT /theme"}, set(by_key)
+    # /query and /warm reuse a single Lambda integration; /theme is its own small Lambda
+    # (see the theme save section below) and therefore its own integration.
     integrations = template.find_resources("AWS::ApiGatewayV2::Integration")
-    assert len(integrations) == 1, list(integrations)
-    (integration_id,) = integrations.keys()
-    for route in routes.values():
-        target = route["Properties"]["Target"]
-        assert integration_id in str(target), target
+    assert len(integrations) == 2, list(integrations)
+    query_integration = next(
+        i for i in integrations if i in str(by_key["POST /query"]["Target"])
+    )
+    assert query_integration in str(by_key["GET /warm"]["Target"])
+    assert query_integration not in str(by_key["PUT /theme"]["Target"])
 
 
 def test_generation_inference_and_query_limit_wired_to_lambda_env():
@@ -310,11 +312,12 @@ def test_cors_allow_origins_locked_to_config_and_never_wildcard():
     literal_origins = [o for o in cors["AllowOrigins"] if isinstance(o, str)]
     assert literal_origins == config_origins, cors
     assert "*" not in cors["AllowOrigins"], cors
-    # Methods must cover the real routes (POST /query, GET /warm) plus the OPTIONS preflight
-    # the gateway answers itself. Authorization is allowed through because /query is gated: the
-    # widget sets that header from JavaScript, which makes every /query preflighted, and leaving
-    # it out kills the request at the OPTIONS with a CORS error instead of a 401.
-    assert set(cors["AllowMethods"]) == {"GET", "POST", "OPTIONS"}, cors
+    # Methods must cover the real routes (POST /query, GET /warm, PUT /theme) plus the OPTIONS
+    # preflight the gateway answers itself. Authorization is allowed through because /query and
+    # /theme are gated: their callers set that header from JavaScript, which makes every request
+    # preflighted, and leaving it out kills the request at the OPTIONS with a CORS error instead
+    # of a 401.
+    assert set(cors["AllowMethods"]) == {"GET", "POST", "PUT", "OPTIONS"}, cors
     assert cors["AllowHeaders"] == ["Content-Type", "Authorization"], cors
     # Still no cookies and no browser-managed HTTP auth, so credentialed CORS stays off - that
     # flag is not what an explicitly-set Authorization header needs.
@@ -1281,11 +1284,17 @@ def test_demo_site_origin_is_allowlisted_at_deploy_time():
     (api,) = template.find_resources("AWS::ApiGatewayV2::Api").values()
     origins = api["Properties"]["CorsConfiguration"]["AllowOrigins"]
     tokens = [o for o in origins if not isinstance(o, str)]
-    assert len(tokens) == 1, origins
-    parts = tokens[0]["Fn::Join"][1]
-    assert parts[0] == "https://", parts
-    assert parts[1]["Fn::GetAtt"][1] == "DomainName", parts
-    assert "DemoSiteDistribution" in parts[1]["Fn::GetAtt"][0], parts
+    # TWO deploy-time origins: the demo page's own distribution, and the widget CDN (the
+    # theme editor page is served from it and PUTs /theme cross-origin). Both are GetAtts
+    # on this stack's distributions, never hardcoded CloudFront domains.
+    assert len(tokens) == 2, origins
+    joined = [json.dumps(t) for t in tokens]
+    assert any("DemoSiteDistribution" in j for j in joined), origins
+    assert any("WidgetDistribution" in j for j in joined), origins
+    for token in tokens:
+        parts = token["Fn::Join"][1]
+        assert parts[0] == "https://", parts
+        assert parts[1]["Fn::GetAtt"][1] == "DomainName", parts
     # Still an explicit allowlist, never a wildcard.
     assert "*" not in origins, origins
 
@@ -1371,15 +1380,16 @@ def test_demo_site_can_be_turned_off_in_config():
     assert [lid for lid in policies if "DemoSite" in lid] == [], list(policies)
     assert "DemoSiteUrl" not in template.find_outputs("*")
 
-    # The allowlist falls back to exactly what config lists and nothing else: no leftover demo
-    # entry, and no deploy-time token (every element is a plain string, not an Fn::GetAtt).
-    # Asserted against config rather than a copied-out list so adding a real origin does not
-    # fail a test that is about the demo knob.
+    # The allowlist falls back to what config lists PLUS the widget CDN's own deploy-time
+    # origin (the theme editor is not a demo feature, so its origin stays): no leftover demo
+    # entry and no demo token. Asserted against config rather than a copied-out list so
+    # adding a real origin does not fail a test that is about the demo knob.
     (api,) = template.find_resources("AWS::ApiGatewayV2::Api").values()
-    assert (
-        api["Properties"]["CorsConfiguration"]["AllowOrigins"]
-        == resolve_cors_allow_origins(CONFIG)
-    )
+    origins = api["Properties"]["CorsConfiguration"]["AllowOrigins"]
+    assert [o for o in origins if isinstance(o, str)] == resolve_cors_allow_origins(CONFIG)
+    tokens = [o for o in origins if not isinstance(o, str)]
+    assert len(tokens) == 1 and "WidgetDistribution" in json.dumps(tokens[0]), origins
+    assert "DemoSiteDistribution" not in json.dumps(tokens), origins
     # The widget still ships from its own bucket at the same root object.
     assert _distribution(template, "widget.js")
 
@@ -1411,11 +1421,14 @@ def test_demo_site_does_not_change_widget_delivery():
         "/theme-guide.html",
         "/theme-editor.html",
     ]
-    # A plain asset copy, never a deploy-time substitution: with more than one source CDK
-    # always renders a SourceMarkers list, but every entry must stay empty (the demo page
-    # is the only stamped file, and it lives in its own deployment).
-    for markers in a.get("SourceMarkers", []):
-        assert markers == {}, ("the widget upload must stay a plain asset copy", markers)
+    # widget.js and the guide stay plain asset copies (empty marker maps); the editor is
+    # the one deploy-stamped source - and identically so with the demo on or off, because
+    # nothing it is stamped with (the save endpoint, the theme-admin sign-in config) is a
+    # demo value.
+    assert a.get("SourceMarkers") == b.get("SourceMarkers"), "stamping must not depend on demo"
+    markers = a.get("SourceMarkers", [])
+    assert len(markers) == 3 and markers[0] == {} and markers[1] == {}, markers
+    assert markers[2] != {}, "the editor source is the stamped one"
 
     # The theme download is on the same path and is just as indifferent to the demo knob.
     c, d = (
@@ -1998,10 +2011,11 @@ def test_feedback_route_has_its_own_integration_on_the_shared_api():
     template = _feedback_template()
     routes = template.find_resources("AWS::ApiGatewayV2::Route")
     keys = {r["Properties"]["RouteKey"] for r in routes.values()}
-    assert keys == {"POST /query", "GET /warm", "POST /feedback"}, keys
-    # Two integrations: /query + /warm share the query Lambda's, /feedback has its own.
+    assert keys == {"POST /query", "GET /warm", "PUT /theme", "POST /feedback"}, keys
+    # Three integrations: /query + /warm share the query Lambda's; /theme and /feedback
+    # each have their own small Lambda.
     integrations = template.find_resources("AWS::ApiGatewayV2::Integration")
-    assert len(integrations) == 2, list(integrations)
+    assert len(integrations) == 3, list(integrations)
     (feedback_route,) = template.find_resources(
         "AWS::ApiGatewayV2::Route", {"Properties": {"RouteKey": "POST /feedback"}}
     ).values()
@@ -2156,26 +2170,65 @@ def _routes(template):
     }
 
 
+# Two pools now share the template (the demo gate's and the theme editor's, see the theme
+# save section below), so every gate test selects its resources by the name the stack gives
+# them rather than assuming it is alone.
+_DEMO_POOL_NAME = "gavilan-library-demo-access"
+_DEMO_CLIENT_NAME = "gavilan-library-demo-widget"
+_DEMO_AUTHORIZER_NAME = "gavilan-library-demo-access"
+_THEME_POOL_NAME = "gavilan-library-theme-admin"
+_THEME_CLIENT_NAME = "gavilan-library-theme-editor"
+_THEME_AUTHORIZER_NAME = "gavilan-library-theme-admin"
+
+
+def _named(template, res_type, name_prop, name):
+    matches = {
+        lid: r
+        for lid, r in template.find_resources(res_type).items()
+        if r["Properties"].get(name_prop) == name
+    }
+    assert len(matches) == 1, (res_type, name, list(matches))
+    return matches
+
+
+def _pool_named(template, name):
+    return _named(template, "AWS::Cognito::UserPool", "UserPoolName", name)
+
+
+def _client_named(template, name):
+    return _named(template, "AWS::Cognito::UserPoolClient", "ClientName", name)
+
+
+def _authorizer_named(template, name):
+    return _named(template, "AWS::ApiGatewayV2::Authorizer", "Name", name)
+
+
 def test_query_is_gated_by_a_jwt_authorizer_and_the_open_routes_stay_open():
     template = _template()
     routes = _routes(template)
 
     query = routes["POST /query"]
     assert query["AuthorizationType"] == "JWT", query
-    assert "AuthorizerId" in query, query
+    (demo_auth_lid,) = _authorizer_named(template, _DEMO_AUTHORIZER_NAME).keys()
+    assert query["AuthorizerId"] == {"Ref": demo_auth_lid}, query
 
     # /warm fires on page load, before anyone could have signed in, so gating it would only
     # guarantee a cold first query. It runs no generation call.
     assert routes["GET /warm"].get("AuthorizationType", "NONE") == "NONE", routes["GET /warm"]
 
-    # Exactly one route is gated. A second one would mean something was gated by accident.
-    gated = [key for key, props in routes.items() if props.get("AuthorizationType") == "JWT"]
-    assert gated == ["POST /query"], gated
+    # Exactly two routes are gated - the billable /query and the theme editor's write path
+    # (its own section below) - and by DIFFERENT authorizers: the demo pool must never
+    # guard a write, and the theme-admin pool must never guard demo spend.
+    gated = sorted(
+        key for key, props in routes.items() if props.get("AuthorizationType") == "JWT"
+    )
+    assert gated == ["POST /query", "PUT /theme"], gated
+    assert routes["POST /query"]["AuthorizerId"] != routes["PUT /theme"]["AuthorizerId"]
 
 
 def test_the_authorizer_is_native_and_trusts_only_this_pool_and_this_client():
     template = _template()
-    (auth,) = template.find_resources("AWS::ApiGatewayV2::Authorizer").values()
+    (auth,) = _authorizer_named(template, _DEMO_AUTHORIZER_NAME).values()
     props = auth["Properties"]
 
     assert props["AuthorizerType"] == "JWT", props
@@ -2184,22 +2237,23 @@ def test_the_authorizer_is_native_and_trusts_only_this_pool_and_this_client():
     assert "AuthorizerUri" not in props, props
     assert props["IdentitySource"] == ["$request.header.Authorization"], props
 
-    # The issuer is built from THIS stack's pool, at deploy time - never a pasted pool id.
+    # The issuer is built from THIS stack's demo pool, at deploy time - never a pasted pool
+    # id, and never the theme-admin pool's.
     issuer = json.dumps(props["JwtConfiguration"]["Issuer"])
     assert "cognito-idp." in issuer and "AWS::Region" in issuer, issuer
-    (pool_lid,) = template.find_resources("AWS::Cognito::UserPool").keys()
+    (pool_lid,) = _pool_named(template, _DEMO_POOL_NAME).keys()
     assert pool_lid in issuer, issuer
 
     # AUDIENCE IS THE APP CLIENT ID. A Cognito ACCESS token carries no `aud`, it carries
     # `client_id`, and API Gateway "validates client_id only if aud is not present" - which is
     # what makes the access token the widget sends validate against this entry.
-    (client_lid,) = template.find_resources("AWS::Cognito::UserPoolClient").keys()
+    (client_lid,) = _client_named(template, _DEMO_CLIENT_NAME).keys()
     assert props["JwtConfiguration"]["Audience"] == [{"Ref": client_lid}], props
 
 
 def test_the_app_client_is_public_password_auth_and_expires_in_a_day():
     template = _template()
-    (client,) = template.find_resources("AWS::Cognito::UserPoolClient").values()
+    (client,) = _client_named(template, _DEMO_CLIENT_NAME).values()
     props = client["Properties"]
 
     # No secret: the widget is JavaScript in a browser, so a secret would be readable by anyone
@@ -2221,7 +2275,7 @@ def test_the_app_client_is_public_password_auth_and_expires_in_a_day():
 
 def test_the_pool_signs_in_by_plain_username_not_email():
     template = _template()
-    (pool,) = template.find_resources("AWS::Cognito::UserPool").values()
+    (pool,) = _pool_named(template, _DEMO_POOL_NAME).values()
     props = pool["Properties"]
 
     # NEITHER UsernameAttributes NOR AliasAttributes: that is what a plain-username pool looks
@@ -2313,3 +2367,258 @@ def test_the_gate_does_not_touch_the_demo_distribution():
     # through the preflight - that lives on the API's CORS config, not on the distribution.
     api = _one(template, "AWS::ApiGatewayV2::Api")
     assert "Authorization" in api["Properties"]["CorsConfiguration"]["AllowHeaders"]
+
+
+# --- Theme save path: theme-admin pool, managed login, PUT /theme, key-scoped writer ---------
+#
+# PERMANENT, unlike the demo gate above: it guards a WRITE (the settings editor's Save rewrites
+# the live theme.json) rather than demo spend, so it survives go-live. These tests pin the
+# account lifecycle the handover depends on - invitation by EMAIL, verified-email recovery,
+# verification-before-email-change, the printed create-user command - and that the writer can
+# reach exactly one S3 object. The demo pool's own pins live in the section above; the last
+# test here holds the two gates apart.
+
+
+def test_theme_admin_pool_signs_in_by_email_with_self_sign_up_off():
+    template = _template()
+    (pool,) = _pool_named(template, _THEME_POOL_NAME).values()
+    props = pool["Properties"]
+    # EMAIL is the sign-in attribute: a real personal address, which doubles as the
+    # invitation and recovery channel. Sign-in options are immutable after pool creation
+    # (the demo section's lesson), so this is pinned rather than left to a deploy.
+    assert props["UsernameAttributes"] == ["email"], props
+    # Accounts exist only through the printed admin-create-user command.
+    assert props["AdminCreateUserConfig"]["AllowAdminCreateUserOnly"] is True, props
+    assert pool.get("DeletionPolicy") == "Delete", pool
+
+
+def test_theme_admin_recovery_is_verified_email_and_email_change_needs_verification():
+    template = _template()
+    (pool,) = _pool_named(template, _THEME_POOL_NAME).values()
+    props = pool["Properties"]
+    # Self-service forgot-password by verified email at priority one - the reason the
+    # printed command sets email_verified true at creation.
+    assert props["AccountRecoverySetting"]["RecoveryMechanisms"] == [
+        {"Name": "verified_email", "Priority": 1}
+    ], props
+    # A changed email is VERIFIED before it replaces the old one: the address is the
+    # sign-in name and the recovery channel, so an unverified typo would lock the
+    # librarian out of both at once.
+    assert props["UserAttributeUpdateSettings"][
+        "AttributesRequireVerificationBeforeUpdate"
+    ] == ["email"], props
+    assert props["AutoVerifiedAttributes"] == ["email"], props
+
+
+def test_theme_admin_invitation_carries_both_slots_and_a_generous_expiry():
+    template = _template()
+    (pool,) = _pool_named(template, _THEME_POOL_NAME).values()
+    props = pool["Properties"]
+    invite = props["AdminCreateUserConfig"]["InviteMessageTemplate"]
+    message = json.dumps(invite["EmailMessage"])
+    # {username} and {####} are Cognito's substitution slots for the address and the
+    # generated temporary password - the template must carry BOTH or the invitation is
+    # not delivered at all.
+    assert "{username}" in message and "{####}" in message, message
+    assert invite.get("EmailSubject"), invite
+    # The invitation links the page it signs into - a deploy-time token on the widget
+    # distribution, never a hardcoded domain.
+    assert "WidgetDistribution" in message and "theme-editor.html" in message, message
+
+    # Strong password policy, and a 90-day temporary-password validity instead of the
+    # 7-day default: the invitation may sit in a librarian's inbox well past handover
+    # week, and a lapsed one costs a RESEND nobody may be around to run.
+    policy = props["Policies"]["PasswordPolicy"]
+    assert policy["MinimumLength"] >= 12, policy
+    for key in ("RequireLowercase", "RequireUppercase", "RequireNumbers", "RequireSymbols"):
+        assert policy[key] is True, (key, policy)
+    assert policy["TemporaryPasswordValidityDays"] == 90, policy
+
+
+def test_theme_admin_uses_managed_login_with_code_plus_pkce():
+    template = _template()
+    # One hosted domain, MANAGED LOGIN (version 2, not the classic hosted UI), prefix
+    # folded with the account id for uniqueness, on the theme pool.
+    (domain,) = template.find_resources("AWS::Cognito::UserPoolDomain").values()
+    props = domain["Properties"]
+    assert props["ManagedLoginVersion"] == 2, props
+    assert "gavilan-theme-" in json.dumps(props["Domain"]), props
+    (pool_lid,) = _pool_named(template, _THEME_POOL_NAME).keys()
+    assert props["UserPoolId"] == {"Ref": pool_lid}, props
+
+    # The app client: public, authorization-code grant only (no implicit - a token in a
+    # URL fragment lands in browser history, and this page runs on shared library
+    # machines), callback and logout on the editor page, and the user-scoped-API scope
+    # the account panel's ChangePassword/UpdateUserAttributes calls need.
+    (client,) = _client_named(template, _THEME_CLIENT_NAME).values()
+    cprops = client["Properties"]
+    assert cprops["GenerateSecret"] is False, cprops
+    assert cprops["AllowedOAuthFlows"] == ["code"], cprops
+    assert cprops["AllowedOAuthFlowsUserPoolClient"] is True, cprops
+    assert set(cprops["AllowedOAuthScopes"]) == {
+        "openid",
+        "email",
+        "aws.cognito.signin.user.admin",
+    }, cprops
+    for url_list in (cprops["CallbackURLs"], cprops["LogoutURLs"]):
+        assert len(url_list) == 1, cprops
+        blob = json.dumps(url_list[0])
+        assert "WidgetDistribution" in blob and "theme-editor.html" in blob, blob
+
+    # Managed login v2 requires a branding assignment per client; Cognito's provided
+    # values are the neutral hosted pages wanted here.
+    (branding,) = template.find_resources("AWS::Cognito::ManagedLoginBranding").values()
+    assert branding["Properties"]["UseCognitoProvidedValues"] is True, branding
+
+
+def test_theme_admin_create_user_command_is_ready_to_run():
+    # This one string IS the account lifecycle's only AWS-credentialed step: creation,
+    # another librarian, and a stale invitation are all this command with substitutions.
+    outputs = _template().find_outputs("*")
+    value = json.dumps(outputs["ThemeAdminCreateUserCommand"]["Value"])
+    # EMAIL delivery is spelled out because DesiredDeliveryMediums DEFAULTS TO SMS - omit
+    # it and the invitation silently never arrives.
+    assert "--desired-delivery-mediums EMAIL" in value, value
+    # email_verified=true at creation is what makes self-service (verified-email)
+    # password reset work from day one.
+    assert "Name=email_verified,Value=true" in value, value
+    # The address appears exactly twice - as the username (the pool signs in by email,
+    # and the email IS the --username value) and as the email attribute.
+    assert value.count("PROJECT_EMAIL_HERE") == 2, value
+    assert "--username PROJECT_EMAIL_HERE" in value, value
+    # No --temporary-password: Cognito generates one, which keeps a credential out of
+    # shell history. And no --message-action in the base command - RESEND is taught by
+    # the description for the stale-invitation case, not defaulted.
+    assert "--temporary-password" not in value, value
+    assert "--message-action" not in value, value
+    description = json.dumps(outputs["ThemeAdminCreateUserCommand"]["Description"])
+    assert "RESEND" in description, description
+
+
+def test_theme_route_is_gated_by_its_own_authorizer_on_its_own_lambda():
+    template = _template()
+    routes = _routes(template)
+    theme = routes["PUT /theme"]
+    assert theme["AuthorizationType"] == "JWT", theme
+    (theme_auth_lid,) = _authorizer_named(template, _THEME_AUTHORIZER_NAME).keys()
+    assert theme["AuthorizerId"] == {"Ref": theme_auth_lid}, theme
+
+    # Same native-JWT shape as the demo gate: no authorizer Lambda, issuer built from
+    # THIS stack's theme pool, audience = the app client id (a Cognito ACCESS token
+    # carries client_id, not aud).
+    (auth,) = _authorizer_named(template, _THEME_AUTHORIZER_NAME).values()
+    props = auth["Properties"]
+    assert props["AuthorizerType"] == "JWT", props
+    assert "AuthorizerUri" not in props, props
+    assert props["IdentitySource"] == ["$request.header.Authorization"], props
+    (pool_lid,) = _pool_named(template, _THEME_POOL_NAME).keys()
+    assert pool_lid in json.dumps(props["JwtConfiguration"]["Issuer"]), props
+    (client_lid,) = _client_named(template, _THEME_CLIENT_NAME).keys()
+    assert props["JwtConfiguration"]["Audience"] == [{"Ref": client_lid}], props
+
+
+def test_theme_writer_is_scoped_to_the_one_object_and_the_one_distribution():
+    template = _template()
+    statements = _statements_for_role_of(template, "theme_handler.lambda_handler")
+    # Exactly two inline statements (basic logs ride the managed policy): PutObject on
+    # the widget bucket's theme.json - the one key, not a prefix, not the bucket, so the
+    # writer cannot touch widget.js, the defaults copy or the hosted pages - and the
+    # invalidation on the widget distribution.
+    assert len(statements) == 2, statements
+    (put,) = [s for s in statements if s["Action"] == "s3:PutObject"]
+    resource = put["Resource"]
+    assert "WidgetBucket" in json.dumps(resource), resource
+    assert _join_literals(resource).endswith("/theme.json"), resource
+    assert "*" not in _join_literals(resource), resource
+    (invalidation,) = [
+        s for s in statements if s["Action"] == "cloudfront:CreateInvalidation"
+    ]
+    assert "WidgetDistribution" in json.dumps(invalidation["Resource"]), invalidation
+
+    # Its own small function (like the feedback path), wired to the bucket, the key and
+    # the distribution id - and to nothing of the query handler's.
+    (fn,) = template.find_resources(
+        "AWS::Lambda::Function",
+        {"Properties": {"Handler": "theme_handler.lambda_handler"}},
+    ).values()
+    env = fn["Properties"]["Environment"]["Variables"]
+    assert env["WIDGET_THEME_KEY"] == "theme.json", env
+    assert "WidgetBucket" in json.dumps(env["WIDGET_BUCKET"]), env
+    assert "WidgetDistribution" in json.dumps(env["WIDGET_DISTRIBUTION_ID"]), env
+    assert "KNOWLEDGE_BASE_ID" not in env, env
+
+
+def test_theme_editor_page_is_stamped_with_the_save_and_sign_in_config():
+    # Same mechanism as the demo page: the committed editor carries bare markers, and
+    # Source.data resolves each to a deploy-time value - so a fresh install in another
+    # account stamps its own endpoint, domain and client id, and nothing is hardcoded.
+    template = _template()
+    props = _widget_deployment(template)["Properties"]
+    markers_list = props["SourceMarkers"]
+    assert len(markers_list) == 3, markers_list
+    assert markers_list[0] == {} and markers_list[1] == {}, markers_list
+    markers = markers_list[2]
+
+    page = (
+        pathlib.Path(__file__).resolve().parents[3] / "frontend" / "theme-editor.html"
+    ).read_text(encoding="utf-8")
+    tokens = (
+        "__THEME_SAVE_URL__",
+        "__THEME_AUTH_BASE__",
+        "__THEME_CLIENT_ID__",
+        "__THEME_COGNITO_IDP__",
+    )
+    expected = sum(page.count(token) for token in tokens)
+    assert expected == 4, "the editor page must carry each placeholder exactly once"
+
+    # The four placeholders resolve through FIVE substitution markers, not four: the
+    # managed-login base URL interleaves two tokens (the domain resource and the region)
+    # and the cognito-idp endpoint reuses the region token. What matters is coverage -
+    # every stamped value is a deploy-time token on THIS stack, never a literal.
+    assert len(markers) == 5, markers
+    resolved = {json.dumps(v, sort_keys=True) for v in markers.values()}
+    blob = json.dumps(sorted(resolved))
+    assert "ChatbotHttpApi" in blob and "ApiEndpoint" in blob, blob  # the save URL
+    assert "ThemeAdminDomain" in blob, blob  # the managed-login base URL's domain
+    assert "ThemeAdminClient" in blob, blob  # the app client id
+    assert "AWS::Region" in blob, blob  # the cognito endpoints' region
+
+
+def test_theme_editor_missing_a_placeholder_fails_synth():
+    # A renamed marker must break the build, not ship an editor whose Save points at the
+    # literal string "__THEME_SAVE_URL__". Pointed at a real frontend page that carries
+    # no markers (the guide).
+    import infra.infra_stack as stack_module
+
+    original = stack_module._WIDGET_THEME_EDITOR_FILE
+    stack_module._WIDGET_THEME_EDITOR_FILE = "theme-guide.html"
+    try:
+        with pytest.raises(ValueError, match=r"deploy-time"):
+            _template_from(CONFIG)
+    finally:
+        stack_module._WIDGET_THEME_EDITOR_FILE = original
+
+
+def test_the_demo_gate_is_untouched_by_the_theme_gate():
+    # The two gates must not bleed into each other: /query stays on the demo authorizer,
+    # the demo pool keeps the plain-username shape pinned in its own section, the demo
+    # client gains no OAuth surface, and the one hosted domain belongs to the theme pool.
+    template = _template()
+    template.resource_count_is("AWS::Cognito::UserPool", 2)
+    template.resource_count_is("AWS::Cognito::UserPoolClient", 2)
+    template.resource_count_is("AWS::ApiGatewayV2::Authorizer", 2)
+    template.resource_count_is("AWS::Cognito::UserPoolDomain", 1)
+    template.resource_count_is("AWS::Cognito::ManagedLoginBranding", 1)
+    # Still no user in CloudFormation, for EITHER pool: a template-owned user is
+    # replacement-on-update on every property.
+    template.resource_count_is("AWS::Cognito::UserPoolUser", 0)
+
+    routes = _routes(template)
+    (demo_auth_lid,) = _authorizer_named(template, _DEMO_AUTHORIZER_NAME).keys()
+    assert routes["POST /query"]["AuthorizerId"] == {"Ref": demo_auth_lid}
+
+    (demo_client,) = _client_named(template, _DEMO_CLIENT_NAME).values()
+    assert "AllowedOAuthFlows" not in demo_client["Properties"], demo_client
+    (domain,) = template.find_resources("AWS::Cognito::UserPoolDomain").values()
+    (theme_pool_lid,) = _pool_named(template, _THEME_POOL_NAME).keys()
+    assert domain["Properties"]["UserPoolId"] == {"Ref": theme_pool_lid}, domain

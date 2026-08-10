@@ -3581,11 +3581,14 @@ function widgetNormalizedHighlight(value) {
   });
 }
 
-test("the settings editor page is self-contained and download-only", () => {
+test("the settings editor page is self-contained; its save path is deploy-stamped", () => {
   assert.ok(/<html lang="en">/.test(THEME_EDITOR_PAGE), "the page declares its language");
   assert.ok(/<title>/.test(THEME_EDITOR_PAGE), "the page carries a title");
   // Nothing external, same rule as the guide: no embedded resources, no absolute URLs,
-  // so it renders on any distribution domain and can never phone home.
+  // so it renders on any distribution domain and can never phone home. The save
+  // endpoint and the sign-in configuration are NOT an exception: they reach the page as
+  // deploy-time substitution markers in the save-config block, so the committed file
+  // still names no host anywhere.
   assert.ok(!/\bsrc=/i.test(THEME_EDITOR_PAGE), "no embedded resources");
   assert.ok(!/<link\b/i.test(THEME_EDITOR_PAGE), "no external stylesheets");
   // The CSS-fetch scan is scoped to the stylesheet: the page's script legitimately says
@@ -3595,21 +3598,73 @@ test("the settings editor page is self-contained and download-only", () => {
   assert.ok(!/@import|url\(/i.test(styleBlock[1]), "no CSS fetches");
   assert.ok(!/@import/i.test(THEME_EDITOR_PAGE), "no @import anywhere");
   assert.ok(!/https?:/i.test(THEME_EDITOR_PAGE), "no absolute URLs anywhere");
-  // Scripts are allowed on THIS page (unlike the guide) but the widget's hygiene rules
-  // still hold: nothing about a visit is stored, and no markup is built from strings.
-  ["localStorage", "sessionStorage", "document.cookie", "indexedDB"].forEach((sink) => {
+
+  // The save-config block: exactly the four stamped values, each marker appearing
+  // exactly once in the whole page (Source.data substitutes EVERY occurrence, so a
+  // second one - a comment spelling a marker out - would get stamped too). The infra
+  // suite pins the other end: what each marker resolves to at deploy.
+  const cfgBlock = THEME_EDITOR_PAGE.match(
+    /<script type="application\/json" id="save-config">([\s\S]*?)<\/script>/
+  );
+  assert.ok(cfgBlock, "found the save-config block");
+  const cfg = JSON.parse(cfgBlock[1]);
+  assert.deepStrictEqual(
+    Object.keys(cfg).sort(), ["authBase", "clientId", "cognitoIdp", "saveUrl"]
+  );
+  [
+    "__THEME_SAVE_URL__", "__THEME_AUTH_BASE__", "__THEME_CLIENT_ID__",
+    "__THEME_COGNITO_IDP__"
+  ].forEach((token) => {
+    assert.strictEqual(
+      THEME_EDITOR_PAGE.split(token).length - 1, 1,
+      token + " must appear exactly once, in the save-config block"
+    );
+  });
+
+  // Storage: nothing persistent and no cookies. The one tab-scoped exception is the
+  // in-flight PKCE handshake (managed login is a full-page redirect, so the verifier
+  // has to survive one navigation): a single session-store key, removed on return, and
+  // no token may ever be a stored value - tokens live in variables and die with the tab.
+  ["localStorage", "document.cookie", "indexedDB"].forEach((sink) => {
     assert.ok(THEME_EDITOR_PAGE.indexOf(sink) < 0, "editor must not touch " + sink);
   });
+  const storageCalls = THEME_EDITOR_PAGE.match(/sessionStorage\.\w+\([^),]*/g) || [];
+  assert.ok(storageCalls.length > 0, "the PKCE handshake uses the session store");
+  storageCalls.forEach((call) => {
+    assert.ok(
+      /sessionStorage\.(setItem|getItem|removeItem)\(\s*OAUTH_STORAGE_KEY/.test(call),
+      "session store access outside the handshake key: " + call
+    );
+  });
+  assert.ok(/OAUTH_STORAGE_KEY = "gavtheme-oauth"/.test(THEME_EDITOR_PAGE));
+  assert.ok(
+    /sessionStorage\.removeItem\(OAUTH_STORAGE_KEY\)/.test(THEME_EDITOR_PAGE),
+    "the handshake is removed on return"
+  );
+  assert.ok(
+    !/sessionStorage\.setItem\([^)]*[Tt]oken/.test(THEME_EDITOR_PAGE),
+    "tokens never reach storage"
+  );
+
   assert.ok(
     !/\.innerHTML|\.outerHTML|insertAdjacentHTML|document\.write\b/.test(THEME_EDITOR_PAGE),
     "no HTML-from-strings"
   );
-  // Its links are relative paths to siblings, and the only one is the guide.
+  // Its links are relative paths to siblings, and the only one is the guide. Sign-in
+  // navigation goes through location.assign to the stamped managed-login URL, never an
+  // anchor, so no href can name a host.
   const hrefs = THEME_EDITOR_PAGE.match(/href="[^"]*"/g) || [];
   hrefs.forEach((href) => assert.strictEqual(href, 'href="theme-guide.html"'));
-  // Download only: the upload half of the workflow stays the console link, so the page
-  // must teach it by its output name, the same rule the guide follows.
+  // The no-sign-in path is intact: the console upload is still taught by its output
+  // name, and the committed Save button ships hidden, reading "Sign in to save" - the
+  // unsigned page is the download-only editor it always was.
   assert.ok(THEME_EDITOR_PAGE.indexOf("WidgetThemeUpload") >= 0);
+  assert.ok(
+    /<button type="button" id="save" hidden>Sign in to save<\/button>/.test(
+      THEME_EDITOR_PAGE
+    ),
+    "Save ships hidden and unsigned"
+  );
 });
 
 test("the editor offers every setting in the shipped file, at the widget's caps", () => {

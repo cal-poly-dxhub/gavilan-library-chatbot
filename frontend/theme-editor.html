@@ -2,19 +2,30 @@
 <!--
   The settings editor: a form that fills in theme.json so nobody has to hand-edit JSON in
   a text editor. Served at the widget bucket root next to theme-guide.html and linked from
-  the WidgetThemeEditor stack output. Download only - the page has no write access to
-  anything; the upload step stays the WidgetThemeUpload console link.
+  the WidgetThemeEditor stack output. Two ways out of it: a signed-in librarian's Save
+  writes the live file directly (a PUT to the stack's save endpoint, gated by the
+  theme-admin Cognito pool), and the Download button still builds the same file for the
+  WidgetThemeUpload console route - which also remains the whole page for anyone unsigned.
 
   Self-contained like the guide page: no external fonts, libraries or stylesheets, and no
-  absolute URLs, so it works on any distribution domain with no deploy-time stamping.
-  Unlike the guide it carries scripts - but no innerHTML, no storage, and no request path
-  beyond two same-origin GETs (theme.json, then defaults/theme.json) that seed the form
-  with the LIVE theme rather than a blank one.
+  absolute URLs in the committed file. The save endpoint and the sign-in configuration are
+  DEPLOY-STAMPED into the save-config JSON block below (the same substitution mechanism as
+  the demo page), so a copy of this page that was never deployed simply keeps Save and the
+  account panel hidden and behaves exactly as the download-only editor did.
+
+  Sign-in itself belongs to Cognito managed login - this page hosts no password form and
+  no reset flow, it only redirects (authorization code + PKCE) and exchanges the returned
+  code. Storage rules, pinned by the contract suite: nothing persistent and no cookies;
+  the tab-scoped session store holds exactly ONE key, the in-flight PKCE verifier +
+  state, written on the redirect out and removed on return. Tokens live in JS variables
+  only - the refresh token is dropped unread, and a reload signs in again.
 
   Two things in here are deliberately copies of widget.js and are pinned against it by the
   contract suite (frontend/test/widget.contract.test.js), so they cannot drift silently:
     - the validation rules (hex pattern, font keyword table, question caps, ink derivation)
     - the embedded defaults block below, byte-identical to frontend/defaults/theme.json
+  (The save Lambda revalidates server-side with the same rules; its copy is pinned by the
+  infra suite's test_theme_handler.py.)
   The preview is a hand-built miniature of the widget, not the widget itself: reusing
   widget.js here would need a network load plus a fetch-intercepting remount per edit,
   because the widget reads theme.json once at boot and exposes applyTheme only to tests.
@@ -137,7 +148,7 @@
   }
 
   .actions { margin: 2.5rem 0 0; }
-  #download {
+  #download, #save {
     font: inherit;
     font-weight: 600;
     color: #ffffff;
@@ -147,8 +158,39 @@
     padding: 0.7rem 1.4rem;
     cursor: pointer;
   }
-  #download:hover:not(:disabled) { filter: brightness(1.07); }
-  #download:disabled { opacity: 0.5; cursor: default; }
+  #save { margin-right: 0.6rem; }
+  #download:hover:not(:disabled), #save:hover:not(:disabled) { filter: brightness(1.07); }
+  #download:disabled, #save:disabled { opacity: 0.5; cursor: default; }
+
+  /* ---- account panel (hidden until the deploy-stamped page has a signed-in session) -- */
+  .account-block { margin: 1rem 0 0; }
+  .account-block input {
+    display: block;
+    width: 100%;
+    max-width: 22rem;
+    margin: 0.4rem 0;
+    padding: 0.5rem 0.6rem;
+    font: inherit;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+  button.minor {
+    font: inherit;
+    padding: 0.45rem 0.9rem;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--field-bg);
+    cursor: pointer;
+  }
+  button.linklike {
+    font: inherit;
+    color: var(--maroon);
+    background: none;
+    border: none;
+    padding: 0;
+    text-decoration: underline;
+    cursor: pointer;
+  }
 
   /* ---- preview: a miniature of the widget, sizes and colours from its stylesheet ---- */
   .pv-stage {
@@ -306,8 +348,8 @@
 
 <h1>Chatbot settings editor</h1>
 
-<p class="lede">Pick the colour, font and starter questions here, then download the
-finished settings file. Nothing changes until you upload that file - the last step is
+<p class="lede">Pick the colour, font and starter questions here. Sign in and Save to put
+them on the live widget - or download the finished settings file and upload it through
 the same <code>WidgetThemeUpload</code> link as always.</p>
 
 <p class="status" id="load-status">Loading your current settings&hellip;</p>
@@ -401,12 +443,46 @@ the same <code>WidgetThemeUpload</code> link as always.</p>
   </fieldset>
 
   <div class="actions">
+    <button type="button" id="save" hidden>Sign in to save</button>
     <button type="button" id="download">Download theme.json</button>
-    <p class="hint">The file saves as <code>theme.json</code>, ready to upload. Open the
+    <p class="hint" id="save-status" role="status" hidden></p>
+    <p class="hint">Save puts your settings on the live widget within about a minute.
+    Or download: the file saves as <code>theme.json</code>, ready to upload. Open the
     <code>WidgetThemeUpload</code> link in the CloudFormation Outputs tab and upload it at
     the top level, next to <code>widget.js</code>. <a href="theme-guide.html">The
     guide</a> walks through that step.</p>
   </div>
+
+  <fieldset class="field" id="account" hidden>
+    <legend>Your account</legend>
+    <p class="hint">Signed in as <strong id="account-email">&hellip;</strong>.
+      <button type="button" class="linklike" id="sign-out">Sign out</button></p>
+
+    <div class="account-block">
+      <h2>Change password</h2>
+      <input type="password" id="pw-current" autocomplete="current-password"
+             aria-label="Current password" placeholder="Current password">
+      <input type="password" id="pw-new" autocomplete="new-password"
+             aria-label="New password" placeholder="New password">
+      <button type="button" class="minor" id="pw-change">Change password</button>
+      <p class="hint" id="pw-status" role="status" hidden></p>
+    </div>
+
+    <div class="account-block">
+      <h2>Change email</h2>
+      <p class="hint">A confirmation code goes to the new address, and your sign-in keeps
+      using the old one until you enter the code below.</p>
+      <input type="text" id="email-new" autocomplete="email"
+             aria-label="New email address" placeholder="New email address">
+      <button type="button" class="minor" id="email-change">Send confirmation code</button>
+      <div id="email-verify" hidden>
+        <input type="text" id="email-code" inputmode="numeric" autocomplete="one-time-code"
+               aria-label="Confirmation code" placeholder="Confirmation code">
+        <button type="button" class="minor" id="email-confirm">Confirm new email</button>
+      </div>
+      <p class="hint" id="email-status" role="status" hidden></p>
+    </div>
+  </fieldset>
 
 </form>
 
@@ -492,6 +568,20 @@ the same <code>WidgetThemeUpload</code> link as always.</p>
       "¿Qué bases de datos de investigación hay?"
     ]
   }
+}
+</script>
+
+<!-- Deploy-stamped save + sign-in configuration. The stack substitutes the four markers
+     with the PUT endpoint, the managed-login base URL, the app client id and the regional
+     cognito-idp endpoint during deployment. In the committed file they are bare markers,
+     which the script detects and treats as "this copy cannot save" - Save and the account
+     panel stay hidden and the page is the download-only editor it always was. -->
+<script type="application/json" id="save-config">
+{
+  "saveUrl": "__THEME_SAVE_URL__",
+  "authBase": "__THEME_AUTH_BASE__",
+  "clientId": "__THEME_CLIENT_ID__",
+  "cognitoIdp": "__THEME_COGNITO_IDP__"
 }
 </script>
 
@@ -638,6 +728,19 @@ the same <code>WidgetThemeUpload</code> link as always.</p>
       file.starterQuestions = questions;
     }
     return JSON.stringify(file, null, 2) + "\n";
+  }
+
+  // ---- sign-in plumbing (managed login does the real work; this page only redirects) --
+
+  // The ONE sessionStorage key this page ever touches: the in-flight PKCE verifier and
+  // state, written when the sign-in redirect leaves and removed the moment it returns.
+  // Nothing else is stored anywhere - tokens live in variables and die with the tab.
+  var OAUTH_STORAGE_KEY = "gavtheme-oauth";
+
+  function b64url(bytes) {
+    var s = "";
+    for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+    return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   }
 
   // ---- preview copy (cosmetic only - the widget's own STRINGS stay authoritative) -----
@@ -843,10 +946,12 @@ the same <code>WidgetThemeUpload</code> link as always.</p>
         picker.value = hex;
         colourError.hidden = true;
         downloadBtn.disabled = false;
+        saveBtn.disabled = false;
         renderPreview();
       } else {
         colourError.hidden = false;
         downloadBtn.disabled = true;
+        saveBtn.disabled = true;
       }
     }
 
@@ -855,6 +960,7 @@ the same <code>WidgetThemeUpload</code> link as always.</p>
       hexInput.value = picker.value;
       colourError.hidden = true;
       downloadBtn.disabled = false;
+      saveBtn.disabled = false;
       renderPreview();
     }
 
@@ -869,6 +975,304 @@ the same <code>WidgetThemeUpload</code> link as always.</p>
       a.click();
       document.body.removeChild(a);
       setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+    }
+
+    // ---- Save + account panel (deploy-stamped pages only) -------------------------
+    //
+    // Unsigned, this whole section is one visible button reading "Sign in to save";
+    // everything else about the page is the download-only editor. Sign-in, the forced
+    // first-password change and forgot-password are all Cognito managed login's own
+    // hosted pages - this code only redirects out (authorization code + PKCE) and
+    // exchanges the code it comes back with.
+    var saveBtn = document.getElementById("save");
+    var saveStatus = document.getElementById("save-status");
+    var accountPanel = document.getElementById("account");
+    var accountEmail = document.getElementById("account-email");
+
+    var saveCfg = null;
+    try {
+      var rawCfg = JSON.parse(document.getElementById("save-config").textContent);
+      var stampedOk = ["saveUrl", "authBase", "clientId", "cognitoIdp"].every(function (k) {
+        // An unstamped copy still carries the bare __...__ markers; treat it as unable
+        // to save rather than letting Save point at a placeholder.
+        return typeof rawCfg[k] === "string" && rawCfg[k] && !/^__[A-Z_]+__$/.test(rawCfg[k]);
+      });
+      if (stampedOk) saveCfg = rawCfg;
+    } catch (e) {
+      saveCfg = null;
+    }
+
+    // The session: variables only, gone on reload. Expiry is tracked because an expired
+    // token's rejection is unreadable cross-origin (the authorizer's 401 carries no CORS
+    // headers), so the page must refuse to send a doomed request rather than inspect
+    // the failure afterwards.
+    var accessToken = null;
+    var tokenExpiresAt = 0;
+
+    function signedIn() {
+      return !!accessToken && Date.now() < tokenExpiresAt;
+    }
+
+    function pageUrl() {
+      return location.origin + location.pathname;
+    }
+
+    function setSaveStatus(message) {
+      saveStatus.hidden = !message;
+      saveStatus.textContent = message || "";
+    }
+
+    function renderAuthState() {
+      if (!saveCfg) return;
+      saveBtn.hidden = false;
+      saveBtn.textContent = signedIn() ? "Save to the live widget" : "Sign in to save";
+      accountPanel.hidden = !signedIn();
+    }
+
+    // One unsigned fetch per user-scoped Cognito call (GetUser, ChangePassword,
+    // UpdateUserAttributes, VerifyUserAttribute) - same dependency-free shape as the
+    // widget's own sign-in call, authorized by the access token in the body.
+    function idpCall(target, payload) {
+      return fetch(saveCfg.cognitoIdp, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-amz-json-1.1",
+          "X-Amz-Target": "AWSCognitoIdentityProviderService." + target
+        },
+        body: JSON.stringify(payload)
+      }).then(function (res) {
+        return res.json().catch(function () { return {}; }).then(function (data) {
+          if (res.ok) return data;
+          var err = new Error(data.message || data.Message || "The request failed.");
+          err.code = data.__type || "";
+          throw err;
+        });
+      });
+    }
+
+    function beginSignIn() {
+      var verifierBytes = new Uint8Array(32);
+      crypto.getRandomValues(verifierBytes);
+      var verifier = b64url(verifierBytes);
+      var stateBytes = new Uint8Array(16);
+      crypto.getRandomValues(stateBytes);
+      var state = b64url(stateBytes);
+      crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)).then(
+        function (digest) {
+          var challenge = b64url(new Uint8Array(digest));
+          sessionStorage.setItem(
+            OAUTH_STORAGE_KEY, JSON.stringify({ verifier: verifier, state: state })
+          );
+          location.assign(
+            saveCfg.authBase + "/oauth2/authorize" +
+            "?client_id=" + encodeURIComponent(saveCfg.clientId) +
+            "&response_type=code" +
+            "&scope=" + encodeURIComponent("openid email aws.cognito.signin.user.admin") +
+            "&redirect_uri=" + encodeURIComponent(pageUrl()) +
+            "&state=" + encodeURIComponent(state) +
+            "&code_challenge_method=S256" +
+            "&code_challenge=" + encodeURIComponent(challenge)
+          );
+        }
+      );
+    }
+
+    function loadAccountEmail() {
+      idpCall("GetUser", { AccessToken: accessToken }).then(function (user) {
+        var attrs = user.UserAttributes || [];
+        for (var i = 0; i < attrs.length; i++) {
+          if (attrs[i].Name === "email") accountEmail.textContent = attrs[i].Value;
+        }
+      }).catch(function () {});
+    }
+
+    // The return leg of the redirect: verify the state echo against the stored
+    // handshake, clean the address bar, exchange the code for tokens. The refresh
+    // token in the response is dropped unread.
+    function finishSignIn() {
+      var params = new URLSearchParams(location.search);
+      var code = params.get("code");
+      if (!code) {
+        if (params.get("error")) {
+          setSaveStatus("Sign-in did not complete. You can try again.");
+          history.replaceState(null, "", pageUrl());
+        }
+        return;
+      }
+      var handshake = null;
+      try {
+        handshake = JSON.parse(sessionStorage.getItem(OAUTH_STORAGE_KEY));
+      } catch (e) { handshake = null; }
+      sessionStorage.removeItem(OAUTH_STORAGE_KEY);
+      var state = params.get("state");
+      history.replaceState(null, "", pageUrl());
+      if (!handshake || !handshake.verifier || handshake.state !== state) {
+        setSaveStatus("Sign-in did not complete. You can try again.");
+        return;
+      }
+      fetch(saveCfg.authBase + "/oauth2/token", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body:
+          "grant_type=authorization_code" +
+          "&client_id=" + encodeURIComponent(saveCfg.clientId) +
+          "&code=" + encodeURIComponent(code) +
+          "&redirect_uri=" + encodeURIComponent(pageUrl()) +
+          "&code_verifier=" + encodeURIComponent(handshake.verifier)
+      })
+        .then(function (res) { return res.json(); })
+        .then(function (data) {
+          if (!data || typeof data.access_token !== "string") {
+            throw new Error("no token in the exchange response");
+          }
+          accessToken = data.access_token;
+          var ttl = typeof data.expires_in === "number" ? data.expires_in : 3600;
+          // A minute early, so a token that would die mid-flight counts as expired.
+          tokenExpiresAt = Date.now() + Math.max(0, ttl - 60) * 1000;
+          setSaveStatus("");
+          renderAuthState();
+          loadAccountEmail();
+        })
+        .catch(function () {
+          setSaveStatus("Sign-in did not complete. You can try again.");
+          renderAuthState();
+        });
+    }
+
+    function save() {
+      if (!signedIn()) {
+        // Covers both "never signed in" and "session expired while the tab sat open":
+        // managed login round-trips and the page comes back signed in.
+        beginSignIn();
+        return;
+      }
+      saveBtn.disabled = true;
+      setSaveStatus("Saving…");
+      fetch(saveCfg.saveUrl, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": "Bearer " + accessToken
+        },
+        // Exactly the bytes the Download button would produce - one serialisation,
+        // whichever way the file leaves the page. The server revalidates and rewrites
+        // the same canonical form regardless.
+        body: buildFileText(formState(), readme)
+      })
+        .then(function (res) {
+          return res.json().catch(function () { return {}; }).then(function (data) {
+            if (res.ok) {
+              setSaveStatus("Saved. The live widget picks this up within about a minute.");
+            } else {
+              setSaveStatus(
+                (data && data.error) ||
+                "The settings could not be saved (HTTP " + res.status + ")."
+              );
+            }
+          });
+        })
+        .catch(function () {
+          setSaveStatus("Could not reach the server. Check your connection and try again.");
+        })
+        .then(function () {
+          saveBtn.disabled = downloadBtn.disabled;
+          renderAuthState();
+        });
+    }
+
+    function signOut() {
+      accessToken = null;
+      tokenExpiresAt = 0;
+      // Managed login's own sign-out, so the hosted session dies too; it lands back on
+      // this page (the registered logout URL).
+      location.assign(
+        saveCfg.authBase + "/logout" +
+        "?client_id=" + encodeURIComponent(saveCfg.clientId) +
+        "&logout_uri=" + encodeURIComponent(pageUrl())
+      );
+    }
+
+    function initAccountPanel() {
+      var pwCurrent = document.getElementById("pw-current");
+      var pwNew = document.getElementById("pw-new");
+      var pwStatus = document.getElementById("pw-status");
+      var emailNew = document.getElementById("email-new");
+      var emailVerify = document.getElementById("email-verify");
+      var emailCode = document.getElementById("email-code");
+      var emailStatus = document.getElementById("email-status");
+
+      function setStatus(node, message) {
+        node.hidden = !message;
+        node.textContent = message || "";
+      }
+
+      document.getElementById("sign-out").addEventListener("click", signOut);
+
+      document.getElementById("pw-change").addEventListener("click", function () {
+        if (!signedIn()) { renderAuthState(); return; }
+        if (!pwCurrent.value || !pwNew.value) {
+          setStatus(pwStatus, "Enter your current password and the new one.");
+          return;
+        }
+        setStatus(pwStatus, "Changing…");
+        idpCall("ChangePassword", {
+          AccessToken: accessToken,
+          PreviousPassword: pwCurrent.value,
+          ProposedPassword: pwNew.value
+        }).then(function () {
+          pwCurrent.value = "";
+          pwNew.value = "";
+          setStatus(pwStatus, "Password changed.");
+        }).catch(function (err) {
+          setStatus(pwStatus, err.message || "The password could not be changed.");
+        });
+      });
+
+      document.getElementById("email-change").addEventListener("click", function () {
+        if (!signedIn()) { renderAuthState(); return; }
+        var address = emailNew.value.trim();
+        if (!address) {
+          setStatus(emailStatus, "Enter the new email address first.");
+          return;
+        }
+        setStatus(emailStatus, "Sending the confirmation code…");
+        idpCall("UpdateUserAttributes", {
+          AccessToken: accessToken,
+          UserAttributes: [{ Name: "email", Value: address }]
+        }).then(function () {
+          emailVerify.hidden = false;
+          setStatus(
+            emailStatus,
+            "A confirmation code was sent to the new address. Enter it below - until " +
+            "then you keep signing in with the old one."
+          );
+        }).catch(function (err) {
+          setStatus(emailStatus, err.message || "The email could not be changed.");
+        });
+      });
+
+      document.getElementById("email-confirm").addEventListener("click", function () {
+        if (!signedIn()) { renderAuthState(); return; }
+        var code = emailCode.value.trim();
+        if (!code) {
+          setStatus(emailStatus, "Enter the confirmation code from the email.");
+          return;
+        }
+        setStatus(emailStatus, "Confirming…");
+        idpCall("VerifyUserAttribute", {
+          AccessToken: accessToken,
+          AttributeName: "email",
+          Code: code
+        }).then(function () {
+          emailVerify.hidden = true;
+          emailNew.value = "";
+          emailCode.value = "";
+          setStatus(emailStatus, "Email updated. Use the new address next time you sign in.");
+          loadAccountEmail();
+        }).catch(function (err) {
+          setStatus(emailStatus, err.message || "The code was not accepted.");
+        });
+      });
     }
 
     // Seed from the LIVE theme so the form edits what is actually deployed: the
@@ -910,13 +1314,25 @@ the same <code>WidgetThemeUpload</code> link as always.</p>
     hexInput.addEventListener("input", onHexTyped);
     function onFormEdited(event) {
       if (event.target === picker || event.target === hexInput) return;
+      // The account panel's fields are not theme settings; a keystroke there is not a
+      // preview change.
+      if (accountPanel.contains(event.target)) return;
       renderPreview();
     }
     // Both events: text fields repaint per keystroke via "input"; "change" covers radio
     // selection in engines that fire no "input" for radios.
     form.addEventListener("input", onFormEdited);
     form.addEventListener("change", onFormEdited);
+    // The form is buttons-only, but Enter in a text field can still trigger an implicit
+    // submission in some engines, which would reload the page and drop the session.
+    form.addEventListener("submit", function (event) { event.preventDefault(); });
     downloadBtn.addEventListener("click", download);
+    if (saveCfg) {
+      saveBtn.addEventListener("click", save);
+      initAccountPanel();
+      renderAuthState();
+      finishSignIn();
+    }
     document.getElementById("pv-lang-en").addEventListener("click", function () {
       pvLang = "en";
       renderPreview();

@@ -137,7 +137,7 @@ The demo link is unauthenticated Bedrock spend, so `POST /query` sits behind a C
 - **The account is created by CLI, and needs the deployer's own AWS credentials.** `cdk deploy` prints both commands (`DemoAuthCreateUserCommand`, `DemoAuthSetPasswordCommand`), spelled with the real username so they run as printed. `--permanent` on the second is REQUIRED or sign-in returns a `NEW_PASSWORD_REQUIRED` challenge instead of a token. No credential is ever in the repo, in CDK, or in a CloudFormation parameter - the username is a name, the password is chosen at step 2.
 - **CORS `allowHeaders` must include `Authorization`.** The widget sets that header from JS, which makes every `/query` preflighted; without it the request dies at the OPTIONS and the symptom is a CORS error, not a 401.
 - **The widget stores NOTHING**: token in a JS variable, no browser storage, no cookie, refresh token dropped unread. Reload means signing in again, by design.
-- **Removing it** is: the auth section in `infra_stack.py`, the `Authorization` entry in `allow_headers`, `authorizer=` on the `/query` route, the four `DemoAuth*` outputs, the two `data-*` attributes on the embed tag and in `demo-site.html` (+ their placeholders), and everything in `widget.js` and the contract test marked TEMPORARY.
+- **Removing it** is: the auth section in `infra_stack.py`, `authorizer=` on the `/query` route, the four `DemoAuth*` outputs, the two `data-*` attributes on the embed tag and in `demo-site.html` (+ their placeholders), and everything in `widget.js` and the contract test marked TEMPORARY. The `Authorization` entry in `allow_headers` now STAYS at go-live: the theme editor's `PUT /theme` (a permanent, separately-gated route) sends that header too, and losing it kills theme saves at the preflight.
 
 ## Widget theme file (`theme.json`)
 
@@ -167,9 +167,11 @@ widget bucket root; the page is its own source of copy, edited in place.
   nothing under a prefix - with only that entry, `defaults/theme.json` is deleted on every
   deploy (measured against aws-cli 2.35.11, not assumed). Pinned by
   `test_the_theme_file_is_outside_the_prune_scope`.
-- **The flow is console-only: four clickable outputs, no CLI, no rename.**
+- **The no-sign-in flow stays console-only: four clickable outputs, no rename.** (A
+  signed-in librarian can skip it entirely - the editor's Save writes the live file, see
+  the save bullets below; the one CLI step anywhere is creating their account.)
   `WidgetThemeGuide` is the hosted guide page ("Start here"), `WidgetThemeEditor` is the
-  hosted settings-editor page (a form that downloads a finished `theme.json` - see below),
+  hosted settings-editor page (a form that saves, or downloads, a finished `theme.json`),
   `WidgetThemeDownload` is `https://<widget CDN>/defaults/theme.json` and
   `WidgetThemeUpload` is the `https://` S3-console deep link to the widget bucket's object
   list. All are `https://` so the CloudFormation Outputs tab renders them as links: the
@@ -197,16 +199,53 @@ widget bucket root; the page is its own source of copy, edited in place.
   must never move under `defaults/`, whose deployment-wide attachment header would
   download it instead of rendering it. Linked by the `WidgetThemeGuide` output.
 - **`theme-editor.html` is the hosted settings editor**, a second self-contained page at
-  the bucket root (a THIRD source of the widget deployment, same prune argument, same
-  never-under-`defaults/` rule), linked by the `WidgetThemeEditor` output. A form with a
+  the bucket root, linked by the `WidgetThemeEditor` output. A form with a
   colour picker, font choices, question fields and a live widget miniature; it seeds from
   the DEPLOYED root `theme.json` (falling back to `defaults/theme.json`, then built-ins)
   so the customer edits their live theme, and its Download button builds a `theme.json`
-  in the repo's pinned serialisation, `_readme` included. Download only - no write API,
-  no auth; upload stays the `WidgetThemeUpload` console link. Scripts are allowed on THIS
-  page (unlike the guide) but no innerHTML, no storage, no absolute URLs. It duplicates
-  the widget's validation rules and the defaults file BY DESIGN, and the contract suite
-  pins every copy against widget.js and `defaults/theme.json` so none can drift silently.
+  in the repo's pinned serialisation, `_readme` included. It ships as the THIRD source of
+  the widget deployment (same prune argument, same never-under-`defaults/` rule) but via
+  `Source.data`, DEPLOY-STAMPED like the demo page: four placeholders
+  (`__THEME_SAVE_URL__`, `__THEME_AUTH_BASE__`, `__THEME_CLIENT_ID__`,
+  `__THEME_COGNITO_IDP__`) resolve to the save endpoint and sign-in config at deploy, a
+  missing one fails synth, and the committed file still carries no absolute URL. Scripts
+  are allowed on THIS page (unlike the guide) but no innerHTML and nothing persistent:
+  sessionStorage holds exactly ONE key (`gavtheme-oauth`, the in-flight PKCE handshake,
+  removed on return), tokens live in JS variables, and the refresh token is dropped
+  unread. It duplicates the widget's validation rules and the defaults file BY DESIGN,
+  and the contract suite pins every copy against widget.js and `defaults/theme.json` so
+  none can drift silently (the save Lambda's Python copy is pinned by
+  `test_theme_handler.py`).
+- **Save is gated by a SECOND, PERMANENT Cognito pool** (`gavilan-library-theme-admin` -
+  NOT the temporary demo pool, which is untouched and still deleted at go-live). Signed
+  in, the editor's Save PUTs the built file to `PUT /theme` on the shared HTTP API,
+  behind its own native JWT authorizer (audience = client id, the same access-token
+  quirk as the demo gate); a small dedicated Lambda (`app/theme_handler.py`) revalidates
+  against the widget's rules (allowlisted keys, hex pattern, font keywords, 4/120 caps -
+  violations are a 400, not a soft drop), rewrites the file in the pinned serialisation,
+  writes the ONE object its IAM allows (`theme.json` at the widget bucket root) and
+  invalidates `/theme.json`. Unsigned, Save reads "Sign in to save" and the page is the
+  download-only editor; unstamped (repo copy), Save stays hidden entirely.
+- **The account lifecycle is self-service; one CLI command total.** The pool signs in by
+  EMAIL (immutable choice), self sign-up off, strong password policy, recovery by
+  verified email at priority 1, email changes verified before they apply
+  (`keep_original`), and a 90-day temporary-password validity instead of the 7-day
+  default. Sign-in, the forced first-password change and forgot-password are Cognito
+  MANAGED LOGIN's hosted pages (v2 + `CfnManagedLoginBranding`, domain prefix
+  `gavilan-theme-<account id>`; the editor page only redirects, authorization code +
+  PKCE - no implicit grant, tokens in URL fragments land in browser history). Change
+  password / change email run as user-scoped cognito-idp calls from the page's account
+  panel with the librarian's own access token (scope `aws.cognito.signin.user.admin`).
+  Accounts are created by the `ThemeAdminCreateUserCommand` output: `admin-create-user`
+  with `PROJECT_EMAIL_HERE` substituted twice (the email IS the `--username` value),
+  `--desired-delivery-mediums EMAIL` (the default is SMS - omit it and the invitation
+  never arrives), `Name=email_verified,Value=true` (what makes self-service reset work),
+  and NO temporary password (Cognito generates one; the invitation template must carry
+  BOTH `{username}` and `{####}` or nothing is delivered). Another librarian = same
+  command with another address; a stale invitation = same command plus
+  `--message-action RESEND`. No user in CloudFormation and no admin email in
+  config.yaml: every `AWS::Cognito::UserPoolUser` property is replacement-on-update, so
+  a template-owned user could not change email without wiping the librarian's password.
 - **`content_disposition` applies to a WHOLE `BucketDeployment`**, which is why the download
   gets its own rather than riding along with `widget.js` - a `<script src>` that comes back as
   a file download is a broken widget. That second deployment shares the widget bucket, which
@@ -276,7 +315,7 @@ The email is PLAIN TEXT and the `Subject` is a CONSTANT - no user-supplied text 
 
 ## Repo layout
 
-- `infra/` - CDK Python app. Provisions the S3 Vectors store (`CfnVectorBucket` + `CfnIndex`), the KB role, `AWS::Bedrock::KnowledgeBase` (S3_VECTORS storage) + `AWS::Bedrock::DataSource` type S3, the KB source bucket, the scraper Lambda (+ deps layer, weekly schedule, one-click deploy Trigger), the dedicated catalog bucket, the query path (Lambda + own role, HTTP API with `POST /query` and `GET /warm`), the TEMPORARY demo access gate (Cognito user pool + public app client + a native JWT authorizer on `POST /query` only - see "Demo access gate"), and - when `feedback` is configured - the feedback path (SNS topic + email subscription + its own small Lambda/role/log group + `POST /feedback`). Also hosts the widget (private S3 + CloudFront OAC, `BucketDeployment` of `frontend/widget.js` only) in the SAME stack (OAC cross-stack cyclical dependency), the demo site (a SECOND private S3 + CloudFront OAC pair, see below), and defines the Bedrock guardrail (one `CfnGuardrail` + one `CfnGuardrailVersion`). Outputs a paste-ready embed tag + CloudFront domain + `/query` URL + `DemoSiteUrl`.
+- `infra/` - CDK Python app. Provisions the S3 Vectors store (`CfnVectorBucket` + `CfnIndex`), the KB role, `AWS::Bedrock::KnowledgeBase` (S3_VECTORS storage) + `AWS::Bedrock::DataSource` type S3, the KB source bucket, the scraper Lambda (+ deps layer, weekly schedule, one-click deploy Trigger), the dedicated catalog bucket, the query path (Lambda + own role, HTTP API with `POST /query` and `GET /warm`), the TEMPORARY demo access gate (Cognito user pool + public app client + a native JWT authorizer on `POST /query` only - see "Demo access gate"), the PERMANENT theme save path (a second Cognito pool with managed login + hosted domain + branding, its own JWT authorizer on `PUT /theme`, and the key-scoped theme-save Lambda - see "Widget theme file"), and - when `feedback` is configured - the feedback path (SNS topic + email subscription + its own small Lambda/role/log group + `POST /feedback`). Also hosts the widget (private S3 + CloudFront OAC, `BucketDeployment` of `frontend/widget.js` only) in the SAME stack (OAC cross-stack cyclical dependency), the demo site (a SECOND private S3 + CloudFront OAC pair, see below), and defines the Bedrock guardrail (one `CfnGuardrail` + one `CfnGuardrailVersion`). Outputs a paste-ready embed tag + CloudFront domain + `/query` URL + `DemoSiteUrl`.
   - `app.py` - CDK entrypoint; loads `config.yaml`, passes to stack
   - `infra/infra_stack.py` - the stack (`GavilanChatbotStack`)
   - `infra/config.py` - `load_config()`; resolves repo-root `config.yaml` from `__file__`. Also the synth-time validators: `resolve_cors_allow_origins()` (rejects `*`) and `resolve_feedback()` (three outcomes: off / on-with-a-destination / a malformed address, which raises)
@@ -286,6 +325,7 @@ The email is PLAIN TEXT and the `Subject` is a CONSTANT - no user-supplied text 
   - `data/database_catalog.json` - bundled seed catalog: the hand-authored not-held list + a fallback held list, merged with the S3 held list at read time.
   - `data/library_links.json` - bundled, hand-authored table of canonical Gavilan URLs, rendered into the Converse `system` payload by `_links_block()` (library home page, college site, online textbook collections, research guides, bookstore, campus maps, public safety, ILL, laptop record). Fully static: no scraper, no S3, no cache. Edit + redeploy to change.
   - `feedback_handler.py` - the feedback Lambda (`POST /feedback`), a SEPARATE function from the query handler and bundled alone: validate the five-field allowlist, render plain text, one `sns:Publish`. Its own role holds `sns:Publish` on the topic and nothing else, and it never imports `handler.py` (which would drag in the prompt, the seed catalog and the KB env vars it has no use for).
+  - `theme_handler.py` - the theme-save Lambda (`PUT /theme`, behind the theme-admin JWT authorizer), same bundled-alone shape: revalidate the theme against the widget's rules, rewrite it in the pinned serialisation, `s3:PutObject` the ONE key (`theme.json` at the widget bucket root - its IAM reaches nothing else) and soft-fail a CloudFront invalidation of `/theme.json`. Pinned against widget.js and `defaults/theme.json` by `tests/unit/test_theme_handler.py`.
   - `primo_search.py` - standalone CLI for exploring the Primo discovery API (dev tool; NOT imported by the handler and NOT in the `from_asset` bundle).
 - `scraper/` - scraper Lambda source. `scraper.py` (pure fetch/extract, incl. `extract_database_catalog` HTML parse, plus the tier helpers `all_seed_urls`/`urls_for_tier` shared by the Lambda and the CLI; `--tier` on the CLI) + `lambda_function.py` (gated S3 upload, gated KB ingestion, catalog regeneration: parse -> guard -> fingerprint gate -> Sonnet enrichment -> write to the catalog bucket). Own `.venv`/tests (needs trafilatura). `requirements-dev.txt` pins pytest to the same version as `infra/` and `eval/`; the tests need the runtime deps too, so install both files.
 - `eval/` - Bedrock RAG eval harness (boto3 tooling, NOT CDK). Runs on demand against deployed infra; cannot run offline. Retrieve-only formatter (chunking eval) + retrieve-and-generate formatter (answer quality, bring-your-own-inference). `capture_outputs.py` is a STUB until the bot is deployed. Separate `eval_config.yaml`.
@@ -294,7 +334,7 @@ The email is PLAIN TEXT and the `Subject` is a CONSTANT - no user-supplied text 
   - `widget.js` - the production widget (production-clean, no mock code); reads its endpoint from its `<script>` tag's `data-api-url`, POSTs a multi-turn `{messages: [...]}` array, renders `{answer, sources}`. **TEMPORARY sign-in gate:** when the tag also carries `data-user-pool-id` + `data-client-id` (region derived from the pool id's `<region>_` prefix), a sign-in form takes the composer's place until one unsigned `InitiateAuth` fetch returns a token, which then rides as `Authorization: Bearer` on every `/query`. Absent those two attributes the widget is byte-identical to the pre-gate one - the same opt-in-by-attribute shape as `data-usage-events` - and the gate does not depend on the widget either way, since API Gateway 401s an unauthenticated `/query` regardless. The ONLY file in the widget bucket. **Bilingual:** every user-visible string lives in the `STRINGS` table (keyed by language code, above the `END LOCALIZATION` banner); render code below that banner calls `t(key)` and holds no copy, which the contract suite enforces by scanning the file. The header carries a two-button English/Español toggle (real buttons, `aria-pressed`, group `aria-label`, visible focus ring - no ID-based ARIA, which cannot cross the shadow boundary), and switching sets `lang` on the host element AND the shadow root container. Each message is stamped with the language it was said in, so a switch relabels the chrome and NOT the transcript: past turns are never retranslated (that would cost a model call per message). The canned greeting + starter questions DO re-render on a switch, but only before the first message - they are the panel's opening state, not a turn anyone took. The language is session-only, deliberately: the widget stores nothing in the browser and a contract test pins that. The table covers the SCREEN-READER-ONLY text too (the per-turn speaker labels, the pending bubble's status region), because a label nobody can see is still read aloud - and because that text is invisible to any check that looks at the rendered page. Two things the toggle must NOT do, both of them accessibility fixes it would otherwise undo: the launcher takes no `aria-label` in any language (its visible text is its whole accessible name, WCAG 2.5.3), and re-seeding the opening state has to re-point the composer's `aria-describedby` at the NEW greeting bubble, or a switch leaves it aimed at a removed node.
   - `defaults/theme.json` - the downloadable copy of the runtime theme file, deployed to `defaults/theme.json` in the widget bucket by its OWN `BucketDeployment` (`prune=False`, prefix-scoped, `Content-Disposition: attachment`) and overwritten on every deploy. The contract suite tests it as code: every value in it equals a built-in default, it is byte-identical to its own canonical two space serialisation (so no reformat lands silently), and its `_readme` array has to document every key, every font keyword and both caps with no external URL.
   - `theme-guide.html`: the hosted customer guide, one self-contained page at the widget bucket root, shipped by the widget `BucketDeployment` as a second source. The page is its own source of copy; no scripts, no external anything; its links are the relative `defaults/theme.json` and `theme-editor.html`. Linked by the `WidgetThemeGuide` stack output.
-  - `theme-editor.html`: the hosted settings editor, a third source of the widget `BucketDeployment`, linked by the `WidgetThemeEditor` stack output. A self-contained form (scripts inline, nothing external, no innerHTML, no storage) that seeds from the live root `theme.json` and downloads a ready-to-upload replacement in the pinned serialisation. Its copies of the widget's validation rules and of the defaults file are pinned by the contract suite.
+  - `theme-editor.html`: the hosted settings editor, a third source of the widget `BucketDeployment` (via `Source.data`, deploy-stamped with the save endpoint + sign-in config), linked by the `WidgetThemeEditor` stack output. A self-contained form (scripts inline, nothing external, no innerHTML, nothing stored beyond the one-session PKCE handshake key) that seeds from the live root `theme.json`, saves it back through `PUT /theme` when a librarian is signed in via managed login, and downloads a ready-to-upload replacement in the pinned serialisation either way. Its copies of the widget's validation rules and of the defaults file are pinned by the contract suite.
   - `demo-site.html` - the shareable demo page, uploaded as `index.html` to the demo bucket. A Gavilan-Library-styled sample page (local CSS only, nothing hotlinked from gavilan.edu) carrying the SAME one-line embed a library page would, so it cannot fork or drift from the shipped widget. Two placeholders, `__WIDGET_SRC__` and `__API_URL__`, are stamped at DEPLOY time (`s3deploy.Source.data` resolves CDK tokens during deployment) - nothing in it is account- or region-specific. Renaming either placeholder fails synth.
   - `mock.js` (dev-only fetch stub) + `demo.html` (offline mock harness) + `demo-live.html` (local page against the deployed API, needs the `localhost:8000` CORS entry) + `test/widget.contract.test.js` (zero-dep Node tests) never ship; dependency direction is one-way (widget never references the mock).
 - `config.yaml` - declarative settings at repo root; `cost_model` (published AWS rates + the MEASURED per-question constants + the zero-traffic baseline inputs, stamped into the demo page at deploy; note `scrapes_per_month` and `reindexes_per_month` are SEPARATE numbers because change gating means most runs re-index nothing), embedding model, `vector_store` (S3 Vectors names, data_type, distance_metric, non-filterable keys), `scraper.tiers` (per-tier schedule + URLs; the only declaration of cadence and tier membership) + `kb_exclude_urls`, `chunking`, `retrieval.number_of_results`, `generation.model_id`, `catalog` (enrichment model, S3 key, guard threshold, cache TTL), `primo` (the live-catalog knobs `timeout_seconds`, `number_of_results`, `availability_budget_seconds`, wired as `PRIMO_*` env; `search_course_reserves` reuses the same knobs), `library_links.data_file` (the bundled link-table filename; the stack feeds the SAME value to the Lambda asset include and the `LIBRARY_LINKS_FILE` env so they cannot drift), `cors.allow_origins` (the HTTP API browser allowlist), `demo_site.enabled` (the shareable demo page; when on, the stack appends the demo distribution's origin to the CORS allowlist as a deploy-time token), `feedback` (`enabled`, `notify_email`, `max_comment_chars`, `max_body_bytes`, `max_sources`; the three caps reach the feedback Lambda as `FEEDBACK_*` env vars, and `notify_email` never does - it becomes the SNS subscription), `guardrail` (`name`, the one-entry `content_filters` list, `blocked_input_messaging` - there is no output guardrail and no PII entity list). CDK reads it at synth via `infra/config.py`. Edit values here, do not hardcode in the stack.

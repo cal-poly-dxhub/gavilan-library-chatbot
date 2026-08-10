@@ -23,9 +23,11 @@ every install generates its own bucket and CDN names, so there is nothing here t
 hand and no name to match by eye.
 
 If you would rather not edit JSON at all, the `WidgetThemeEditor` output opens a hosted
-form (colour picker, font choices, question fields, live preview) that downloads the
-finished `theme.json` for you - it replaces steps 1 and 2 below, and the upload step is
-the same either way.
+form (colour picker, font choices, question fields, live preview). Signed in - your
+sign-in was set up at handover, and the page's Sign in button handles passwords and
+resets - its **Save** button puts the settings on the live widget directly, no upload
+step at all. Without signing in it still downloads the finished `theme.json` for you,
+replacing steps 1 and 2 below with the upload step the same as ever.
 
 Open **CloudFormation** → the **GavilanChatbotStack** stack → the **Outputs** tab. Two rows
 matter, and they are steps 1 and 2:
@@ -182,3 +184,13 @@ against `#ffffff` and `#f1f3f6` before it goes live.
   validation rules and the defaults file; the `theme-editor.html` block of the contract
   suite pins every copy against `widget.js` and `defaults/theme.json`, so a rule change
   in the widget fails tests until the editor matches.
+- The editor's **Save** goes through `PUT /theme` on the stack's HTTP API, gated by the
+  permanent theme-admin Cognito pool (email sign-in, managed login hosts every password
+  flow) and served by `app/theme_handler.py`, whose IAM reaches exactly one object: the
+  root `theme.json`. Librarian accounts are created with the printed
+  `ThemeAdminCreateUserCommand` output (one `admin-create-user`, invitation by email);
+  everything after that - first password, resets, change password, change email - is
+  self-service from the editor page. The editor page itself is deploy-stamped
+  (`Source.data`) with the save endpoint and sign-in configuration; the committed file
+  carries four `__THEME_*__` placeholders and no URLs. Details and the full rationale
+  live in CLAUDE.md's "Widget theme file" section.
