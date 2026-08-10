@@ -27,7 +27,9 @@ form (colour picker, font choices, question fields, live preview). Signed in - y
 sign-in was set up at handover, and the page's Sign in button handles passwords and
 resets - its **Save** button puts the settings on the live widget directly, no upload
 step at all. Without signing in it still downloads the finished `theme.json` for you,
-replacing steps 1 and 2 below with the upload step the same as ever.
+replacing steps 1 and 2 below with the upload step the same as ever. The download lives
+in that page's **Settings** panel (top right), along with a **Choose defaults** action
+that refills the form with the shipped settings.
 
 Open **CloudFormation** → the **GavilanChatbotStack** stack → the **Outputs** tab. Two rows
 matter, and they are steps 1 and 2:
@@ -184,6 +186,12 @@ against `#ffffff` and `#f1f3f6` before it goes live.
   validation rules and the defaults file; the `theme-editor.html` block of the contract
   suite pins every copy against `widget.js` and `defaults/theme.json`, so a rule change
   in the widget fails tests until the editor matches.
+- Its main view is only the fields, the preview and Save. The download, the
+  "Choose defaults" refill and the account controls sit in a native `<dialog>` behind the
+  Settings control, which is also what supplies Escape-to-close and the focus return. The
+  contract suite pins that split: the deleted upload copy stays deleted, those controls
+  exist exactly once and only inside the panel, and an unsigned download is still
+  `defaults/theme.json` byte for byte.
 - The editor's **Save** goes through `PUT /theme` on the stack's HTTP API, gated by the
   permanent theme-admin Cognito pool (email sign-in, managed login hosts every password
   flow) and served by `app/theme_handler.py`, whose IAM reaches exactly one object: the

@@ -7,6 +7,13 @@
   theme-admin Cognito pool), and the Download button still builds the same file for the
   WidgetThemeUpload console route - which also remains the whole page for anyone unsigned.
 
+  The main view is the fields, the preview and Save, and nothing else: once Save writes
+  the live file, the console upload is a fallback rather than the workflow, so it stopped
+  earning room on the page. It, the refill-from-defaults action and the account controls
+  live in the settings panel below - a native <dialog>, so Escape closes it and focus
+  goes back to the control that opened it. The download MOVES there and never goes away:
+  an unsigned visitor has no other route to a theme.json.
+
   Self-contained like the guide page: no external fonts, libraries or stylesheets, and no
   absolute URLs in the committed file. The save endpoint and the sign-in configuration are
   DEPLOY-STAMPED into the save-config JSON block below (the same substitution mechanism as
@@ -63,6 +70,16 @@
     font-size: 1.15rem;
     margin: 0 0 0.25rem;
   }
+  h3 { font-size: 1rem; margin: 0 0 0.25rem; }
+  h4 { font-size: 0.95rem; margin: 0 0 0.25rem; }
+  .page-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin: 0 0 0.5rem;
+  }
+  .page-head h1 { margin: 0; }
   p { margin: 0.5rem 0; }
   a { color: var(--maroon); }
   a:focus-visible, button:focus-visible, input:focus-visible {
@@ -158,11 +175,34 @@
     padding: 0.7rem 1.4rem;
     cursor: pointer;
   }
-  #save { margin-right: 0.6rem; }
   #download:hover:not(:disabled), #save:hover:not(:disabled) { filter: brightness(1.07); }
   #download:disabled, #save:disabled { opacity: 0.5; cursor: default; }
 
-  /* ---- account panel (hidden until the deploy-stamped page has a signed-in session) -- */
+  /* ---- the settings panel: everything past the everyday form ------------------------ */
+  dialog {
+    width: calc(100% - 2rem);
+    max-width: 34rem;
+    color: var(--text);
+    background: #ffffff;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 1.25rem 1.5rem 1.75rem;
+  }
+  dialog::backdrop { background: rgba(26, 29, 33, 0.5); }
+  .panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+  .panel-head h2 { margin: 0; }
+  .panel-group {
+    margin: 1.25rem 0 0;
+    padding: 1.25rem 0 0;
+    border-top: 1px solid var(--line);
+  }
+
+  /* ---- account controls (hidden until the deploy-stamped page has a signed-in session) */
   .account-block { margin: 1rem 0 0; }
   .account-block input {
     display: block;
@@ -346,11 +386,13 @@
 </head>
 <body>
 
-<h1>Chatbot settings editor</h1>
+<div class="page-head">
+  <h1>Chatbot settings editor</h1>
+  <button type="button" class="minor" id="settings-open" aria-haspopup="dialog"
+          aria-expanded="false" aria-controls="settings-panel">Settings</button>
+</div>
 
-<p class="lede">Pick the colour, font and starter questions here. Sign in and Save to put
-them on the live widget - or download the finished settings file and upload it through
-the same <code>WidgetThemeUpload</code> link as always.</p>
+<p class="lede">Pick the colour, font and starter questions here.</p>
 
 <p class="status" id="load-status">Loading your current settings&hellip;</p>
 
@@ -444,45 +486,8 @@ the same <code>WidgetThemeUpload</code> link as always.</p>
 
   <div class="actions">
     <button type="button" id="save" hidden>Sign in to save</button>
-    <button type="button" id="download">Download theme.json</button>
     <p class="hint" id="save-status" role="status" hidden></p>
-    <p class="hint">Save puts your settings on the live widget within about a minute.
-    Or download: the file saves as <code>theme.json</code>, ready to upload. Open the
-    <code>WidgetThemeUpload</code> link in the CloudFormation Outputs tab and upload it at
-    the top level, next to <code>widget.js</code>. <a href="theme-guide.html">The
-    guide</a> walks through that step.</p>
   </div>
-
-  <fieldset class="field" id="account" hidden>
-    <legend>Your account</legend>
-    <p class="hint">Signed in as <strong id="account-email">&hellip;</strong>.
-      <button type="button" class="linklike" id="sign-out">Sign out</button></p>
-
-    <div class="account-block">
-      <h2>Change password</h2>
-      <input type="password" id="pw-current" autocomplete="current-password"
-             aria-label="Current password" placeholder="Current password">
-      <input type="password" id="pw-new" autocomplete="new-password"
-             aria-label="New password" placeholder="New password">
-      <button type="button" class="minor" id="pw-change">Change password</button>
-      <p class="hint" id="pw-status" role="status" hidden></p>
-    </div>
-
-    <div class="account-block">
-      <h2>Change email</h2>
-      <p class="hint">A confirmation code goes to the new address, and your sign-in keeps
-      using the old one until you enter the code below.</p>
-      <input type="text" id="email-new" autocomplete="email"
-             aria-label="New email address" placeholder="New email address">
-      <button type="button" class="minor" id="email-change">Send confirmation code</button>
-      <div id="email-verify" hidden>
-        <input type="text" id="email-code" inputmode="numeric" autocomplete="one-time-code"
-               aria-label="Confirmation code" placeholder="Confirmation code">
-        <button type="button" class="minor" id="email-confirm">Confirm new email</button>
-      </div>
-      <p class="hint" id="email-status" role="status" hidden></p>
-    </div>
-  </fieldset>
 
 </form>
 
@@ -520,6 +525,65 @@ the same <code>WidgetThemeUpload</code> link as always.</p>
   </div>
 </aside>
 </div>
+
+<!-- The settings panel. One control opens it, Escape or Close closes it, and the three
+     groups are the only route to anything that is not an everyday edit. The account group
+     stays hidden until a signed-in session exists, so an unsigned visitor's panel is the
+     refill and the download. -->
+<dialog id="settings-panel" aria-labelledby="settings-panel-title">
+  <div class="panel-head">
+    <h2 id="settings-panel-title">Settings</h2>
+    <button type="button" class="minor" id="settings-close">Close</button>
+  </div>
+
+  <section class="panel-group">
+    <h3>Choose defaults</h3>
+    <p class="hint">Refills the form with the settings the chatbot shipped with. Nothing
+    reaches the live widget until you save.</p>
+    <button type="button" class="minor" id="use-defaults">Choose defaults</button>
+  </section>
+
+  <section class="panel-group">
+    <h3>Download</h3>
+    <button type="button" id="download">Download theme.json</button>
+    <p class="hint">Saves the settings as <code>theme.json</code> if you would rather
+    upload the file yourself. Open the <code>WidgetThemeUpload</code> link in the
+    CloudFormation Outputs tab and put it at the top level, next to
+    <code>widget.js</code> - <a href="theme-guide.html">the guide</a> walks through
+    it.</p>
+  </section>
+
+  <section class="panel-group" id="account" hidden>
+    <h3>Your account</h3>
+    <p class="hint">Signed in as <strong id="account-email">&hellip;</strong>.
+      <button type="button" class="linklike" id="sign-out">Sign out</button></p>
+
+    <div class="account-block">
+      <h4>Change password</h4>
+      <input type="password" id="pw-current" autocomplete="current-password"
+             aria-label="Current password" placeholder="Current password">
+      <input type="password" id="pw-new" autocomplete="new-password"
+             aria-label="New password" placeholder="New password">
+      <button type="button" class="minor" id="pw-change">Change password</button>
+      <p class="hint" id="pw-status" role="status" hidden></p>
+    </div>
+
+    <div class="account-block">
+      <h4>Change email</h4>
+      <p class="hint">A confirmation code goes to the new address, and your sign-in keeps
+      using the old one until you enter the code below.</p>
+      <input type="text" id="email-new" autocomplete="email"
+             aria-label="New email address" placeholder="New email address">
+      <button type="button" class="minor" id="email-change">Send confirmation code</button>
+      <div id="email-verify" hidden>
+        <input type="text" id="email-code" inputmode="numeric" autocomplete="one-time-code"
+               aria-label="Confirmation code" placeholder="Confirmation code">
+        <button type="button" class="minor" id="email-confirm">Confirm new email</button>
+      </div>
+      <p class="hint" id="email-status" role="status" hidden></p>
+    </div>
+  </section>
+</dialog>
 
 <!-- The shipped defaults, byte-identical to frontend/defaults/theme.json (pinned by the
      contract suite). The form's built-in fallback values and the _readme block of every
@@ -1292,31 +1356,57 @@ the same <code>WidgetThemeUpload</code> link as always.</p>
 
     fetchJson("theme.json").then(function (live) {
       if (live && typeof live === "object" && !Array.isArray(live)) {
-        seed(
-          stateFrom(live, builtinState).state,
-          "Editing your uploaded settings. Downloading keeps anything you don't change."
-        );
+        seed(stateFrom(live, builtinState).state, "Editing your live settings.");
         return null;
       }
       return fetchJson("defaults/theme.json").then(function (defaults) {
         if (defaults) {
-          seed(
-            stateFrom(defaults, builtinState).state,
-            "No uploaded settings file found - starting from the shipped defaults."
-          );
+          seed(stateFrom(defaults, builtinState).state, "Starting from the shipped defaults.");
         } else {
           seed(builtinState, "Starting from the built-in defaults.");
         }
       });
     });
 
+    // ---- the settings panel ---------------------------------------------------------
+    //
+    // A native <dialog> opened modally: Escape closes it and focus returns to the
+    // control that opened it, both from the engine rather than from key handling here.
+    // The focus() call in the close handler makes the return explicit anyway, because
+    // it is the part a customer would notice missing.
+    var panel = document.getElementById("settings-panel");
+    var panelOpener = document.getElementById("settings-open");
+
+    function closePanel() {
+      if (panel.open) panel.close();
+    }
+
+    panelOpener.addEventListener("click", function () {
+      panel.showModal();
+      panelOpener.setAttribute("aria-expanded", "true");
+    });
+    document.getElementById("settings-close").addEventListener("click", closePanel);
+    panel.addEventListener("close", function () {
+      panelOpener.setAttribute("aria-expanded", "false");
+      panelOpener.focus();
+    });
+
+    document.getElementById("use-defaults").addEventListener("click", function () {
+      // Straight from the embedded defaults block - the page holds no second copy of the
+      // shipped values. It fills the form in and stops there: saving stays a decision.
+      seedForm(builtinState);
+      colourError.hidden = true;
+      downloadBtn.disabled = false;
+      saveBtn.disabled = false;
+      status.textContent = "Filled in with the shipped defaults. Nothing is saved yet.";
+      renderPreview();
+      closePanel();
+    });
+
     picker.addEventListener("input", onPicked);
     hexInput.addEventListener("input", onHexTyped);
     function onFormEdited(event) {
       if (event.target === picker || event.target === hexInput) return;
-      // The account panel's fields are not theme settings; a keystroke there is not a
-      // preview change.
-      if (accountPanel.contains(event.target)) return;
       renderPreview();
     }
     // Both events: text fields repaint per keystroke via "input"; "change" covers radio

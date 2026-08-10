@@ -3847,4 +3847,137 @@ test("the editor seeds its form the way the widget reads a live file", () => {
   assert.strictEqual(editor.stateFrom(null, base).changed, false);
 });
 
+// The main view is the everyday job - the fields, the preview, Save - and everything else
+// is one control away. Once Save wrote the live file the console upload stopped being the
+// workflow, so the sentences teaching it are gone rather than reworded.
+
+// Everything the page renders before the panel, comments stripped: the scans below are
+// about the copy a customer reads, and a comment is neither rendered nor read aloud.
+const EDITOR_MAIN_VIEW = THEME_EDITOR_PAGE
+  .split("<body>")[1]
+  .split("<dialog")[0]
+  .replace(/<!--[\s\S]*?-->/g, "");
+const EDITOR_PANEL = (THEME_EDITOR_PAGE.match(
+  /<dialog id="settings-panel"[^>]*>([\s\S]*?)<\/dialog>/
+) || [])[1];
+
+test("the main view carries the form, the preview and Save, and no file handling", () => {
+  ["No uploaded settings file found",
+   "Save puts your settings on the live widget",
+   "walks through that step",
+   "upload it through the same"].forEach((gone) => {
+    assert.ok(THEME_EDITOR_PAGE.indexOf(gone) < 0, "still on the page: " + gone);
+  });
+
+  // Nothing in the main view names the file or teaches moving it around. ("downloaded"
+  // survives in the font hint, which is about fonts, not files.)
+  assert.ok(EDITOR_MAIN_VIEW, "found the main view");
+  assert.ok(!/theme\.json/i.test(EDITOR_MAIN_VIEW), "the main view names no file");
+  assert.ok(!/upload/i.test(EDITOR_MAIN_VIEW), "no upload text in the main view");
+  assert.ok(!/\bdownload\b/i.test(EDITOR_MAIN_VIEW), "no download text in the main view");
+
+  // What stays: the three settings, the preview, Save, and the unsigned indication.
+  ["data-theme-key=", "id=\"pv-root\"", "id=\"load-status\"",
+   '<button type="button" id="save" hidden>Sign in to save</button>'].forEach((kept) => {
+    assert.ok(EDITOR_MAIN_VIEW.indexOf(kept) >= 0, "missing from the main view: " + kept);
+  });
+});
+
+test("the download and account controls are reachable only through the settings control", () => {
+  assert.ok(EDITOR_PANEL, "found the settings panel");
+  // The panel ships closed - a <dialog> with no open attribute renders nothing and
+  // holds nothing focusable - and one control opens it.
+  assert.ok(
+    !/<dialog id="settings-panel"[^>]*\sopen[\s>]/.test(THEME_EDITOR_PAGE),
+    "the panel must ship closed"
+  );
+  assert.ok(
+    /<button type="button" class="minor" id="settings-open"[\s\S]*?aria-controls="settings-panel">/
+      .test(EDITOR_MAIN_VIEW),
+    "the opener is a real button in the main view, pointed at the panel"
+  );
+  assert.ok(/aria-expanded="false"/.test(EDITOR_MAIN_VIEW), "the opener ships collapsed");
+
+  // Every control the main view lost is in the panel, and each id exists exactly once on
+  // the page - so there is no second route to any of them.
+  ["download", "use-defaults", "account", "sign-out", "pw-change", "pw-current", "pw-new",
+   "email-change", "email-confirm", "email-new", "email-code"].forEach((id) => {
+    const marker = 'id="' + id + '"';
+    assert.ok(EDITOR_PANEL.indexOf(marker) >= 0, id + " must live in the panel");
+    assert.strictEqual(
+      THEME_EDITOR_PAGE.split(marker).length - 1, 1, id + " appears more than once"
+    );
+  });
+
+  // Keyboard: showModal is what gives Escape and the focus trap; the close handler puts
+  // focus back on the opener, whichever way the panel was dismissed.
+  assert.ok(/panel\.showModal\(\)/.test(THEME_EDITOR_PAGE), "opened modally");
+  assert.ok(
+    /panel\.addEventListener\("close", function \(\) \{[\s\S]*?panelOpener\.focus\(\);/
+      .test(THEME_EDITOR_PAGE),
+    "closing returns focus to the opener"
+  );
+  assert.ok(/id="settings-close"/.test(EDITOR_PANEL), "and there is a visible Close");
+});
+
+test("Choose defaults refills the form from the shipped file and saves nothing", () => {
+  const editor = editorRules();
+  const handler = THEME_EDITOR_PAGE.match(
+    /getElementById\("use-defaults"\)\.addEventListener\("click", function \(\) \{([\s\S]*?)\n    \}\);/
+  );
+  assert.ok(handler, "found the Choose defaults handler");
+  // It seeds from builtinState, which is read out of the embedded defaults block above -
+  // so the page holds no second copy of the shipped values to drift.
+  assert.ok(/seedForm\(builtinState\)/.test(handler[1]), handler[1]);
+  assert.ok(!/fetch\(|saveUrl/.test(handler[1]), "refilling must not save");
+
+  // seedForm writes every field there is, so a refill leaves nothing of the old theme.
+  const seed = THEME_EDITOR_PAGE.match(/function seedForm\(state\) \{([\s\S]*?)\n    \}/);
+  assert.ok(seed, "found seedForm");
+  ["picker.value = state.highlight", "hexInput.value = state.highlight",
+   'input[name="fontFamily"]', "slots[lang][i].value = state.questions[lang][i]"]
+    .forEach((piece) => assert.ok(seed[1].indexOf(piece) >= 0, "seedForm misses " + piece));
+
+  // And the state it seeds IS the shipped file, read through the widget's own rules.
+  const shipped = editor.stateFrom(THEME_DEFAULTS, {
+    highlight: editor.DEFAULT_HIGHLIGHT,
+    font: editor.DEFAULT_FONT,
+    questions: { en: [], es: [] }
+  }).state;
+  assert.deepStrictEqual(shipped, {
+    highlight: THEME_DEFAULTS.highlightColor,
+    font: THEME_DEFAULTS.fontFamily,
+    questions: {
+      en: THEME_DEFAULTS.starterQuestions.en,
+      es: THEME_DEFAULTS.starterQuestions.es
+    }
+  });
+});
+
+test("an unsigned visitor still downloads the shipped defaults, byte for byte", () => {
+  const editor = editorRules();
+  // Unsigned, the committed page hides Save and the account group, so the panel's
+  // download is the only way out - it moved, it did not disappear, and it is never
+  // hidden or disabled in the markup.
+  assert.ok(
+    /<button type="button" id="save" hidden>Sign in to save<\/button>/.test(THEME_EDITOR_PAGE)
+  );
+  assert.ok(/<section class="panel-group" id="account" hidden>/.test(THEME_EDITOR_PAGE));
+  assert.ok(
+    /<button type="button" id="download">Download theme\.json<\/button>/.test(EDITOR_PANEL),
+    "the download button is plain, visible markup"
+  );
+
+  // The whole unsigned path end to end: an untouched load seeds from the shipped
+  // defaults file and downloading it returns those bytes unchanged.
+  const seeded = editor.stateFrom(THEME_DEFAULTS, {
+    highlight: editor.DEFAULT_HIGHLIGHT,
+    font: editor.DEFAULT_FONT,
+    questions: { en: [], es: [] }
+  }).state;
+  assert.strictEqual(
+    editor.buildFileText(seeded, THEME_DEFAULTS._readme), THEME_DEFAULTS_TEXT
+  );
+});
+
 run();
