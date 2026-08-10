@@ -22,6 +22,11 @@ Everything you need is in the AWS console, and both links come out of the stack 
 every install generates its own bucket and CDN names, so there is nothing here to copy by
 hand and no name to match by eye.
 
+If you would rather not edit JSON at all, the `WidgetThemeEditor` output opens a hosted
+form (colour picker, font choices, question fields, live preview) that downloads the
+finished `theme.json` for you - it replaces steps 1 and 2 below, and the upload step is
+the same either way.
+
 Open **CloudFormation** → the **GavilanChatbotStack** stack → the **Outputs** tab. Two rows
 matter, and they are steps 1 and 2:
 
@@ -172,3 +177,8 @@ against `#ffffff` and `#f1f3f6` before it goes live.
   `test_the_theme_file_is_outside_the_prune_scope` /
   `test_the_theme_file_is_served_cross_origin_and_briefly_cached` in
   `infra/tests/unit/test_infra_stack.py`.
+- The settings editor is `frontend/theme-editor.html`, served at the bucket root and
+  linked by the `WidgetThemeEditor` output. It deliberately duplicates the widget's
+  validation rules and the defaults file; the `theme-editor.html` block of the contract
+  suite pins every copy against `widget.js` and `defaults/theme.json`, so a rule change
+  in the widget fails tests until the editor matches.

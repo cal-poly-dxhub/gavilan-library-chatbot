@@ -99,6 +99,15 @@ _WIDGET_THEME_DEFAULTS_DIR = _FRONTEND_DIR / _WIDGET_THEME_DEFAULTS_PREFIX
 # truth; edit frontend/theme-guide.html directly.
 _WIDGET_THEME_GUIDE_FILE = "theme-guide.html"
 
+# The settings editor: a second self contained page at the widget bucket root, linked from
+# the WidgetThemeEditor output. A form with pickers that downloads a ready-to-upload
+# theme.json - download only, no write access, no auth; the upload step stays the
+# WidgetThemeUpload console link. It ships exactly like the guide (a source of the widget
+# deployment, never under defaults/ whose attachment header would download it), and for
+# the same reason: the workflow has to explain and now also OPERATE itself from inside
+# AWS. The page is its own source of truth; edit frontend/theme-editor.html directly.
+_WIDGET_THEME_EDITOR_FILE = "theme-editor.html"
+
 # The shipped demo page and the two placeholders the deploy stamps into it. Keeping the
 # names here (rather than inline) makes the synth-time assertion below the single place
 # that couples this stack to the page's markup.
@@ -1421,6 +1430,9 @@ class GavilanChatbotStack(Stack):
                 s3deploy.Source.asset(
                     str(_FRONTEND_DIR), exclude=["*", f"!{_WIDGET_THEME_GUIDE_FILE}"]
                 ),
+                s3deploy.Source.asset(
+                    str(_FRONTEND_DIR), exclude=["*", f"!{_WIDGET_THEME_EDITOR_FILE}"]
+                ),
             ],
             # TWO FILES IN THIS BUCKET SURVIVE EVERY DEPLOY, and this one line is the whole
             # reason. BucketDeployment prunes by default - `aws s3 sync --delete` - which
@@ -1446,7 +1458,11 @@ class GavilanChatbotStack(Stack):
             # test_the_theme_file_is_outside_the_prune_scope pins the rendered property.
             exclude=[_WIDGET_THEME_FILE, f"{_WIDGET_THEME_DEFAULTS_PREFIX}/*"],
             distribution=widget_distribution,
-            distribution_paths=["/widget.js", f"/{_WIDGET_THEME_GUIDE_FILE}"],
+            distribution_paths=[
+                "/widget.js",
+                f"/{_WIDGET_THEME_GUIDE_FILE}",
+                f"/{_WIDGET_THEME_EDITOR_FILE}",
+            ],
         )
 
         # --- defaults/theme.json: the thing the customer clicks ------------------------
@@ -1599,6 +1615,18 @@ class GavilanChatbotStack(Stack):
                 f"/{_WIDGET_THEME_GUIDE_FILE}"
             ),
             description="Start here: how to change the chatbot's colours and questions.",
+        )
+        CfnOutput(
+            self,
+            "WidgetThemeEditor",
+            value=(
+                f"https://{widget_distribution.distribution_domain_name}"
+                f"/{_WIDGET_THEME_EDITOR_FILE}"
+            ),
+            description=(
+                "A form that fills in theme.json for you: pick the colour, font and "
+                "questions, download the file, then upload it via WidgetThemeUpload."
+            ),
         )
         CfnOutput(
             self,

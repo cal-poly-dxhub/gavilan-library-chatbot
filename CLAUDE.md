@@ -167,15 +167,17 @@ widget bucket root; the page is its own source of copy, edited in place.
   nothing under a prefix - with only that entry, `defaults/theme.json` is deleted on every
   deploy (measured against aws-cli 2.35.11, not assumed). Pinned by
   `test_the_theme_file_is_outside_the_prune_scope`.
-- **The flow is console-only: three clickable outputs, no CLI, no rename.**
-  `WidgetThemeGuide` is the hosted guide page ("Start here"), `WidgetThemeDownload` is
-  `https://<widget CDN>/defaults/theme.json` and `WidgetThemeUpload` is the `https://`
-  S3-console deep link to the widget bucket's object list. All are `https://` so the
-  CloudFormation Outputs tab renders them as links: the bucket name is generated per
-  install, the account holds ~19 buckets, and the demo-site bucket sits next to the widget
-  one (an upload into the wrong one succeeds silently and changes nothing), so a name to
-  match by eye is the failure mode being designed out. All three outputs carry a
-  Description, because the Outputs tab is the only entry point anyone has.
+- **The flow is console-only: four clickable outputs, no CLI, no rename.**
+  `WidgetThemeGuide` is the hosted guide page ("Start here"), `WidgetThemeEditor` is the
+  hosted settings-editor page (a form that downloads a finished `theme.json` - see below),
+  `WidgetThemeDownload` is `https://<widget CDN>/defaults/theme.json` and
+  `WidgetThemeUpload` is the `https://` S3-console deep link to the widget bucket's object
+  list. All are `https://` so the CloudFormation Outputs tab renders them as links: the
+  bucket name is generated per install, the account holds ~19 buckets, and the demo-site
+  bucket sits next to the widget one (an upload into the wrong one succeeds silently and
+  changes nothing), so a name to match by eye is the failure mode being designed out. All
+  four outputs carry a Description, because the Outputs tab is the only entry point anyone
+  has.
 - **`defaults/theme.json` is the download** - a deployment-owned copy of the built-in
   defaults, ALREADY named `theme.json` (hence the prefix: a second file of that name at the
   root would BE the customer's), served `Content-Disposition: attachment` so a click saves it
@@ -188,12 +190,23 @@ widget bucket root; the page is its own source of copy, edited in place.
   never contain a root `frontend/theme.json`.
 - **`theme-guide.html` is the hosted guide**, one self-contained page at the widget bucket
   root, and its own source of copy (edit the HTML directly). No scripts, no
-  external CSS or fonts, no absolute URLs; its only link is the RELATIVE
-  `defaults/theme.json`, so it works on any distribution domain with no deploy-time
-  stamping. It rides the widget deployment as a SECOND source (the prune keeps what its
-  own sources contain, so the pinned exclude list is untouched) and must never move under
-  `defaults/`, whose deployment-wide attachment header would download it instead of
-  rendering it. Linked by the `WidgetThemeGuide` output.
+  external CSS or fonts, no absolute URLs; its links are RELATIVE
+  (`defaults/theme.json` and `theme-editor.html`), so it works on any distribution domain
+  with no deploy-time stamping. It rides the widget deployment as a SECOND source (the
+  prune keeps what its own sources contain, so the pinned exclude list is untouched) and
+  must never move under `defaults/`, whose deployment-wide attachment header would
+  download it instead of rendering it. Linked by the `WidgetThemeGuide` output.
+- **`theme-editor.html` is the hosted settings editor**, a second self-contained page at
+  the bucket root (a THIRD source of the widget deployment, same prune argument, same
+  never-under-`defaults/` rule), linked by the `WidgetThemeEditor` output. A form with a
+  colour picker, font choices, question fields and a live widget miniature; it seeds from
+  the DEPLOYED root `theme.json` (falling back to `defaults/theme.json`, then built-ins)
+  so the customer edits their live theme, and its Download button builds a `theme.json`
+  in the repo's pinned serialisation, `_readme` included. Download only - no write API,
+  no auth; upload stays the `WidgetThemeUpload` console link. Scripts are allowed on THIS
+  page (unlike the guide) but no innerHTML, no storage, no absolute URLs. It duplicates
+  the widget's validation rules and the defaults file BY DESIGN, and the contract suite
+  pins every copy against widget.js and `defaults/theme.json` so none can drift silently.
 - **`content_disposition` applies to a WHOLE `BucketDeployment`**, which is why the download
   gets its own rather than riding along with `widget.js` - a `<script src>` that comes back as
   a file download is a broken widget. That second deployment shares the widget bucket, which
@@ -280,7 +293,8 @@ The email is PLAIN TEXT and the `Subject` is a CONSTANT - no user-supplied text 
 - `frontend/` - embeddable widget + the demo page. FOUR files ship, to two SEPARATE buckets:
   - `widget.js` - the production widget (production-clean, no mock code); reads its endpoint from its `<script>` tag's `data-api-url`, POSTs a multi-turn `{messages: [...]}` array, renders `{answer, sources}`. **TEMPORARY sign-in gate:** when the tag also carries `data-user-pool-id` + `data-client-id` (region derived from the pool id's `<region>_` prefix), a sign-in form takes the composer's place until one unsigned `InitiateAuth` fetch returns a token, which then rides as `Authorization: Bearer` on every `/query`. Absent those two attributes the widget is byte-identical to the pre-gate one - the same opt-in-by-attribute shape as `data-usage-events` - and the gate does not depend on the widget either way, since API Gateway 401s an unauthenticated `/query` regardless. The ONLY file in the widget bucket. **Bilingual:** every user-visible string lives in the `STRINGS` table (keyed by language code, above the `END LOCALIZATION` banner); render code below that banner calls `t(key)` and holds no copy, which the contract suite enforces by scanning the file. The header carries a two-button English/Español toggle (real buttons, `aria-pressed`, group `aria-label`, visible focus ring - no ID-based ARIA, which cannot cross the shadow boundary), and switching sets `lang` on the host element AND the shadow root container. Each message is stamped with the language it was said in, so a switch relabels the chrome and NOT the transcript: past turns are never retranslated (that would cost a model call per message). The canned greeting + starter questions DO re-render on a switch, but only before the first message - they are the panel's opening state, not a turn anyone took. The language is session-only, deliberately: the widget stores nothing in the browser and a contract test pins that. The table covers the SCREEN-READER-ONLY text too (the per-turn speaker labels, the pending bubble's status region), because a label nobody can see is still read aloud - and because that text is invisible to any check that looks at the rendered page. Two things the toggle must NOT do, both of them accessibility fixes it would otherwise undo: the launcher takes no `aria-label` in any language (its visible text is its whole accessible name, WCAG 2.5.3), and re-seeding the opening state has to re-point the composer's `aria-describedby` at the NEW greeting bubble, or a switch leaves it aimed at a removed node.
   - `defaults/theme.json` - the downloadable copy of the runtime theme file, deployed to `defaults/theme.json` in the widget bucket by its OWN `BucketDeployment` (`prune=False`, prefix-scoped, `Content-Disposition: attachment`) and overwritten on every deploy. The contract suite tests it as code: every value in it equals a built-in default, it is byte-identical to its own canonical two space serialisation (so no reformat lands silently), and its `_readme` array has to document every key, every font keyword and both caps with no external URL.
-  - `theme-guide.html`: the hosted customer guide, one self-contained page at the widget bucket root, shipped by the widget `BucketDeployment` as a second source. The page is its own source of copy; no scripts, no external anything; only link is the relative `defaults/theme.json`. Linked by the `WidgetThemeGuide` stack output.
+  - `theme-guide.html`: the hosted customer guide, one self-contained page at the widget bucket root, shipped by the widget `BucketDeployment` as a second source. The page is its own source of copy; no scripts, no external anything; its links are the relative `defaults/theme.json` and `theme-editor.html`. Linked by the `WidgetThemeGuide` stack output.
+  - `theme-editor.html`: the hosted settings editor, a third source of the widget `BucketDeployment`, linked by the `WidgetThemeEditor` stack output. A self-contained form (scripts inline, nothing external, no innerHTML, no storage) that seeds from the live root `theme.json` and downloads a ready-to-upload replacement in the pinned serialisation. Its copies of the widget's validation rules and of the defaults file are pinned by the contract suite.
   - `demo-site.html` - the shareable demo page, uploaded as `index.html` to the demo bucket. A Gavilan-Library-styled sample page (local CSS only, nothing hotlinked from gavilan.edu) carrying the SAME one-line embed a library page would, so it cannot fork or drift from the shipped widget. Two placeholders, `__WIDGET_SRC__` and `__API_URL__`, are stamped at DEPLOY time (`s3deploy.Source.data` resolves CDK tokens during deployment) - nothing in it is account- or region-specific. Renaming either placeholder fails synth.
   - `mock.js` (dev-only fetch stub) + `demo.html` (offline mock harness) + `demo-live.html` (local page against the deployed API, needs the `localhost:8000` CORS entry) + `test/widget.contract.test.js` (zero-dep Node tests) never ship; dependency direction is one-way (widget never references the mock).
 - `config.yaml` - declarative settings at repo root; `cost_model` (published AWS rates + the MEASURED per-question constants + the zero-traffic baseline inputs, stamped into the demo page at deploy; note `scrapes_per_month` and `reindexes_per_month` are SEPARATE numbers because change gating means most runs re-index nothing), embedding model, `vector_store` (S3 Vectors names, data_type, distance_metric, non-filterable keys), `scraper.tiers` (per-tier schedule + URLs; the only declaration of cadence and tier membership) + `kb_exclude_urls`, `chunking`, `retrieval.number_of_results`, `generation.model_id`, `catalog` (enrichment model, S3 key, guard threshold, cache TTL), `primo` (the live-catalog knobs `timeout_seconds`, `number_of_results`, `availability_budget_seconds`, wired as `PRIMO_*` env; `search_course_reserves` reuses the same knobs), `library_links.data_file` (the bundled link-table filename; the stack feeds the SAME value to the Lambda asset include and the `LIBRARY_LINKS_FILE` env so they cannot drift), `cors.allow_origins` (the HTTP API browser allowlist), `demo_site.enabled` (the shareable demo page; when on, the stack appends the demo distribution's origin to the CORS allowlist as a deploy-time token), `feedback` (`enabled`, `notify_email`, `max_comment_chars`, `max_body_bytes`, `max_sources`; the three caps reach the feedback Lambda as `FEEDBACK_*` env vars, and `notify_email` never does - it becomes the SNS subscription), `guardrail` (`name`, the one-entry `content_filters` list, `blocked_input_messaging` - there is no output guardrail and no PII entity list). CDK reads it at synth via `infra/config.py`. Edit values here, do not hardcode in the stack.

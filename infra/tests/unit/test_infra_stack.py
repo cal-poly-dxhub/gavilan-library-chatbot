@@ -957,7 +957,11 @@ def test_the_theme_file_is_outside_the_prune_scope():
     frontend = pathlib.Path(__file__).resolve().parents[3] / "frontend"
     assert not (frontend / "theme.json").exists(), "the repo must not ship a theme.json"
     assert (frontend / "defaults" / "theme.json").exists()
-    assert props["DistributionPaths"] == ["/widget.js", "/theme-guide.html"]
+    assert props["DistributionPaths"] == [
+        "/widget.js",
+        "/theme-guide.html",
+        "/theme-editor.html",
+    ]
 
 
 def test_the_defaults_file_is_a_download_not_a_page():
@@ -1080,26 +1084,33 @@ def test_the_stack_links_both_ends_of_the_theming_flow():
 
 def test_the_guide_page_ships_at_the_bucket_root_and_renders_in_a_tab():
     # The self serving requirement: the theming workflow explains itself from inside AWS,
-    # so the guide page is an object the widget deployment itself ships. It rides as a
-    # SECOND source of that deployment, which is what keeps it outside the prune argument
-    # entirely: the prune only deletes objects its own sources do not contain, so the page
-    # needs no entry in the pinned exclude list.
+    # so the guide page (and now the settings editor next to it) is an object the widget
+    # deployment itself ships. Each rides as its own source of that deployment, which is
+    # what keeps them outside the prune argument entirely: the prune only deletes objects
+    # its own sources do not contain, so neither page needs an entry in the pinned
+    # exclude list.
     template = _template()
     props = _widget_deployment(template)["Properties"]
-    assert len(props["SourceObjectKeys"]) == 2, props["SourceObjectKeys"]
-    assert "DestinationBucketKeyPrefix" not in props, "the page must land at the root"
+    assert len(props["SourceObjectKeys"]) == 3, props["SourceObjectKeys"]
+    assert "DestinationBucketKeyPrefix" not in props, "the pages must land at the root"
     # Invalidated on deploy alongside widget.js, so a copy edit shows up immediately.
-    assert props["DistributionPaths"] == ["/widget.js", "/theme-guide.html"]
+    assert props["DistributionPaths"] == [
+        "/widget.js",
+        "/theme-guide.html",
+        "/theme-editor.html",
+    ]
 
-    # It must NOT ride the defaults deployment: everything in that one is served with
-    # Content-Disposition attachment, and a guide that downloads instead of rendering is
-    # no guide at all. One source there, and nothing named like a page in its directory.
+    # Neither page may ride the defaults deployment: everything in that one is served with
+    # Content-Disposition attachment, and a page that downloads instead of rendering is
+    # no page at all. One source there, and nothing named like a page in its directory.
     defaults_props = _theme_defaults_deployment(template)["Properties"]
     assert len(defaults_props["SourceObjectKeys"]) == 1, defaults_props["SourceObjectKeys"]
 
     frontend = pathlib.Path(__file__).resolve().parents[3] / "frontend"
     assert (frontend / "theme-guide.html").exists()
     assert not (frontend / "defaults" / "theme-guide.html").exists()
+    assert (frontend / "theme-editor.html").exists()
+    assert not (frontend / "defaults" / "theme-editor.html").exists()
 
 
 def test_the_guide_output_links_the_page_and_every_theme_output_is_described():
@@ -1118,15 +1129,35 @@ def test_the_guide_output_links_the_page_and_every_theme_output_is_described():
     assert outputs["WidgetThemeGuide"]["Description"] == (
         "Start here: how to change the chatbot's colours and questions."
     )
-    for name in ("WidgetThemeGuide", "WidgetThemeDownload", "WidgetThemeUpload"):
+    for name in (
+        "WidgetThemeGuide",
+        "WidgetThemeEditor",
+        "WidgetThemeDownload",
+        "WidgetThemeUpload",
+    ):
         assert outputs[name].get("Description"), f"{name} needs a Description"
 
-    # The guide and the download are served by the same distribution: their values join
-    # over the same CloudFront domain attribute.
+    # The guide, the editor and the download are served by the same distribution: their
+    # values join over the same CloudFront domain attribute.
     def domain_token(name):
         return [p for p in outputs[name]["Value"]["Fn::Join"][1] if not isinstance(p, str)]
 
     assert domain_token("WidgetThemeGuide") == domain_token("WidgetThemeDownload")
+    assert domain_token("WidgetThemeEditor") == domain_token("WidgetThemeDownload")
+
+
+def test_the_editor_output_links_the_editor_page():
+    # The editor is reached the same way as the guide: a clickable https:// output in the
+    # CloudFormation Outputs tab, pointing at the page on the widget CDN. Its description
+    # names WidgetThemeUpload because downloading the file is only half the workflow.
+    outputs = _template().find_outputs("*")
+    assert "WidgetThemeEditor" in outputs, list(outputs)
+    editor = "".join(
+        p for p in outputs["WidgetThemeEditor"]["Value"]["Fn::Join"][1] if isinstance(p, str)
+    )
+    assert editor.startswith("https://"), editor
+    assert editor.endswith("/theme-editor.html"), editor
+    assert "WidgetThemeUpload" in outputs["WidgetThemeEditor"]["Description"]
 
 
 def test_stack_outputs_ready_to_paste_embed_tag():
@@ -1372,10 +1403,14 @@ def test_demo_site_does_not_change_widget_delivery():
     )
     for key in keys:
         assert a.get(key) == b.get(key), (key, a.get(key), b.get(key))
-    # Still pruning its own bucket, still shipping exactly the two files it owns, still
+    # Still pruning its own bucket, still shipping exactly the three files it owns, still
     # invalidated on deploy.
     assert a["Prune"] is True
-    assert a["DistributionPaths"] == ["/widget.js", "/theme-guide.html"]
+    assert a["DistributionPaths"] == [
+        "/widget.js",
+        "/theme-guide.html",
+        "/theme-editor.html",
+    ]
     # A plain asset copy, never a deploy-time substitution: with more than one source CDK
     # always renders a SourceMarkers list, but every entry must stay empty (the demo page
     # is the only stamped file, and it lives in its own deployment).
