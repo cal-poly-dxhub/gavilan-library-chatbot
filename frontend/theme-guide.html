@@ -1,15 +1,18 @@
 <!doctype html>
 <!--
-  The customer facing theming guide, served at the widget bucket root and linked from the
-  WidgetThemeGuide stack output. This file is the source of its own copy; edit it here.
-  One file, nothing external: no scripts, no fonts, no
-  stylesheets, and the only link on the page is the relative path to defaults/theme.json.
+  The customer facing theming guide, served at the widget bucket root. NO stack output
+  points here: the Outputs tab names the settings editor and nothing else for theming, and
+  the only route to this page is the guide link in that editor's Settings panel. Keep it
+  that way - a second entry point is a second thing to keep true.
+  This file is the source of its own copy; edit it here. One file, nothing external: no
+  scripts, no fonts, no stylesheets, and its only links are the relative paths to
+  defaults/theme.json and theme-editor.html.
 -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Changing the chatbot's colours and questions</title>
+<title>Changing the chatbot's colours and questions by hand</title>
 <style>
   body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -45,7 +48,19 @@
 </head>
 <body>
 
-<h1>Changing the chatbot's colours and questions</h1>
+<h1>Changing the chatbot's colours and questions by hand</h1>
+
+<h2>This is the manual version</h2>
+
+<p>The <a href="theme-editor.html">settings editor</a> is the normal way to make
+these changes. It offers the same three settings as a colour picker, a list of
+fonts and question fields, with a live preview, and when you are signed in its
+Save button puts your choices on the live widget straight away. If that worked for
+you, you do not need this page at all.</p>
+
+<p>This page is the manual route to the same result: edit the settings file
+yourself and upload it in the AWS console. Use it when nobody is signed in to the
+editor, or when you would rather keep the file.</p>
 
 <h2>What you can change</h2>
 
@@ -66,18 +81,14 @@ there.</p>
   <li>up to four suggested questions, per language</li>
 </ul>
 
-<p>Rather not edit a file by hand? The <a href="theme-editor.html">settings
-editor</a> makes the same choices with pickers and a live preview, then downloads
-the finished <code>theme.json</code> - use it instead of steps 1 and 2, and carry
-on from step 3.</p>
-
 <h2>Step 1: get the settings file</h2>
 
 <p><a href="defaults/theme.json" target="_blank" rel="noopener">Download the settings file</a>. It saves to your
 computer as <code>theme.json</code>.</p>
 
 <p>Come back for a fresh copy any time. This link always gives you the original,
-untouched. It is also in the Outputs tab as <code>WidgetThemeDownload</code>.</p>
+untouched. The <a href="theme-editor.html">settings editor</a> has the same download
+in its <strong>Settings</strong> panel.</p>
 
 <h2>Step 2: edit it</h2>
 
@@ -148,6 +159,11 @@ against your colour. A pale colour turns the text black.</p>
 <p><strong>The page itself is broken.</strong> That is not the theme. No settings
 file, however bad, can affect the page the widget sits on. Raise it with
 DxHub.</p>
+
+<h2>Back to the editor</h2>
+
+<p>The <a href="theme-editor.html">settings editor</a> does all of the above for
+you, and saves directly to the live widget once you are signed in.</p>
 
 </body>
 </html>

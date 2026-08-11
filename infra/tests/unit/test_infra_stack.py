@@ -1062,20 +1062,22 @@ def _logical_id(resources, target):
     raise AssertionError("resource not found")
 
 
-def test_the_stack_links_both_ends_of_the_theming_flow():
-    # Every install generates its own bucket and CDN names, so the docs cannot carry either
-    # link - they have to come from the stack. Both are https:// so the CloudFormation
-    # Outputs tab renders them clickable: anything else is a name to match by eye against
-    # nineteen buckets, with the demo-site bucket sitting right next to the right one.
+def test_the_theming_outputs_are_the_editor_and_the_upload_link():
+    # The Outputs tab points at the EDITOR and nothing else for theming. There used to be
+    # four rows; the guide and the defaults download lost theirs, because the editor's Save
+    # publishes the live file and its settings panel holds both the same download and the
+    # only link to the guide. Three routes into one workflow is two routes to leave stale.
+    #
+    # WidgetThemeUpload survives on purpose: the guide's console procedure names it BY
+    # OUTPUT NAME, so deleting it would break the page it is quoted on, and it is the only
+    # route left for anyone who is not signed in.
     outputs = _template().find_outputs("*")
+    theme_outputs = sorted(n for n in outputs if n.startswith("WidgetTheme"))
+    assert theme_outputs == ["WidgetThemeEditor", "WidgetThemeUpload"], theme_outputs
 
     def literals(name):
         assert name in outputs, list(outputs)
         return "".join(p for p in outputs[name]["Value"]["Fn::Join"][1] if isinstance(p, str))
-
-    download = literals("WidgetThemeDownload")
-    assert download.startswith("https://"), download
-    assert download.endswith("/defaults/theme.json"), download
 
     upload = literals("WidgetThemeUpload")
     assert upload.startswith("https://"), upload
@@ -1083,6 +1085,22 @@ def test_the_stack_links_both_ends_of_the_theming_flow():
     assert "tab=objects" in upload, upload
     # It points at the BUCKET, not at an object key that does not exist until they upload one.
     assert "theme.json" not in upload, upload
+
+
+def test_no_output_points_at_the_guide_or_the_defaults_download():
+    # The deletions, pinned by what they must NOT produce rather than by a name that is
+    # gone. Checked against every output VALUE too, so re-adding either link under a
+    # different output name fails here as well - the invariant is one theming entry point,
+    # not one particular missing key.
+    outputs = _template().find_outputs("*")
+    assert "WidgetThemeGuide" not in outputs, list(outputs)
+    assert "WidgetThemeDownload" not in outputs, list(outputs)
+
+    for name, out in outputs.items():
+        parts = out["Value"]
+        rendered = json.dumps(parts)
+        assert "theme-guide.html" not in rendered, f"{name} links the guide"
+        assert "defaults/theme.json" not in rendered, f"{name} links the download"
 
 
 def test_the_guide_page_ships_at_the_bucket_root_and_renders_in_a_tab():
@@ -1116,43 +1134,13 @@ def test_the_guide_page_ships_at_the_bucket_root_and_renders_in_a_tab():
     assert not (frontend / "defaults" / "theme-editor.html").exists()
 
 
-def test_the_guide_output_links_the_page_and_every_theme_output_is_described():
-    # The Outputs tab is the only entry point anyone has, so all three theme outputs say
-    # what to do with them, and the guide's description is the designated starting point.
-    outputs = _template().find_outputs("*")
-
-    def literals(name):
-        assert name in outputs, list(outputs)
-        return "".join(p for p in outputs[name]["Value"]["Fn::Join"][1] if isinstance(p, str))
-
-    guide = literals("WidgetThemeGuide")
-    assert guide.startswith("https://"), guide
-    assert guide.endswith("/theme-guide.html"), guide
-
-    assert outputs["WidgetThemeGuide"]["Description"] == (
-        "Start here: how to change the chatbot's colours and questions."
-    )
-    for name in (
-        "WidgetThemeGuide",
-        "WidgetThemeEditor",
-        "WidgetThemeDownload",
-        "WidgetThemeUpload",
-    ):
-        assert outputs[name].get("Description"), f"{name} needs a Description"
-
-    # The guide, the editor and the download are served by the same distribution: their
-    # values join over the same CloudFront domain attribute.
-    def domain_token(name):
-        return [p for p in outputs[name]["Value"]["Fn::Join"][1] if not isinstance(p, str)]
-
-    assert domain_token("WidgetThemeGuide") == domain_token("WidgetThemeDownload")
-    assert domain_token("WidgetThemeEditor") == domain_token("WidgetThemeDownload")
-
-
-def test_the_editor_output_links_the_editor_page():
-    # The editor is reached the same way as the guide: a clickable https:// output in the
-    # CloudFormation Outputs tab, pointing at the page on the widget CDN. Its description
-    # names WidgetThemeUpload because downloading the file is only half the workflow.
+def test_the_editor_output_is_the_theming_entry_point_and_says_save_publishes():
+    # Every install generates its own bucket and CDN names, so the docs cannot carry the
+    # link - it has to come from the stack, and it is https:// so the CloudFormation
+    # Outputs tab renders it clickable. The description carries the "Start here" framing
+    # the guide's output used to hold, and it has to say that Save PUBLISHES: an editor
+    # that looks like it only produces a file for uploading sends the customer back into
+    # the console for a step Save already did.
     outputs = _template().find_outputs("*")
     assert "WidgetThemeEditor" in outputs, list(outputs)
     editor = "".join(
@@ -1160,7 +1148,26 @@ def test_the_editor_output_links_the_editor_page():
     )
     assert editor.startswith("https://"), editor
     assert editor.endswith("/theme-editor.html"), editor
-    assert "WidgetThemeUpload" in outputs["WidgetThemeEditor"]["Description"]
+
+    description = outputs["WidgetThemeEditor"]["Description"]
+    assert description == (
+        "Start here: the settings editor for the chatbot's colour, font and starter "
+        "questions. Signed in, its Save publishes them straight to the live widget - no "
+        "upload, no redeploy. Not signed in, it downloads a finished theme.json instead."
+    ), description
+
+    # Both surviving theme outputs are described. The Outputs tab is the only entry point
+    # anyone has, so a row without one is a link with no instructions attached.
+    for name in ("WidgetThemeEditor", "WidgetThemeUpload"):
+        assert outputs[name].get("Description"), f"{name} needs a Description"
+
+    # It is served by the widget distribution: the one token its value joins over is the
+    # same CloudFront domain attribute WidgetCdnDomain reports.
+    tokens = [
+        p for p in outputs["WidgetThemeEditor"]["Value"]["Fn::Join"][1]
+        if not isinstance(p, str)
+    ]
+    assert tokens == [outputs["WidgetCdnDomain"]["Value"]], tokens
 
 
 def test_stack_outputs_ready_to_paste_embed_tag():

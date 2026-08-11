@@ -3508,7 +3508,7 @@ test("defaults/theme.json is valid, is the shipped default, and documents itself
   });
 });
 
-test("the theme guide page is self-contained and names the outputs it teaches", () => {
+test("the theme guide page is self-contained and names only the output that exists", () => {
   // One file at the bucket root, rendered in a browser tab straight off the widget CDN.
   // Nothing external: no scripts, no fonts, no stylesheets, no URLs at all, so it can
   // never break, phone home, or depend on a host the customer's network blocks.
@@ -3527,13 +3527,31 @@ test("the theme guide page is self-contained and names the outputs it teaches", 
   hrefs.forEach((href) => assert.ok(allowed.includes(href), href));
   allowed.forEach((href) => assert.ok(hrefs.includes(href), "missing link: " + href));
 
-  // It teaches the CloudFormation Outputs tab, so the two console links are named by
-  // their output names and never described in other words.
-  assert.ok(THEME_GUIDE_PAGE.indexOf("WidgetThemeDownload") >= 0);
+  // It teaches the CloudFormation Outputs tab, so the console link is named by its output
+  // name and never described in other words. WidgetThemeUpload is the ONLY theming output
+  // left besides the editor's own, and quoting a name the stack no longer emits would send
+  // the reader hunting a row that is not there.
   assert.ok(THEME_GUIDE_PAGE.indexOf("WidgetThemeUpload") >= 0);
+  ["WidgetThemeGuide", "WidgetThemeDownload"].forEach((gone) => {
+    assert.strictEqual(
+      THEME_GUIDE_PAGE.indexOf(gone), -1,
+      "the guide names a deleted output: " + gone
+    );
+  });
   assert.ok(
     THEME_GUIDE_PAGE.indexOf("Changing the chatbot's colours and questions") >= 0,
     "the page carries its own title"
+  );
+
+  // The guide is the MANUAL version of the editor and the editor is the only route to it,
+  // so it has to say so and link back. Nothing else in the product points here.
+  assert.ok(
+    /manual version/i.test(THEME_GUIDE_PAGE),
+    "the guide frames itself as the manual route"
+  );
+  assert.ok(
+    (THEME_GUIDE_PAGE.match(/href="theme-editor\.html"/g) || []).length >= 2,
+    "the guide links back to the editor from the top and the bottom"
   );
 });
 
@@ -3655,10 +3673,17 @@ test("the settings editor page is self-contained; its save path is deploy-stampe
   // anchor, so no href can name a host.
   const hrefs = THEME_EDITOR_PAGE.match(/href="[^"]*"/g) || [];
   hrefs.forEach((href) => assert.strictEqual(href, 'href="theme-guide.html"'));
-  // The no-sign-in path is intact: the console upload is still taught by its output
-  // name, and the committed Save button ships hidden, reading "Sign in to save" - the
-  // unsigned page is the download-only editor it always was.
-  assert.ok(THEME_EDITOR_PAGE.indexOf("WidgetThemeUpload") >= 0);
+  // That link is the guide's ONLY route in the whole product: its stack output is gone,
+  // so an editor that stopped linking it would strand the page entirely.
+  assert.ok(hrefs.length >= 1, "the editor links the guide");
+  // The console procedure is the GUIDE's job now, named there by its output name. The
+  // editor points at the guide instead of quoting output names of its own.
+  assert.strictEqual(
+    THEME_EDITOR_PAGE.indexOf("WidgetThemeUpload"), -1,
+    "the editor defers the console procedure to the guide"
+  );
+  // The no-sign-in path is intact: the committed Save button ships hidden, reading
+  // "Sign in to save" - the unsigned page is the download-only editor it always was.
   assert.ok(
     /<button type="button" id="save" hidden>Sign in to save<\/button>/.test(
       THEME_EDITOR_PAGE

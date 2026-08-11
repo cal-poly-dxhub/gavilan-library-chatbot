@@ -77,10 +77,11 @@ _FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
 _WIDGET_THEME_FILE = "theme.json"
 
 # The starting point the customer downloads, under its own prefix in the SAME bucket. It is
-# a deployment-owned copy of the built-in defaults, ALREADY NAMED theme.json, so the whole
-# customisation flow is: click the download link in the stack outputs, edit, drag into the
-# bucket link next to it. No CLI, no rename, and no reading a generated bucket name off one
-# output to find it in a list of nineteen.
+# a deployment-owned copy of the built-in defaults, ALREADY NAMED theme.json, so the manual
+# route is: download it, edit, drag into the WidgetThemeUpload bucket link. No CLI, no
+# rename, and no reading a generated bucket name off one output to find it in a list of
+# nineteen. It has no stack output of its own - the editor's settings panel and the guide
+# page both serve it, and neither needs the customer to be in the console to get it.
 #
 # The prefix is what makes the naming work. A second copy called theme.json cannot sit at
 # the root next to the customer's - it would BE the customer's - so it lives one level down
@@ -89,24 +90,28 @@ _WIDGET_THEME_DEFAULTS_PREFIX = "defaults"
 _WIDGET_THEME_DEFAULTS_DIR = _FRONTEND_DIR / _WIDGET_THEME_DEFAULTS_PREFIX
 
 # The customer facing theming guide: one self contained HTML page at the widget bucket
-# root, served by the widget distribution and linked from the WidgetThemeGuide output. It
-# exists so the workflow explains itself from inside AWS (the settings file used to point
-# at a GitHub doc the client cannot open). It rides in the widget deployment as a SECOND
-# source, so the prune sees it as the deployment's own object and never deletes it, and
-# neither exclude list has to change. It must NOT ship under defaults/: that whole
-# deployment is served with Content-Disposition attachment, and a guide page that
-# downloads instead of rendering is no guide at all. The page is its own source of
-# truth; edit frontend/theme-guide.html directly.
+# root, served by the widget distribution. It exists so the workflow explains itself from
+# inside AWS (the settings file used to point at a GitHub doc the client cannot open).
+# NO stack output points here: the Outputs tab names the editor and nothing else for
+# theming, and the guide is reached from the editor's settings panel, which is the one
+# place a reader is already looking when they want the console procedure. It rides in the
+# widget deployment as a SECOND source, so the prune sees it as the deployment's own
+# object and never deletes it, and neither exclude list has to change. It must NOT ship
+# under defaults/: that whole deployment is served with Content-Disposition attachment,
+# and a guide page that downloads instead of rendering is no guide at all. The page is its
+# own source of truth; edit frontend/theme-guide.html directly.
 _WIDGET_THEME_GUIDE_FILE = "theme-guide.html"
 
-# The settings editor: a second self contained page at the widget bucket root, linked from
-# the WidgetThemeEditor output. A form with pickers that downloads a ready-to-upload
-# theme.json, and - for a librarian signed in through the theme-admin pool below - saves it
-# straight to the live widget via PUT /theme. The console upload (WidgetThemeUpload) stays
-# as the fallback path. It ships exactly like the guide (a source of the widget deployment,
-# never under defaults/ whose attachment header would download it), and for the same
-# reason: the workflow has to explain and now also OPERATE itself from inside AWS. The page
-# is its own source of copy; edit frontend/theme-editor.html directly.
+# The settings editor: a second self contained page at the widget bucket root, and the ONE
+# theming page the Outputs tab links (WidgetThemeEditor). A form with pickers that saves
+# straight to the live widget via PUT /theme for a librarian signed in through the
+# theme-admin pool below, and - from its settings panel - downloads a ready-to-upload
+# theme.json for anyone who is not. The console upload (WidgetThemeUpload) stays as the
+# fallback path, and the guide that walks through it is linked from that same panel. It
+# ships exactly like the guide (a source of the widget deployment, never under defaults/
+# whose attachment header would download it), and for the same reason: the workflow has to
+# explain and now also OPERATE itself from inside AWS. The page is its own source of copy;
+# edit frontend/theme-editor.html directly.
 _WIDGET_THEME_EDITOR_FILE = "theme-editor.html"
 # The editor's four deploy-time placeholders, stamped through the same s3deploy.Source.data
 # mechanism as the demo page: the PUT /theme endpoint, the managed-login base URL, the app
@@ -1900,22 +1905,19 @@ class GavilanChatbotStack(Stack):
             value=query_url,
             description="HTTP API POST /query endpoint the widget calls.",
         )
-        # The theming flow's three outputs, all https:// URLs so the CloudFormation
-        # Outputs tab renders them as links the customer can click. That is the entire
-        # design: a generated bucket name in a nineteen bucket account is not something to
-        # match by eye, and the demo site bucket sits right next to this one (an upload
-        # into the wrong one succeeds and changes nothing). The Outputs tab is the only
-        # entry point anyone has, so each output carries a Description that says what to
-        # do with it. The guide page is the one that teaches the other two.
-        CfnOutput(
-            self,
-            "WidgetThemeGuide",
-            value=(
-                f"https://{widget_distribution.distribution_domain_name}"
-                f"/{_WIDGET_THEME_GUIDE_FILE}"
-            ),
-            description="Start here: how to change the chatbot's colours and questions.",
-        )
+        # The theming flow's TWO outputs, both https:// URLs so the CloudFormation Outputs
+        # tab renders them as links the customer can click. That is the entire design: a
+        # generated bucket name in a nineteen bucket account is not something to match by
+        # eye, and the demo site bucket sits right next to this one (an upload into the
+        # wrong one succeeds and changes nothing). The Outputs tab is the only entry point
+        # anyone has, so each output carries a Description that says what to do with it.
+        #
+        # There used to be four. The editor is now the single theming entry point, so the
+        # guide and the defaults download lost their outputs: the editor's Save publishes
+        # the live file, and its settings panel holds the same download and links the
+        # guide, so two more rows in the Outputs tab were three routes to one workflow.
+        # WidgetThemeUpload STAYS - the guide's console procedure names it by output name,
+        # and it is the only route left for anyone who is not signed in.
         CfnOutput(
             self,
             "WidgetThemeEditor",
@@ -1924,18 +1926,10 @@ class GavilanChatbotStack(Stack):
                 f"/{_WIDGET_THEME_EDITOR_FILE}"
             ),
             description=(
-                "A form that fills in theme.json for you: pick the colour, font and "
-                "questions, download the file, then upload it via WidgetThemeUpload."
-            ),
-        )
-        CfnOutput(
-            self,
-            "WidgetThemeDownload",
-            value=f"https://{widget_distribution.distribution_domain_name}"
-            f"/{_WIDGET_THEME_DEFAULTS_PREFIX}/{_WIDGET_THEME_FILE}",
-            description=(
-                "Downloads the settings file, theme.json. The instructions are inside "
-                "the file. Edit it, then upload it via WidgetThemeUpload."
+                "Start here: the settings editor for the chatbot's colour, font and "
+                "starter questions. Signed in, its Save publishes them straight to the "
+                "live widget - no upload, no redeploy. Not signed in, it downloads a "
+                "finished theme.json instead."
             ),
         )
         CfnOutput(

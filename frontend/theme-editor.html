@@ -1,18 +1,21 @@
 <!doctype html>
 <!--
   The settings editor: a form that fills in theme.json so nobody has to hand-edit JSON in
-  a text editor. Served at the widget bucket root next to theme-guide.html and linked from
-  the WidgetThemeEditor stack output. Two ways out of it: a signed-in librarian's Save
-  writes the live file directly (a PUT to the stack's save endpoint, gated by the
-  theme-admin Cognito pool), and the Download button still builds the same file for the
-  WidgetThemeUpload console route - which also remains the whole page for anyone unsigned.
+  a text editor. Served at the widget bucket root next to theme-guide.html, and the ONLY
+  theming page a stack output links (WidgetThemeEditor). Two ways out of it: a signed-in
+  librarian's Save writes the live file directly (a PUT to the stack's save endpoint,
+  gated by the theme-admin Cognito pool), and the Download button still builds the same
+  file for the console upload route - which also remains the whole page for anyone
+  unsigned. This page does not spell out that console procedure or name the output it
+  uses; theme-guide.html owns both, and the panel's download links it.
 
   The main view is the fields, the preview and Save, and nothing else: once Save writes
   the live file, the console upload is a fallback rather than the workflow, so it stopped
   earning room on the page. It, the refill-from-defaults action and the account controls
   live in the settings panel below - a native <dialog>, so Escape closes it and focus
   goes back to the control that opened it. The download MOVES there and never goes away:
-  an unsigned visitor has no other route to a theme.json.
+  an unsigned visitor has no other route to a theme.json. So does the guide link, which
+  is the guide's only route in the entire product now that its output is gone.
 
   Self-contained like the guide page: no external fonts, libraries or stylesheets, and no
   absolute URLs in the committed file. The save endpoint and the sign-in configuration are
@@ -135,9 +138,6 @@
     border-radius: 8px;
   }
   .field-error { color: #8a1c12; font-size: 0.9rem; margin: 0.5rem 0 0; }
-  .contrast-note { font-size: 0.9rem; margin: 0.5rem 0 0; max-width: 40rem; }
-  .contrast-note--warn { color: #8a1c12; }
-  .contrast-note--ok { color: var(--muted); }
 
   .font-option {
     display: flex;
@@ -402,8 +402,7 @@
   <fieldset class="field" data-theme-key="highlightColor">
     <legend>Highlight colour</legend>
     <p class="hint">Used for the header, the launcher, Send, your visitors' own chat
-    bubbles, and links. The text that sits on it is not a setting: the widget picks black
-    or white on its own, whichever reads better on your colour.</p>
+    bubbles, and links.</p>
     <div class="colour-row">
       <input type="color" id="colour-picker" value="#8a1c30"
              aria-label="Pick the highlight colour">
@@ -412,7 +411,6 @@
     </div>
     <p class="field-error" id="colour-error" hidden>Not a colour the widget can read. Use
     a hex value: six digits like <code>#1e4b8f</code>, or three like <code>#a13</code>.</p>
-    <p class="contrast-note" id="contrast-note" hidden></p>
   </fieldset>
 
   <fieldset class="field" data-theme-key="fontFamily">
@@ -466,8 +464,7 @@
     <legend>Starter questions</legend>
     <p class="hint">The example questions offered before anyone types, up to four per
     language, 120 characters each. Leave every Spanish field empty and Spanish-speaking
-    visitors see your English questions - nothing is machine-translated. Leave both
-    languages empty to keep the built-in questions.</p>
+    visitors see your English questions.</p>
     <fieldset class="qlang">
       <legend>English</legend>
       <input type="text" maxlength="120" data-question-slot="en-1" aria-label="English starter question 1">
@@ -493,9 +490,6 @@
 
 <aside class="preview-col" aria-label="Preview">
   <h2>Preview</h2>
-  <p class="hint">A picture of the widget with your settings - it updates as you type,
-  and it does not answer questions. Switch it to Espa&ntilde;ol to see what
-  Spanish-speaking visitors get.</p>
   <div class="pv-stage">
     <div class="pv-root" id="pv-root">
       <div class="pv-panel">
@@ -546,11 +540,8 @@
   <section class="panel-group">
     <h3>Download</h3>
     <button type="button" id="download">Download theme.json</button>
-    <p class="hint">Saves the settings as <code>theme.json</code> if you would rather
-    upload the file yourself. Open the <code>WidgetThemeUpload</code> link in the
-    CloudFormation Outputs tab and put it at the top level, next to
-    <code>widget.js</code> - <a href="theme-guide.html">the guide</a> walks through
-    it.</p>
+    <p class="hint">For if you would rather upload to S3 yourself.
+    <a href="theme-guide.html">The guide</a> walks through it.</p>
   </section>
 
   <section class="panel-group" id="account" hidden>
@@ -698,14 +689,6 @@
     return relativeLuminance(hex) > 0.1791 ? "#000000" : "#ffffff";
   }
 
-  function contrastRatio(a, b) {
-    var la = relativeLuminance(a);
-    var lb = relativeLuminance(b);
-    var hi = Math.max(la, lb);
-    var lo = Math.min(la, lb);
-    return (hi + 0.05) / (lo + 0.05);
-  }
-
   // The widget's readQuestionList: collapse whitespace, drop empties and over-long
   // entries rather than truncating, cap the count. Null when nothing usable remains.
   function cleanQuestionList(value) {
@@ -819,7 +802,7 @@
         "What can I help you find?",
       suggestionsLabel: "Try asking:",
       userSample: "Do you have laptop chargers?",
-      botSample: "Yes - laptop chargers can be borrowed at the front desk. See ",
+      botSample: "Yes, laptop chargers can be borrowed at the front desk. See ",
       botSampleLink: "equipment lending",
       botSampleEnd: " for the full list.",
       placeholder: "Ask a question…",
@@ -834,7 +817,7 @@
         "texto y lo que ofrece la biblioteca. ¿Qué buscas?",
       suggestionsLabel: "Prueba preguntando:",
       userSample: "¿Prestan cargadores de portátil?",
-      botSample: "Sí - puedes pedir un cargador en el mostrador. Consulta ",
+      botSample: "Sí, puedes pedir un cargador en el mostrador. Consulta ",
       botSampleLink: "préstamo de equipos",
       botSampleEnd: " para la lista completa.",
       placeholder: "Haz una pregunta…",
@@ -867,7 +850,6 @@
     var picker = document.getElementById("colour-picker");
     var hexInput = document.getElementById("colour-hex");
     var colourError = document.getElementById("colour-error");
-    var contrastNote = document.getElementById("contrast-note");
     var downloadBtn = document.getElementById("download");
     var status = document.getElementById("load-status");
     var pvRoot = document.getElementById("pv-root");
@@ -981,26 +963,6 @@
         pvSuggestions.appendChild(chip);
       });
 
-      // The one contrast the customer owns (docs/widget-theming.md): the highlight as
-      // TEXT on the widget's light surfaces. Header text is derived and always safe.
-      var worst = Math.min(
-        contrastRatio(state.highlight, "#ffffff"),
-        contrastRatio(state.highlight, "#f1f3f6")
-      );
-      contrastNote.hidden = false;
-      if (worst < 4.5) {
-        contrastNote.className = "contrast-note contrast-note--warn";
-        contrastNote.textContent =
-          "As link text on the widget's light backgrounds this colour measures " +
-          worst.toFixed(2) + ":1, below the 4.5:1 readability guideline. The header " +
-          "stays readable automatically, but check links and the starter questions " +
-          "with a contrast tool before going live.";
-      } else {
-        contrastNote.className = "contrast-note contrast-note--ok";
-        contrastNote.textContent =
-          "Links on the widget's light backgrounds measure " + worst.toFixed(2) +
-          ":1 with this colour, which clears the 4.5:1 readability guideline.";
-      }
     }
 
     function onHexTyped() {
@@ -1307,7 +1269,7 @@
           emailVerify.hidden = false;
           setStatus(
             emailStatus,
-            "A confirmation code was sent to the new address. Enter it below - until " +
+            "A confirmation code was sent to the new address. Enter it below. Until " +
             "then you keep signing in with the old one."
           );
         }).catch(function (err) {
