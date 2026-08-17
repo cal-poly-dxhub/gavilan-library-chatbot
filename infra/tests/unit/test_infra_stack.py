@@ -1244,22 +1244,17 @@ def test_demo_page_is_stamped_with_the_deployed_api_and_widget_urls():
     page = (
         pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
     ).read_text(encoding="utf-8")
-    expected = sum(
-        page.count(token)
-        for token in ("__API_URL__", "__WIDGET_SRC__", "__USER_POOL_ID__", "__CLIENT_ID__")
-    )
-    assert expected >= 4, "the demo page must carry every deploy-time placeholder"
+    expected = sum(page.count(token) for token in ("__API_URL__", "__WIDGET_SRC__"))
+    assert expected >= 2, "the demo page must carry every deploy-time placeholder"
     assert len(markers) == expected, (len(markers), expected)
 
-    # Each marker resolves to the HTTP API endpoint, the widget CDN domain, or one of the two
-    # sign-in ids (TEMPORARY, with the gate) - four distinct deploy-time values, no literals.
+    # Each marker resolves to the HTTP API endpoint or the widget CDN domain - two distinct
+    # deploy-time values, no literals.
     resolved = {json.dumps(v, sort_keys=True) for v in markers.values()}
-    assert len(resolved) == 4, resolved
+    assert len(resolved) == 2, resolved
     blob = json.dumps(sorted(resolved))
     assert "ChatbotHttpApi" in blob and "ApiEndpoint" in blob, blob
     assert "WidgetDistribution" in blob and "DomainName" in blob, blob
-    assert "DemoAuthUserPool" in blob, blob
-    assert "DemoAuthClient" in blob, blob
 
     # It lands in the demo bucket, and the deploy invalidates the page so a redeploy is
     # visible immediately instead of served from the edge cache.
@@ -1786,8 +1781,7 @@ def test_cost_model_reaches_the_page_for_a_fresh_install_in_another_account():
         pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
     ).read_text(encoding="utf-8")
     assert len(markers) == sum(
-        page.count(token)
-        for token in ("__API_URL__", "__WIDGET_SRC__", "__USER_POOL_ID__", "__CLIENT_ID__")
+        page.count(token) for token in ("__API_URL__", "__WIDGET_SRC__")
     )
 
 
@@ -2162,11 +2156,13 @@ def test_shipped_config_has_a_feedback_block_with_the_documented_knobs():
     assert block["notify_email"] == ""
 
 
-# --- Sign-in gate on POST /query (TEMPORARY: removed at go-live) ----------------
+# --- POST /query is public, and the pre-launch demo gate is gone ---------------
 #
-# The public demo link is unauthenticated Bedrock spend, and a link travels. These tests pin
-# the shape of the gate, not just its presence: which route it covers, that it trusts only
-# this pool and this client, and that no credential is anywhere near the template.
+# Before gavilan.edu carried the widget, the only thing driving billable /query was a
+# shareable demo URL, so the route sat behind a Cognito pool and a JWT authorizer. That gate
+# was DELETED at go-live rather than made switchable, because a config flag would have kept a
+# shared login and its username in a public repo. These tests pin the absence: the one gate
+# left in the product is the theme editor's, on PUT /theme.
 
 
 def _routes(template):
@@ -2177,12 +2173,9 @@ def _routes(template):
     }
 
 
-# Two pools now share the template (the demo gate's and the theme editor's, see the theme
-# save section below), so every gate test selects its resources by the name the stack gives
-# them rather than assuming it is alone.
-_DEMO_POOL_NAME = "gavilan-library-demo-access"
-_DEMO_CLIENT_NAME = "gavilan-library-demo-widget"
-_DEMO_AUTHORIZER_NAME = "gavilan-library-demo-access"
+# The theme editor's pool, client and authorizer are the only ones in the template. They are
+# still selected BY NAME rather than by "the only one", so a second pool arriving later fails
+# these tests loudly instead of being picked up by whichever happened to be first.
 _THEME_POOL_NAME = "gavilan-library-theme-admin"
 _THEME_CLIENT_NAME = "gavilan-library-theme-editor"
 _THEME_AUTHORIZER_NAME = "gavilan-library-theme-admin"
@@ -2210,180 +2203,114 @@ def _authorizer_named(template, name):
     return _named(template, "AWS::ApiGatewayV2::Authorizer", "Name", name)
 
 
-def test_query_is_gated_by_a_jwt_authorizer_and_the_open_routes_stay_open():
+def test_query_is_public_and_only_the_theme_write_is_gated():
     template = _template()
     routes = _routes(template)
 
+    # THE ACCEPTANCE CRITERION. /query takes an anonymous POST: no authorizer, and no
+    # AuthorizationType left behind at "JWT" pointing at a Ref that no longer resolves.
     query = routes["POST /query"]
-    assert query["AuthorizationType"] == "JWT", query
-    (demo_auth_lid,) = _authorizer_named(template, _DEMO_AUTHORIZER_NAME).keys()
-    assert query["AuthorizerId"] == {"Ref": demo_auth_lid}, query
-
-    # /warm fires on page load, before anyone could have signed in, so gating it would only
-    # guarantee a cold first query. It runs no generation call.
+    assert query.get("AuthorizationType", "NONE") == "NONE", query
+    assert "AuthorizerId" not in query, query
     assert routes["GET /warm"].get("AuthorizationType", "NONE") == "NONE", routes["GET /warm"]
 
-    # Exactly two routes are gated - the billable /query and the theme editor's write path
-    # (its own section below) - and by DIFFERENT authorizers: the demo pool must never
-    # guard a write, and the theme-admin pool must never guard demo spend.
+    # Exactly ONE gated route in the whole API, and it is the settings editor's Save - a
+    # write, not a read and not spend. Spelled as an equality so a new gate on /query (or
+    # anywhere else) fails here rather than passing a "PUT /theme is still gated" check.
     gated = sorted(
         key for key, props in routes.items() if props.get("AuthorizationType") == "JWT"
     )
-    assert gated == ["POST /query", "PUT /theme"], gated
-    assert routes["POST /query"]["AuthorizerId"] != routes["PUT /theme"]["AuthorizerId"]
+    assert gated == ["PUT /theme"], gated
+    (theme_auth_lid,) = _authorizer_named(template, _THEME_AUTHORIZER_NAME).keys()
+    assert routes["PUT /theme"]["AuthorizerId"] == {"Ref": theme_auth_lid}
 
 
-def test_the_authorizer_is_native_and_trusts_only_this_pool_and_this_client():
+def test_no_demo_pool_client_or_authorizer_is_left_in_the_template():
+    # The gate was a Cognito pool, a public app client and a JWT authorizer. Counting is what
+    # makes this bite: the theme editor legitimately owns one of each, so "there is a pool"
+    # proves nothing and "there are two" is exactly the regression.
     template = _template()
-    (auth,) = _authorizer_named(template, _DEMO_AUTHORIZER_NAME).values()
-    props = auth["Properties"]
-
-    assert props["AuthorizerType"] == "JWT", props
-    # No authorizer Lambda: nothing to cold-start, nothing to pay for, no code of ours in the
-    # auth decision. A JWT authorizer has no AuthorizerUri.
-    assert "AuthorizerUri" not in props, props
-    assert props["IdentitySource"] == ["$request.header.Authorization"], props
-
-    # The issuer is built from THIS stack's demo pool, at deploy time - never a pasted pool
-    # id, and never the theme-admin pool's.
-    issuer = json.dumps(props["JwtConfiguration"]["Issuer"])
-    assert "cognito-idp." in issuer and "AWS::Region" in issuer, issuer
-    (pool_lid,) = _pool_named(template, _DEMO_POOL_NAME).keys()
-    assert pool_lid in issuer, issuer
-
-    # AUDIENCE IS THE APP CLIENT ID. A Cognito ACCESS token carries no `aud`, it carries
-    # `client_id`, and API Gateway "validates client_id only if aud is not present" - which is
-    # what makes the access token the widget sends validate against this entry.
-    (client_lid,) = _client_named(template, _DEMO_CLIENT_NAME).keys()
-    assert props["JwtConfiguration"]["Audience"] == [{"Ref": client_lid}], props
-
-
-def test_the_app_client_is_public_password_auth_and_expires_in_a_day():
-    template = _template()
-    (client,) = _client_named(template, _DEMO_CLIENT_NAME).values()
-    props = client["Properties"]
-
-    # No secret: the widget is JavaScript in a browser, so a secret would be readable by anyone
-    # who views source, and Cognito refuses the unsigned browser call unless the client is public.
-    assert props["GenerateSecret"] is False, props
-    # USER_PASSWORD_AUTH is what a dependency-free widget can do without SRP's big-integer crypto.
-    # ALLOW_REFRESH_TOKEN_AUTH is added by Cognito; the widget drops the refresh token unread.
-    assert set(props["ExplicitAuthFlows"]) == {
-        "ALLOW_USER_PASSWORD_AUTH",
-        "ALLOW_REFRESH_TOKEN_AUTH",
-    }, props
-    # One sign-in covers the session, and one day is also Cognito's ceiling for an access token.
-    assert props["TokenValidityUnits"]["AccessToken"] == "minutes", props
-    assert props["AccessTokenValidity"] == 24 * 60, props
-    # The refresh token the widget throws away cannot outlive the session by the 30-day default.
-    assert props["RefreshTokenValidity"] == 24 * 60, props
-    assert props["PreventUserExistenceErrors"] == "ENABLED", props
-
-
-def test_the_pool_signs_in_by_plain_username_not_email():
-    template = _template()
-    (pool,) = _pool_named(template, _DEMO_POOL_NAME).values()
-    props = pool["Properties"]
-
-    # NEITHER UsernameAttributes NOR AliasAttributes: that is what a plain-username pool looks
-    # like, and it is what makes `admin-create-user --username gavtesting` valid. Set
-    # UsernameAttributes: ["email"] and Cognito requires the name to BE an address; set
-    # AliasAttributes and it rejects one that looks like an address. The captain hands the
-    # client a word, not a fake mailbox, so the pool takes a word.
-    #
-    # Sign-in options are immutable after creation - changing this later replaces the pool and
-    # the pool id the widget is built with - so it is pinned here rather than left to a deploy.
-    assert "UsernameAttributes" not in props, props
-    assert "AliasAttributes" not in props, props
-    # No standard attribute is required either, or step 1 would need --user-attributes.
-    assert "Schema" not in props, props
-    # No self-service recovery: nothing verified to send a code to, and the deployer's CLI is
-    # the only thing that should be able to move this password.
-    assert props["AccountRecoverySetting"]["RecoveryMechanisms"] == [
-        {"Name": "admin_only", "Priority": 1}
-    ], props
-    # Nobody signs themselves up.
-    assert props["AdminCreateUserConfig"]["AllowAdminCreateUserOnly"] is True, props
-    # The gate leaves with `cdk destroy`, and with the code deletion at go-live.
-    assert pool.get("DeletionPolicy") == "Delete", pool
-
-
-def test_the_printed_setup_commands_create_a_plain_username_account():
-    # These two strings ARE the handoff: if they do not run as printed, the demo has no login.
-    template = _template()
-    outputs = template.find_outputs("*")
-    create = json.dumps(outputs["DemoAuthCreateUserCommand"]["Value"])
-    set_pw = json.dumps(outputs["DemoAuthSetPasswordCommand"]["Value"])
-
-    assert "--username gavtesting" in create, create
-    assert "--username gavtesting" in set_pw, set_pw
-    # No email attribute: the pool asks for none, and passing one to a plain-username pool is
-    # noise the person running this would have to understand and edit.
-    assert "email" not in create, create
-    assert "@" not in create, create
-
-
-def test_the_gate_ships_no_credentials_and_takes_no_password_parameter():
-    # A password in a template is a password in the console, the changeset and the stack events.
-    # The account is created by hand after deploy - which is why the stack prints the commands.
-    template = _template()
-    body = template.to_json()
-    assert body.get("Parameters", {}).get("DemoAuthPassword") is None, "no password parameter"
-    for key in ("Password", "TemporaryPassword", "MFAConfiguration"):
-        assert f'"{key}":' not in json.dumps(
-            template.find_resources("AWS::Cognito::UserPool")
-        ), key
-    # No user is created in CloudFormation at all.
+    template.resource_count_is("AWS::Cognito::UserPool", 1)
+    template.resource_count_is("AWS::Cognito::UserPoolClient", 1)
+    template.resource_count_is("AWS::ApiGatewayV2::Authorizer", 1)
     template.resource_count_is("AWS::Cognito::UserPoolUser", 0)
-    # The deployer runs both steps with their own credentials, so both are printed - including
-    # --permanent, without which sign-in returns a challenge instead of a token.
-    outputs = template.find_outputs("*")
-    create = outputs["DemoAuthCreateUserCommand"]["Value"]
-    set_pw = outputs["DemoAuthSetPasswordCommand"]["Value"]
-    assert "admin-create-user" in json.dumps(create), create
-    assert "--permanent" in json.dumps(set_pw), set_pw
+
+    # ...and the one of each belongs to the theme editor, by name.
+    assert list(_pool_named(template, _THEME_POOL_NAME))
+    assert list(_client_named(template, _THEME_CLIENT_NAME))
+    assert list(_authorizer_named(template, _THEME_AUTHORIZER_NAME))
+
+    # Nothing in the rendered template still names the demo gate or its shared login. The
+    # username in particular: a public repo must not carry it, which is why the gate was
+    # deleted rather than put behind a config flag.
+    body = json.dumps(template.to_json())
+    for needle in ("gavtesting", "DemoAuth", "demo-access", "demo-widget"):
+        assert needle not in body, needle
 
 
-def test_the_embed_tag_and_the_demo_page_both_carry_the_sign_in_ids():
-    # An embed without them renders a widget that cannot obtain a token and 401s on every
-    # question. Both ids are public by design: they name the pool, they do not open it.
+def test_no_output_offers_a_sign_in_or_an_account_to_enrol_for_the_widget():
+    # The gate's whole handoff lived in the Outputs tab: two ids and two admin-create-user
+    # commands. All four are gone, and the embed tag is back to src + data-api-url.
     template = _template()
-    tag = json.dumps(template.find_outputs("WidgetEmbedTag"))
-    assert "data-user-pool-id" in tag and "data-client-id" in tag, tag
+    outputs = template.find_outputs("*")
+    for name in (
+        "DemoAuthUserPoolId",
+        "DemoAuthClientId",
+        "DemoAuthCreateUserCommand",
+        "DemoAuthSetPasswordCommand",
+    ):
+        assert name not in outputs, name
 
+    tag = json.dumps(template.find_outputs("WidgetEmbedTag"))
+    assert "data-user-pool-id" not in tag, tag
+    assert "data-client-id" not in tag, tag
+    assert "data-api-url" in tag, tag
+
+    # ONE admin-create-user command survives in the outputs, and it enrols a THEME EDITOR
+    # (an email address to invite), never a widget user.
+    commands = [
+        name
+        for name, out in outputs.items()
+        if "admin-create-user" in json.dumps(out["Value"])
+    ]
+    assert commands == ["ThemeAdminCreateUserCommand"], commands
+
+
+def test_the_demo_page_embeds_the_widget_with_no_sign_in_ids():
+    # The committed page, not just the stamped one: a leftover placeholder would be stamped
+    # with nothing and ship as a literal "__USER_POOL_ID__" attribute on the embed.
     page = (
         pathlib.Path(__file__).resolve().parents[3] / "frontend" / "demo-site.html"
     ).read_text(encoding="utf-8")
-    assert 'data-user-pool-id="__USER_POOL_ID__"' in page
-    assert 'data-client-id="__CLIENT_ID__"' in page
-    # ...and they are stamped at deploy, never hardcoded - see the marker test above.
+    for needle in ("data-user-pool-id", "data-client-id", "__USER_POOL_ID__", "__CLIENT_ID__"):
+        assert needle not in page, needle
     assert "us-west-2_" not in page, "no literal pool id may be committed to the page"
 
 
-def test_the_gate_does_not_touch_the_demo_distribution():
+def test_removing_the_gate_did_not_touch_the_demo_distribution():
     # HARD CONSTRAINT: the demo distribution's live alias and certificate exist only on the
-    # deployed resource, not in this template, so ANY update to it strips them. The gate reaches
-    # the demo page through its BucketDeployment (an S3 object write plus an invalidation), and
-    # an invalidation is not an update to the distribution resource.
+    # deployed resource, not in this template, so ANY update to it strips them. Deleting the
+    # gate reaches the demo page through its BucketDeployment (an S3 object write plus an
+    # invalidation), and an invalidation is not an update to the distribution resource.
     template = _template()
     demo = _distribution(template, "index.html")["Properties"]["DistributionConfig"]
     blob = json.dumps(demo)
     for needle in ("Cognito", "DemoAuth", "Authorizer", "user-pool"):
         assert needle not in blob, (needle, blob)
-    # The demo page still reaches /query cross-origin, which now needs the Authorization header
-    # through the preflight - that lives on the API's CORS config, not on the distribution.
+    # Authorization STAYS in allowHeaders after the gate: PUT /theme sends that header from
+    # JavaScript, so losing it would kill theme saves at the preflight. It lives on the API's
+    # CORS config, not on either distribution.
     api = _one(template, "AWS::ApiGatewayV2::Api")
     assert "Authorization" in api["Properties"]["CorsConfiguration"]["AllowHeaders"]
 
 
 # --- Theme save path: theme-admin pool, managed login, PUT /theme, key-scoped writer ---------
 #
-# PERMANENT, unlike the demo gate above: it guards a WRITE (the settings editor's Save rewrites
-# the live theme.json) rather than demo spend, so it survives go-live. These tests pin the
-# account lifecycle the handover depends on - invitation by EMAIL, verified-email recovery,
-# verification-before-email-change, the printed create-user command - and that the writer can
-# reach exactly one S3 object. The demo pool's own pins live in the section above; the last
-# test here holds the two gates apart.
+# The only sign-in in the product. It guards a WRITE - the settings editor's Save rewrites the
+# live theme.json - which is why it survives while the pre-launch gate on /query did not. These
+# tests pin the account lifecycle the handover depends on: invitation by EMAIL, verified-email
+# recovery, verification-before-email-change, the printed create-user command, and that the
+# writer can reach exactly one S3 object.
 
 
 def test_theme_admin_pool_signs_in_by_email_with_self_sign_up_off():
@@ -2510,9 +2437,8 @@ def test_theme_route_is_gated_by_its_own_authorizer_on_its_own_lambda():
     (theme_auth_lid,) = _authorizer_named(template, _THEME_AUTHORIZER_NAME).keys()
     assert theme["AuthorizerId"] == {"Ref": theme_auth_lid}, theme
 
-    # Same native-JWT shape as the demo gate: no authorizer Lambda, issuer built from
-    # THIS stack's theme pool, audience = the app client id (a Cognito ACCESS token
-    # carries client_id, not aud).
+    # Native JWT: no authorizer Lambda, issuer built from THIS stack's theme pool,
+    # audience = the app client id (a Cognito ACCESS token carries client_id, not aud).
     (auth,) = _authorizer_named(template, _THEME_AUTHORIZER_NAME).values()
     props = auth["Properties"]
     assert props["AuthorizerType"] == "JWT", props
@@ -2606,26 +2532,27 @@ def test_theme_editor_missing_a_placeholder_fails_synth():
         stack_module._WIDGET_THEME_EDITOR_FILE = original
 
 
-def test_the_demo_gate_is_untouched_by_the_theme_gate():
-    # The two gates must not bleed into each other: /query stays on the demo authorizer,
-    # the demo pool keeps the plain-username shape pinned in its own section, the demo
-    # client gains no OAuth surface, and the one hosted domain belongs to the theme pool.
+def test_the_theme_gate_is_the_only_sign_in_and_it_reaches_nothing_else():
+    # The theme editor's pool is the one sign-in left in the product, so its managed-login
+    # surface has to belong to it and to nothing else - and the hosted domain and branding
+    # exist exactly once, not once per pool as they did while the demo gate stood.
     template = _template()
-    template.resource_count_is("AWS::Cognito::UserPool", 2)
-    template.resource_count_is("AWS::Cognito::UserPoolClient", 2)
-    template.resource_count_is("AWS::ApiGatewayV2::Authorizer", 2)
     template.resource_count_is("AWS::Cognito::UserPoolDomain", 1)
     template.resource_count_is("AWS::Cognito::ManagedLoginBranding", 1)
-    # Still no user in CloudFormation, for EITHER pool: a template-owned user is
-    # replacement-on-update on every property.
+    # Still no user in CloudFormation: a template-owned user is replacement-on-update on
+    # every property, so it could not change email without wiping the librarian's password.
     template.resource_count_is("AWS::Cognito::UserPoolUser", 0)
 
-    routes = _routes(template)
-    (demo_auth_lid,) = _authorizer_named(template, _DEMO_AUTHORIZER_NAME).keys()
-    assert routes["POST /query"]["AuthorizerId"] == {"Ref": demo_auth_lid}
-
-    (demo_client,) = _client_named(template, _DEMO_CLIENT_NAME).values()
-    assert "AllowedOAuthFlows" not in demo_client["Properties"], demo_client
     (domain,) = template.find_resources("AWS::Cognito::UserPoolDomain").values()
     (theme_pool_lid,) = _pool_named(template, _THEME_POOL_NAME).keys()
     assert domain["Properties"]["UserPoolId"] == {"Ref": theme_pool_lid}, domain
+
+    # Its authorizer guards PUT /theme and nothing else - it must not drift onto the public
+    # /query the way the deleted demo authorizer sat there.
+    routes = _routes(template)
+    (theme_auth_lid,) = _authorizer_named(template, _THEME_AUTHORIZER_NAME).keys()
+    guarded = sorted(
+        key for key, props in routes.items()
+        if props.get("AuthorizerId") == {"Ref": theme_auth_lid}
+    )
+    assert guarded == ["PUT /theme"], guarded

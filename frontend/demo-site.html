@@ -868,15 +868,8 @@
     the token counts the meter above needs. The library's own embed
     omits it, and without it the widget's request body and responses
     are byte-identical to what they have always been.
-
-    The two sign-in ids are TEMPORARY and come off at go-live, along
-    with the Cognito pool and the authorizer. They gate this page's
-    /query calls behind one shared account, because this page is a
-    link and a link travels. They are not secrets: they name the
-    pool, they do not open it.
     ============================================================
   -->
-  <script src="__WIDGET_SRC__" data-api-url="__API_URL__" data-usage-events="true"
-          data-user-pool-id="__USER_POOL_ID__" data-client-id="__CLIENT_ID__" defer></script>
+  <script src="__WIDGET_SRC__" data-api-url="__API_URL__" data-usage-events="true" defer></script>
 </body>
 </html>
