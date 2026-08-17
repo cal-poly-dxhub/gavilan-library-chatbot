@@ -1,0 +1,4 @@
+# Dev/test deps. The unit tests stub boto3 in sys.modules, so boto3 is not required to
+# run them; only pytest and PyYAML (for the config loader) are.
+pytest==8.4.2
+PyYAML>=6.0,<7.0

@@ -1,0 +1,169 @@
+<!doctype html>
+<!--
+  The customer facing theming guide, served at the widget bucket root. NO stack output
+  points here: the Outputs tab names the settings editor and nothing else for theming, and
+  the only route to this page is the guide link in that editor's Settings panel. Keep it
+  that way - a second entry point is a second thing to keep true.
+  This file is the source of its own copy; edit it here. One file, nothing external: no
+  scripts, no fonts, no stylesheets, and its only links are the relative paths to
+  defaults/theme.json and theme-editor.html.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Changing the chatbot's colours and questions by hand</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: #1a1d21;
+    background: #ffffff;
+    max-width: 42rem;
+    margin: 0 auto;
+    padding: 2rem 1.25rem 4rem;
+    line-height: 1.6;
+  }
+  h1 {
+    font-size: 1.7rem;
+    line-height: 1.25;
+    color: #8a1c30;
+    margin: 0 0 1.5rem;
+  }
+  h2 {
+    font-size: 1.2rem;
+    margin: 2.25rem 0 0.5rem;
+  }
+  p, ul { margin: 0.75rem 0; }
+  li { margin: 0.35rem 0; }
+  code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Courier New", monospace;
+    font-size: 0.925em;
+    background: #f3f4f6;
+    border: 1px solid #e2e4e8;
+    border-radius: 4px;
+    padding: 0.1em 0.35em;
+  }
+  a { color: #8a1c30; }
+</style>
+</head>
+<body>
+
+<h1>Changing the chatbot's colours and questions by hand</h1>
+
+<h2>This is the manual version</h2>
+
+<p>The <a href="theme-editor.html">settings editor</a> is the normal way to make
+these changes. It offers the same three settings as a colour picker, a list of
+fonts and question fields, with a live preview, and when you are signed in its
+Save button puts your choices on the live widget straight away. If that worked for
+you, you do not need this page at all.</p>
+
+<p>This page is the manual route to the same result: edit the settings file
+yourself and upload it in the AWS console. Use it when nobody is signed in to the
+editor, or when you would rather keep the file.</p>
+
+<h2>What you can change</h2>
+
+<p>Three things: the main colour, the font, and the example questions the widget
+offers before anyone has typed.</p>
+
+<h2>Before you start</h2>
+
+<p>You need sign-in access to the college's AWS account. Every step below happens
+there.</p>
+
+<p>If someone asked you to make this change, ask them for:</p>
+
+<ul>
+  <li>the hex colour they want, for example <code>#1b3a6b</code></li>
+  <li>which font they want. The allowed fonts are listed inside the settings file
+  you download in step 1, so send them that list if they need it.</li>
+  <li>up to four suggested questions, per language</li>
+</ul>
+
+<h2>Step 1: get the settings file</h2>
+
+<p><a href="defaults/theme.json" target="_blank" rel="noopener">Download the settings file</a>. It saves to your
+computer as <code>theme.json</code>.</p>
+
+<p>Come back for a fresh copy any time. This link always gives you the original,
+untouched. The <a href="theme-editor.html">settings editor</a> has the same download
+in its <strong>Settings</strong> panel.</p>
+
+<h2>Step 2: edit it</h2>
+
+<p>Open <code>theme.json</code> in a plain text editor. VS Code is ideal. Notepad
+works.</p>
+
+<p>Do not use Microsoft Word, and do not use TextEdit in rich text mode. They
+replace straight quotes with curly ones, and the file then silently stops
+working.</p>
+
+<p>The instructions are inside the file. It explains all three settings.</p>
+
+<p>Save it, and keep the name exactly <code>theme.json</code>. If your editor adds
+<code>.txt</code>, remove it.</p>
+
+<h2>Step 3: upload it</h2>
+
+<p>In AWS, open CloudFormation, click the chatbot stack, and open the
+<strong>Outputs</strong> tab. At Gavilan College that stack is named
+<code>GavilanChatbotStack</code>.</p>
+
+<p>Click the link labelled <code>WidgetThemeUpload</code>. It opens the right
+storage location.</p>
+
+<p>Click <strong>Upload</strong>, drag <code>theme.json</code> in, and click
+<strong>Upload</strong> again. Accept every default.</p>
+
+<p>You will use this Outputs tab every time you want to make a change.</p>
+
+<h2>Step 4: check it</h2>
+
+<p>Wait a full minute. The settings are cached for 60 seconds, so a refresh before
+that still shows the old look.</p>
+
+<p>Then hard-refresh the library page. That is Cmd Shift R on a Mac, Ctrl Shift R
+on Windows.</p>
+
+<h2>Changing something later</h2>
+
+<p>Edit your saved <code>theme.json</code>, then upload it again the same way. The
+same filename replaces the old file. There is no delete step and no warning to
+answer.</p>
+
+<p>Keep your copy somewhere you will find it again. It is your working file.</p>
+
+<h2>Going back to the default look</h2>
+
+<p>Open <code>WidgetThemeUpload</code> and delete <code>theme.json</code> from the
+storage location. The widget goes back to the settings it shipped with.</p>
+
+<h2>If something looks wrong</h2>
+
+<p><strong>Nothing changed at all.</strong> Usually the cache. Wait the full minute
+and hard-refresh again. If it still looks the same, check that the file in the
+storage location is named exactly <code>theme.json</code>, with no
+<code>.txt</code> and no <code>(1)</code>.</p>
+
+<p><strong>Everything went back to the default look.</strong> The file is probably
+malformed. A missing comma, a curly quote, or an extra comma after the last entry
+will do it. The widget is built to ignore a broken settings file rather than break
+the page, so nothing reports an error anywhere. Paste the contents into any online
+JSON validator, fix what it reports, and upload again.</p>
+
+<p><strong>A colour looks wrong rather than missing.</strong> Text colour is not a
+setting. The widget picks black or white on its own, whichever is easier to read
+against your colour. A pale colour turns the text black.</p>
+
+<p><strong>The page itself is broken.</strong> That is not the theme. No settings
+file, however bad, can affect the page the widget sits on. Raise it with
+DxHub.</p>
+
+<h2>Back to the editor</h2>
+
+<p>The <a href="theme-editor.html">settings editor</a> does all of the above for
+you, and saves directly to the live widget once you are signed in.</p>
+
+</body>
+</html>

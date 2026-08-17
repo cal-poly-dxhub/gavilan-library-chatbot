@@ -1,0 +1,575 @@
+# Gavilan Library Chatbot - declarative configuration.
+#
+# Single source of truth for changeable knobs. The CDK app in infra/ reads this file
+# (resolved at the repo root, one level up from infra/) and wires the values into the
+# stack. 
+
+knowledge_base:
+  name: gavilan-library-kb
+  # Titan Text Embeddings v2 -> 1024-dimension vectors.
+  embedding_model_id: amazon.titan-embed-text-v2:0
+  vector_dimension: 1024
+
+vector_store:
+  # Amazon S3 Vectors store. Semantic-search-only (no hybrid): a deliberate cost/simplicity
+  # tradeoff. Keyword coverage is handled by agentifying the bot with a structured lookup tool.
+  #
+  # Vector-bucket names follow S3-style rules (3-63 chars, lowercase letters/numbers/hyphens).
+  vector_bucket_name: gavilan-library-vectors
+  # Index name: 3-63 chars, lowercase letters/numbers/hyphens/dots.
+  index_name: bedrock-knowledge-base-default-index
+  # float32 is the only supported vector data type.
+  data_type: float32
+  # cosine: Titan Embed Text v2 embeddings are normalized, so cosine ranks equivalently to the
+  # old OpenSearch l2. (Index dimension is knowledge_base.vector_dimension = 1024, the single
+  # source of truth; it MUST equal the embedding model's output or ingestion fails.)
+  distance_metric: cosine
+  # Bedrock-internal metadata keys marked NON-filterable AT CREATION (IMMUTABLE afterward). Left
+  # filterable, they blow S3 Vectors' ~1 KB / 35-key filterable-metadata limit and every ingestion
+  # fails with ValidationException. AMAZON_BEDROCK_TEXT (chunk text) + AMAZON_BEDROCK_METADATA are
+  # the documented culprits; the x-amz-bedrock-kb-* keys are added defensively (max is 10 keys, we
+  # use 5). Retrieval never filters on any of these, so non-filterable costs nothing.
+  non_filterable_metadata_keys:
+    - AMAZON_BEDROCK_TEXT
+    - AMAZON_BEDROCK_METADATA
+    - x-amz-bedrock-kb-source-uri
+    - x-amz-bedrock-kb-chunk-id
+    - x-amz-bedrock-kb-data-source-id
+
+data_source:
+  web_crawler:
+    # Seed URLs to crawl. Replace with the library pages you want ingested.
+    seed_urls:
+      - https://www.gavilan.edu/library/
+    # Blacklist regex patterns (exclusion filters). Empty for now.
+    exclude_patterns: []
+    # Allowlist regex patterns (inclusion filters). Empty for now.
+    include_patterns: []
+    # Crawl scope. One of: DEFAULT, HOST_ONLY, SUBDOMAINS.
+    # HOST_ONLY keeps the crawl on www.gavilan.edu and does not wander to subdomains.
+    scope: HOST_ONLY
+    # Rate limits.
+    max_pages: 1000
+    rate_limit: 300   # max crawl requests per minute
+
+# --- Custom scraper (runs as a Lambda on a tiered schedule; also runnable locally) ---
+#
+# Replaces the removed managed Web Crawler. scraper/scraper.py is the importable fetch/extract
+# core (also a CLI that writes markdown + a metadata JSON sidecar per page to output_dir for
+# manual inspection); scraper/lambda_function.py wraps it to upload into the KB S3 source bucket.
+# The URL lists are EXPLICIT and curated - NO recursive crawling (the managed crawler over-crawled
+# the /library/ tree and hit ingestion limits, so pages are listed explicitly instead).
+#
+# FRESHNESS TIERS. Every seed URL lives under exactly one tier, and each tier carries its own
+# EventBridge cron. This block is the ONLY place either is declared: moving a page between tiers
+# is moving a line, and changing a cadence is editing a cron string. No code change for either.
+#
+# The tiers answer the question the library will certainly ask - "we changed our hours, when does
+# the bot know?" - with "hours within a day, everything else within five" instead of the old
+# single weekly scrape's "up to a week".
+#
+# Scraping more often is nearly free, which is what makes this affordable: Bedrock knowledge-base
+# sync is incremental (unchanged documents are skipped, not re-embedded), and the scraper now
+# hashes each page's extracted content against what is already in the source bucket, so an
+# unchanged page uploads nothing and starts no ingestion job. The one genuinely per-run cost is
+# the Sonnet call that enriches the database catalog, and that is gated separately (see `catalog`
+# below): it runs only when the parsed databases.php rows actually change, and never on the fast
+# tier at all.
+scraper:
+  tiers:
+    # FAST: pages that carry hours, closures, holiday schedules, semester dates, or dated
+    # announcements. It fetches ONLY the three URLs listed here - never the whole site - and it
+    # never touches the database catalog, so a daily run is three HTTP GETs and, on a day when
+    # nothing changed, zero uploads, zero ingestion, and zero model calls.
+    #
+    # 11:30 UTC (~3:30-4:30am Pacific) is deliberately 90 minutes clear of the full tier's slot
+    # below. Overlap is handled correctly if it ever happens (the scraper skips when an ingestion
+    # job is already running, and the next run picks the change back up), but the cheapest fix
+    # for a once-per-five-days collision is to not schedule them at the same minute.
+    fast:
+      schedule_cron: "cron(30 11 * * ? *)"
+      urls:
+        # THE hours page: "LIBRARY HOURS" per semester, each semester's date range, and the
+        # holiday-closure list. Verified 2026-07-29 as the library's single authoritative hours
+        # source - the library home page carries no hours of its own, only links to this page's
+        # #hours anchor. Also holds the staff directory, which rides along harmlessly.
+        - https://www.gavilan.edu/library/about-the-library.php
+        # Financial Aid office hours, and they are TERM-BOUNDED ("Summer Hours: July 6 - August 1,
+        # 2026") plus a separate Hollister drop-in schedule, so they turn over several times a year.
+        - https://www.gavilan.edu/finaid/index.php
+        # Bookstore "Store Hours" plus dated one-off closure announcements ("The Bookstore will be
+        # closed Monday May 25th") - the announcement pattern this tier exists to catch.
+        - https://www.gavilan.edu/student/bookstore/index.php
+    # FULL: everything else - policies, services, FAQs, about pages, the databases page.
+    #
+    # NOTE WHAT "full" MEANS AT RUN TIME: a full run fetches EVERY url in this block, fast tier
+    # included, not just the ones listed under it. It is the complete refresh, so it self-heals a
+    # fast tier that has been failing and it keeps the stale-object prune (which deletes anything
+    # configuration no longer calls for) safe by construction - a run that saw only a third of the
+    # corpus must never be allowed to decide what is stale. The extra cost is three HTTP GETs
+    # every five days; with change gating they upload nothing when nothing changed.
+    #
+    # The cron fires on the 1st, 6th, 11th, 16th, 21st and 26th at 10:00 UTC (~2-3am Pacific),
+    # which is exactly five days apart within a month and 3-6 days across a month boundary. That
+    # is a deliberate trade for a FIXED low-traffic maintenance window: EventBridge's `rate(5 days)`
+    # would hold the interval exactly but drifts the time of day and re-anchors on every deploy.
+    full:
+      schedule_cron: "cron(0 10 1,6,11,16,21,26 * ? *)"
+      urls:
+        - https://www.gavilan.edu/library/howdoi.php
+        - https://www.gavilan.edu/library/libraryservices.php
+        - https://www.gavilan.edu/library/contactus.php
+        - https://www.gavilan.edu/library/ill.php
+        - https://www.gavilan.edu/library/researchassistance.php
+        - https://www.gavilan.edu/library/findresources.php
+        - https://www.gavilan.edu/library/librarycard.php
+        - https://www.gavilan.edu/library/libcardexamples.php
+        - https://www.gavilan.edu/library/citingsources.php
+        - https://www.gavilan.edu/library/librarycourses.php
+        - https://www.gavilan.edu/library/facultyservices.php
+        - https://www.gavilan.edu/library/otherlibraries.php
+        - https://www.gavilan.edu/library/orientationrequest.php
+        # Stays in the SEED list but is excluded from the KB below: the scraper parses this page's
+        # HTML to regenerate the held database_catalog (lambda_function.regenerate_catalog looks for
+        # "databases.php" in the scrape results), so dropping it here would silently freeze the
+        # catalog at its last-good copy. FULL tier on purpose - it is the only page whose scrape
+        # can cost a model call, and there is nothing time-sensitive on it.
+        - https://www.gavilan.edu/library/databases.php
+        # REMOVED: sites.php ("Selected Websites by Subject"). 13,209 chars - the single largest noise
+        # source in the corpus. It is 133 alphabetical entries of EXTERNAL website names, and the
+        # extractor strips their URLs, so the bot could name a site but never link to it while
+        # <citations> forbids writing the URL from memory. In a live 11-question round it surfaced in
+        # 8 answers and contributed to none: subject words match nearly every query. Nothing is lost -
+        # researchassistance.php still describes the service, and the questions it would serve are
+        # research questions, which are out of scope by design.
+        # Laptop and equipment support. The ONLY source for the program lending list (EOPS,
+        # Non-Credit, CTE, El Centro, AEC), the semester renewal-by-emailed-form flow, and the
+        # "laptop tech support goes to circulation, not IT" routing. Note it contradicts
+        # howdoi.php ("Reserves and semester laptops cannot be renewed") - staff are resolving.
+        # "semester" here is a LOAN PERIOD, not a schedule, so this is not a fast-tier page.
+        - https://www.gavilan.edu/library/laptopsupport.php
+        # --- College pages, not library pages ---
+        # Every seed above is under /library/. The college pages answer questions the bot is
+        # actually asked but the library site cannot cover: where a campus office is, and which
+        # books a course requires. They widen scope past library operations, which is deliberate.
+        # (finaid and bookstore are the other two, and they are in the fast tier above because
+        # their hours turn over per-term.)
+        #   main_map - Office Guide (Financial Aid Office -> SC) + Building Guide legend. Static
+        #   building/room mapping with no hours on it, so it belongs here.
+        - https://www.gavilan.edu/about/maps/main_map.php
+  # Scraped for their side effects, never indexed. The scraper fetches these normally but does not
+  # upload them to the KB source bucket, and the prune step keeps them out of it.
+  #   databases.php - regenerate_catalog needs its HTML, but the CONTENT is redundant: the whole
+  #   page is names + descriptions by subject, which is exactly what the authoritative
+  #   database_catalog tool serves, and its one unique line (off-campus access needs your library
+  #   card or GavID) is already duplicated in researchassistance.php. At 15,221 chars it would
+  #   otherwise be a third of the entire corpus and it surfaced as retrieval noise 5 times in one
+  #   live round without ever contributing to an answer.
+  kb_exclude_urls:
+    - https://www.gavilan.edu/library/databases.php
+  output_dir: ./scraper_output
+  timeout_seconds: 20
+  user_agent: "GavilanLibraryScraper/1.0 (+https://www.gavilan.edu/library/)"
+
+chunking:
+  # v1 uses managed FIXED_SIZE chunking (architecture.md Phase 1). Phase 2 moves to
+  # HIERARCHICAL. One of: FIXED_SIZE, HIERARCHICAL, SEMANTIC, NONE.
+  strategy: FIXED_SIZE
+  # 600, not 300. The offline chunking eval (eval/run_chunking_eval.py) measured 300-token
+  # boundaries cutting 26% of golden answers in half - the library's hours table and staff
+  # directory live on one page and a 300-token window splits them, which is why several answers
+  # cited the right page but gave contact details with no hours. At 600 evidence integrity is
+  # 100%. CAVEAT: that eval measures BOUNDARIES only, never ranking - a bigger chunk averages its
+  # embedding over more text and can retrieve less precisely. Re-run eval/retrieval_probe.py
+  # after any change here and compare against the 300-token baseline (recall@1 71%, @3 88%,
+  # @5 94%, @8 100%). CHANGING THIS IS DESTRUCTIVE: Bedrock chunking is immutable, so CDK
+  # replaces the data source and the whole corpus re-indexes.
+  max_tokens: 600
+  overlap_percentage: 20
+
+# --- Query path (Lambda + HTTP API) ---
+
+http_api:
+  # Stage-level request throttling, applied to EVERY route (/query and /warm). This is the
+  # load-bearing cost-abuse control for the public, unauthenticated endpoint that fans out to
+  # paid Bedrock calls - it is the stated reason WAF was excluded. Sized for a single library
+  # widget: a handful of requests/sec with a small burst. Clients get HTTP 429 over the limit.
+  throttling_rate_limit: 10     # steady-state requests per second across the stage
+  throttling_burst_limit: 20    # maximum burst (bucket capacity)
+
+# --- CORS (browser preflight allowlist for the HTTP API) ---
+#
+# Which page origins a BROWSER will let call /query and /warm. The widget is embedded on
+# https://www.gavilan.edu/library/, but the browser sends a host-only Origin header
+# (https://www.gavilan.edu) - the path is irrelevant to CORS, so do not add one here.
+#
+# This is NOT a security boundary: CORS is browser-enforced only, so curl/scripts bypass it
+# entirely. API Gateway stage throttling above stays the real cost cap. What this DOES buy is
+# stopping a random third-party site from silently driving our billable /query endpoint
+# (Bedrock + Primo spend) from its visitors' browsers.
+#
+# Never set this to "*" - the stack rejects a wildcard at synth. We send no cookies or auth
+# headers, so AllowCredentials stays off and the wildcard-with-credentials rules do not apply.
+# Entries are matched as EXACT, FULL origin strings by API Gateway, so each one is scheme +
+# host (+ port), with no trailing slash and no path. A stray slash does not "mostly work" - it
+# never matches, and the browser blocks every call from that origin.
+cors:
+  allow_origins:
+    - https://www.gavilan.edu       # production: the library site hosting the widget
+    - http://localhost:8000         # DEV ONLY (frontend/demo.html) - safe to delete for final launch
+    # The demo site's custom hostname. The stack already appends the demo distribution's own
+    # *.cloudfront.net origin at deploy time, but that is a DIFFERENT origin string: a browser
+    # on the friendly hostname sends this one, matches nothing, and the chat dies while the
+    # page itself loads fine. Listed here rather than derived because the hostname is a DNS +
+    # certificate decision made outside this stack (the distribution carries no alternate
+    # domain name), so nothing in the template knows it exists.
+    - https://gavbot-demo.calpoly.io
+
+# --- Shareable demo site ---
+#
+# A public page (its own S3 bucket + CloudFront distribution) that embeds the production widget
+# in a Gavilan-Library-looking sample site, so one `cdk deploy` hands back a link the client can
+# open with no setup. The page is frontend/demo-site.html; the stack stamps the deployed API URL
+# and widget CDN URL into it at deploy time, so nothing about it is account- or region-specific.
+#
+# Two things follow from enabling it, both handled by the stack:
+#   - its CloudFront origin is appended to the CORS allowlist above (the demo runs the REAL
+#     cross-origin embed, so the browser needs the origin listed - it is resolved from the
+#     distribution at deploy, never hardcoded)
+#   - the page is served with a noindex meta tag AND an X-Robots-Tag response header
+#
+# Set to false for a launched install that no longer needs a showcase; the next deploy removes
+# the bucket, the distribution, and the extra CORS origin. Removing the widget/production path
+# is NOT affected either way - the demo has its own bucket and CDN.
+demo_site:
+  enabled: true
+
+# --- Cost model (the demo page's session meter + monthly estimator) ---------------------
+#
+# Feeds frontend/demo-site.html, which the stack stamps at deploy time exactly like the API
+# and widget URLs. Nothing here reaches a Lambda, and nothing here reads a bill: it is
+# published list rates multiplied by MEASURED usage. No Cost Explorer call, no account
+# spend, no billing API - the page says "estimate" everywhere for that reason.
+#
+# TWO HALVES, deliberately kept apart:
+#   rates     - published AWS list prices. Change when AWS changes them, and move `as_of`.
+#   measured  - what one real question actually consumed, from eval/measure_usage.py against
+#               the deployed endpoint. Re-run that script and paste its output after any
+#               change that moves token usage (retrieval.number_of_results, chunking,
+#               the system prompt, the link table, generation.max_tokens).
+#
+# WHY MEASURED AND NOT DERIVED. Three things make the obvious estimate wrong, and all three
+# are invisible from the outside:
+#   - one question is not one model call (agentic loop, and each call resends everything);
+#   - the retrieved passages ride in the input tokens and dominate them;
+#   - the guardrail bills per 1,000-character text unit, not per question.
+cost_model:
+  # Shown on the page. Rates move; a figure with no date is not checkable.
+  as_of: "2026-07-29"
+  region: us-west-2
+  currency: USD
+
+  # Published AWS list prices for us-west-2, verified 2026-07-29.
+  # Sources: Claude Sonnet 4.6 on Bedrock ($3/$15 per million tokens, aws.amazon.com/bedrock/pricing);
+  # everything else from the AWS Price List API for us-west-2 (Titan Embed V2, the guardrail
+  # policy unit rates) and the S3 / Lambda / API Gateway / CloudFront pricing pages.
+  # NOTE: the Price List API does not publish the newer Bedrock Anthropic models, so the
+  # generation rates come from the pricing page rather than the API. Recheck both on update.
+  rates:
+    generation_input_per_1m: 3.00        # Claude Sonnet 4.6 input
+    generation_output_per_1m: 15.00      # Claude Sonnet 4.6 output
+    embedding_per_1m: 0.02               # Titan Text Embeddings V2
+    guardrail_content_per_1k_units: 0.15 # content filters, per 1,000 text units
+    # NO sensitive-information (PII) rate: the PII policy was removed with the rest of the
+    # guardrail scope-down, so there is no line for it to price.
+    vector_query_per_1m: 2.50            # S3 Vectors queries
+    vector_storage_per_gb_month: 0.06    # S3 Vectors storage
+    vector_put_per_gb: 0.20              # S3 Vectors writes (128 KB minimum per PUT)
+    s3_storage_per_gb_month: 0.0265      # S3 Standard, first 50 TB
+    lambda_per_1m_requests: 0.20
+    lambda_per_gb_second: 0.0000166667
+    api_requests_per_1m: 1.00            # HTTP API (API Gateway v2), first 300M
+    cloudfront_per_1m_requests: 1.00     # HTTPS requests, North America
+    logs_ingest_per_gb: 0.50
+
+  # What ONE question actually consumed, measured live. See eval/measure_usage.py.
+  measured:
+    at: "2026-07-29"
+    # 20 single-turn questions spanning all four tools, plus 5 conversations run 8 turns deep.
+    sample_questions: 60
+    # Converse invocations per question. Above 1 because the loop re-calls the model after a
+    # tool result; first questions need a second call far more often than follow-ups do.
+    model_calls_avg: 1.23
+    # Input tokens for ONE model call: system prompt + link table + history + the retrieved
+    # passages. Measured PER CALL rather than per question so the loop-length effect and the
+    # history-depth effect stay separable - the estimator multiplies them back together.
+    context_tokens_per_call_base: 10666
+    # The depth effect, isolated. Small on purpose: _seed_messages rebuilds history from TEXT
+    # turns only, so a prior turn adds a question and an answer, NOT the passages behind them.
+    # It also stops growing once MAX_HISTORY_MESSAGES trims, around the fifth exchange.
+    context_tokens_per_call_per_prior_turn: 54
+    output_tokens_avg: 230
+    retrievals_avg: 1.08
+    # Content-filter text units per question. NOT re-measured since the guardrail scope-down -
+    # the old 2.22 measured a shape that no longer exists (an input screen PLUS an output
+    # backstop billing on every Converse turn). With only the input screen left there is
+    # exactly ONE ApplyGuardrail call per question, over the student's question alone, and a
+    # text unit covers 1,000 characters - so 1.0 for anything under that, and the server-side
+    # cap (request.max_query_chars) makes 2 the ceiling. Re-run eval/measure_usage.py to
+    # replace this with a measured figure.
+    guardrail_content_units_avg: 1.0
+    # Query Lambda compute per question: measured mean billed duration 6.58s at 256 MB.
+    # Small (well under a tenth of a cent) but it is the one per-question cost that is not
+    # Bedrock, so leaving it out would make the model look tidier than it is.
+    query_lambda_gb_seconds: 1.64
+    # Tokens embedded per retrieval (the priming query is capped at 400 characters).
+    retrieval_query_tokens: 100
+
+  # What exists when nobody is asking anything. Inputs, not answers: the page multiplies
+  # these by the rates above and shows the itemization, so the floor can be checked rather
+  # than trusted. All measured against the deployed stack on 2026-07-29.
+  baseline:
+    # S3 Standard across all four buckets (KB source, catalog, widget, demo page).
+    s3_stored_bytes: 135177
+    # S3 Vectors: 24 vectors in the live index; 1024 float32 dims plus the chunk text and
+    # Bedrock's metadata keys.
+    vector_count: 24
+    vector_bytes_each: 7000
+    # Tokens embedded by ONE full re-ingestion: the 18 indexed documents (~7,500 tokens)
+    # plus the 20% chunk overlap.
+    ingest_embedded_tokens: 9000
+    # Scraper Lambda: 512 MB, measured billed durations of 25s and 67s. That is a FULL run over
+    # all 19 pages; a fast-tier run fetches 3, so applying this figure to every run overstates
+    # the Lambda line. Left conservative on purpose - the whole line is a fraction of a cent.
+    scraper_seconds_per_run: 46
+    scraper_memory_gb: 0.5
+    # Scraper INVOCATIONS per month, from the tiered schedule above: the fast tier daily (~30.4)
+    # plus the full sweep on the 1st/6th/11th/16th/21st/26th (6). This drives Lambda compute only.
+    scrapes_per_month: 36.4
+    # RE-INDEXES per month - how often a run actually finds changed content and pays for
+    # embeddings + S3 Vectors writes. Deliberately a SEPARATE number from scrapes_per_month,
+    # because change gating broke the old one-to-one relationship: most runs now upload nothing
+    # and start no ingestion job, so counting every scrape as a re-index would overstate this
+    # line roughly ninefold. Like deploys_per_month this is an assumption about how often the
+    # library edits its site, not a measurement - nobody can measure it for you.
+    reindexes_per_month: 4
+    # `cdk deploy` re-runs the scraper only when the SCRAPER LAMBDA ITSELF changed: the install
+    # Trigger is tied to the function's currentVersion, whose logical id hashes the code asset
+    # plus the function configuration, so a widget/demo/query-path deploy does not fire it.
+    # Assumption, not a measurement, and an upper bound for that reason. Shown as a line item.
+    deploys_per_month: 4
+    # CloudWatch Logs across the stack's log groups, at rest.
+    log_gb_per_month: 0.02
+
+request:
+  # Max characters accepted for a user query. Over this, the handler returns HTTP 400 BEFORE
+  # any retrieval or guardrail call. This is the real server-side size control
+  # (the widget maxlength is advisory UX only); the platform limits (API GW 10MB / Lambda 6MB)
+  # are far too high to guard against cost-amplifying huge pastes. A library FAQ question is
+  # short, so 2000 chars is already generous.
+  max_query_chars: 2000
+
+retrieval:
+  # Number of KB chunks to retrieve per query and feed to generation.
+  #
+  # Raised 5 -> 8 after a live round where the answer to "how do I get help with research?" was
+  # missing the reference desk's phone/email/chat entirely: that block exists in libraryservices.php
+  # and simply lost a slot race, while two of the five slots went to near-miss noise (an A-Z link
+  # fragment from sites.php and a faculty-facing page). The block was retrievable, just ranked out.
+  # Cheapest lever available - config only, no re-ingest, and it costs a few hundred tokens a turn.
+  number_of_results: 8
+
+generation:
+  # Bedrock-hosted Claude model for answer generation, invoked via a CROSS-REGION INFERENCE
+  # PROFILE.
+  model_id: us.anthropic.claude-sonnet-4-6
+  # Converse inference knobs. A factual FAQ bot wants short, direct, low-variance answers: cap
+  # the output length and keep temperature low. Sensible ranges: max_tokens ~500-700,
+  # temperature 0-0.3.
+  max_tokens: 600
+  temperature: 0.2
+
+# --- Database catalog (Phase 2b: self-updating) ---
+#
+# The database_catalog tool's HELD list is regenerated from databases.php: the scraper parses the
+# A-Z table (deterministic names/descriptions/URLs) then a model enriches each database with
+# subjects + aliases, and writes the result to S3. The agent reads that fresh copy. The
+# hand-authored NOT-HELD list stays in the bundled app/data/database_catalog.json (absence can't
+# be scraped) and is merged in at read time.
+#
+# WHEN THIS RUNS, AND WHY IT IS GATED. This model call is the only meaningful per-run cost in the
+# whole ingestion path - embeddings, S3 Vectors writes, Lambda and EventBridge are pennies or free
+# at this corpus size - so it is the thing the change gating exists to protect. Two gates:
+#   - it is on a FULL-tier page, so the daily fast tier never reaches it at all;
+#   - a full run fingerprints the PARSED rows (name/description/url) and compares against the
+#     fingerprint stored in the catalog object it wrote last time. Identical rows -> the catalog
+#     is left completely untouched, no model call and no S3 write.
+# The parsed rows are hashed rather than the raw HTML on purpose: enrichment only ever sees those
+# three fields, so a nav tweak or a rotating banner must not be able to bill a Sonnet call.
+catalog:
+  # S3 object key for the regenerated held catalog (in the dedicated catalog bucket the stack
+  # creates). The bucket name is wired to both Lambdas as an env var by the stack.
+  s3_key: database_catalog.json
+  # Model that assigns subjects + aliases to each parsed database. Runs at most once per FULL
+  # scrape, only when the parsed rows changed, and then only for newly-added databases. Measured
+  # 2026-07-29 against the live page: 3,395 in / 3,359 out tokens ($0.06 at the rates above) to
+  # enrich all 46 databases from scratch, and 242 in / 111 out ($0.002) for a single added one -
+  # so the steady-state cost is the second figure on the rare month the library adds a database,
+  # and zero otherwise. A live dry-run showed
+  # Sonnet 4.6 produces high-quality subjects AND aliases (e.g. "EBSCO", "OVIC", "PBSC"), matching
+  # the hand-built catalog; cheaper models gave good subjects but almost no aliases, which would
+  # break name-matching like "do you have EBSCO?". So use Sonnet.
+  enrichment_model_id: us.anthropic.claude-sonnet-4-6
+  # Robustness guard: the smallest plausible number of databases a good extraction yields. If a
+  # scrape parses fewer (page broken/restructured), the scraper KEEPS the last-good catalog instead
+  # of overwriting it. The real page currently lists ~46; 30 leaves headroom without accepting junk.
+  min_databases: 30
+  # Per-container cache TTL (seconds) for the agent's S3 read of the catalog. Weekly-changing data,
+  # so 15 min stale is fine and avoids an S3 GET per query.
+  cache_ttl_seconds: 900
+
+# --- Curated library links tool (library_links) ---
+#
+# A FIFTH agent tool: a small hand-authored table of the library's and college's canonical URLs
+# (library home page, campus map, bookstore, research guides, ILL, laptop record, ...). It exists
+# because no other path can produce these links - the KB only knows the scraped seed pages above,
+# database_catalog cites the A-Z page, and the Primo tools cite per-query search URLs - so without
+# it the model could only surface such a link by writing a URL from memory.
+#
+# Unlike the database catalog this is STATIC: it is bundled with the query Lambda, so there is no
+# S3 object, no scraper step, and no cache TTL to tune. Edit app/data/<data_file> and redeploy.
+# The single knob is the bundled filename, and the stack uses it for BOTH the Lambda asset include
+# and the LIBRARY_LINKS_FILE env var so the two can never drift.
+library_links:
+  data_file: library_links.json
+
+# --- Primo book/media catalog tool (search_book_catalog) ---
+#
+# A THIRD agent tool: a LIVE search of Gavilan's Primo discovery catalog (an undocumented public
+# JSON endpoint the library sanctioned) for books/media. It returns candidate records + real-time
+# availability; the MODEL judges whether any is a real match (Primo is NOT authoritative about
+# absence - only total == 0 is a clean not-held signal). The endpoint identity (host, inst, vid,
+# scope) is tied to the institution and lives in code (app/handler.py), not here; only the
+# behavioral knobs below are tunable. It is a live third-party call inside the agent loop, so it
+# is timed out and soft-fails (a dead Primo never kills a query).
+primo:
+  # Per-HTTP-call socket timeout (seconds) for each Primo call (the search + each availability
+  # lookup). Bounds how long a slow Primo can hold the Converse loop / Lambda budget.
+  timeout_seconds: 5
+  # Number of candidate records returned to the model to judge. Each also costs one availability
+  # (delivery) call, so keep this small - a few good candidates is enough for the model to match.
+  number_of_results: 4
+  # Total wall-clock cap (seconds) across ALL per-result availability lookups in one search. Past
+  # it, remaining results report availability "unknown" instead of pushing toward the Lambda
+  # timeout. Sized so search + availability stay well under the Lambda 30s with room for Converse.
+  availability_budget_seconds: 8
+
+# --- Bedrock Guardrails ---
+#
+# ONE guardrail, screening ONE category: PROMPT_ATTACK, on the INPUT side only.
+#
+# It runs via the standalone ApplyGuardrail API (source=INPUT) on the BARE user query,
+# BEFORE the Converse loop. A block returns blocked_input_messaging and never reaches
+# retrieval or generation, so an injection attempt costs one guardrail call and no
+# generation spend.
+#
+# WHY NOTHING ELSE IS SCREENED. The input screen runs AHEAD of the system prompt, so
+# anything it decides pre-empts the prompt's <priority_responses> crisis handling. A
+# content filter blocking a message about self-harm answers a student in trouble with
+# canned decline copy instead of the hand-written referral; PII anonymization silently
+# rewrites their message before the model reads it, so a name and a street arrive as
+# {NAME} and {ADDRESS}. The system prompt owns safety instead: it sees the whole
+# question, it can tell a request for a book about suicide prevention from a person in
+# crisis, and unlike a filter it can RESPOND rather than only refuse.
+#
+# PROMPT_ATTACK is the exception because it is the one thing the prompt cannot own - it
+# is an attack ON the prompt - it is input-only by definition, and nothing else defends a
+# public, unauthenticated endpoint.
+#
+# THE OUTPUT GUARDRAIL IS GONE. Not disabled - deleted. Nothing is attached to the
+# Converse call, and there is no output-side policy anywhere in this file.
+
+guardrail:
+  # The single guardrail resource. Still named for what it is: the input screen.
+  name: gavilan-library-input-guardrail
+  # Content filters for the input screen. strength: NONE | LOW | MEDIUM | HIGH.
+  # PROMPT_ATTACK only, per the decision above - re-adding a category here re-creates
+  # exactly the pre-emption problem, so treat this list as closed rather than a knob.
+  # Everything here is INPUT-side: the stack sets output strength NONE on every filter
+  # (this guardrail is never applied to output, and AWS requires NONE for PROMPT_ATTACK
+  # anyway), so there is no output_strength to set.
+  content_filters:
+    - type: PROMPT_ATTACK
+      input_strength: HIGH
+  # Friendly, student-facing blocked message (matches the bot's tone), returned by the
+  # input screen. A detected prompt injection is now the only thing that can trigger it.
+  #
+  # BILINGUAL (English then Spanish, one blank line between them, rendered as two paragraphs
+  # by the widget). This is STATIC guardrail configuration, returned by Bedrock instead of a
+  # model reply: nothing translates it at runtime, and the widget's language control cannot
+  # reach it either, so a Spanish-speaking student who trips it would otherwise hit an
+  # English wall. Carrying both languages in the one string is the only way to serve both.
+  # Bedrock caps this at 500 characters - keep the pair under it.
+  # NOTE: guardrail policy text is baked into a published guardrail VERSION, so editing this
+  # only takes effect on the next `cdk deploy` (which publishes a new version and repins the
+  # Lambda). The Spanish copy has NOT had native review yet.
+  #
+  # CloudFormation requires a blocked-OUTPUTS message on every guardrail resource, so the
+  # stack passes this same string for it. It is unreachable by construction (nothing applies
+  # this guardrail to output), which is why there is no second message to maintain here.
+  blocked_input_messaging: "I can't help with that request. I'm here for questions about the Gavilan College Library, like hours, checkouts, and finding materials.\n\nNo puedo ayudarte con esa solicitud. Estoy aquí para responder preguntas sobre la Biblioteca de Gavilan College, como horarios, préstamos y cómo encontrar materiales."
+
+# --- ARCHIVED: feedback endpoint (NOT ACTIVE, NOT SUPPORTED) ---------------------------
+#
+# THIS FEATURE IS ARCHIVED AND WILL NOT WORK. It is switched off and there is nothing to
+# configure here. The backend route was built but the widget has no report-an-answer
+# button, so nothing can ever call it. Left in place only so the wiring is not lost.
+#
+# Leave `enabled: false`. Turning it on provisions an SNS topic and a Lambda that no part
+# of the product talks to. The notes below describe how it was meant to work.
+#
+# --- Feedback endpoint (POST /feedback -> SNS email to a librarian) ---------------------
+#
+# "It said something wrong, how do we fix it?" The RAG-first answer (D-20260727-10) is: edit the
+# library webpage, and the bot picks the change up on the next scheduled scrape of that page's tier.
+# That only works if
+# a librarian learns WHICH PAGE to edit, so the notification carries the source URLs the reported
+# answer cited. Without those it is a complaint box, not a fix path.
+#
+# TRANSPORT IS SNS, NOT SES, and that is a handoff decision rather than a technical preference:
+# SES starts every account in a sandbox that can only send to pre-verified addresses and needs a
+# support request to leave it, which would make one-click install into a fresh AWS account the
+# client's problem. An SNS email subscription needs one confirmation click by the recipient.
+# (Verified on the current account 2026-07-29: SES ProductionAccessEnabled is false, 200
+# messages/day - the sandbox is not hypothetical.)
+#
+# THERE IS NO SERVER-SIDE STORE. No table, no bucket, no logged copy: the email IS the record. A
+# report that fails to send is lost, deliberately - the alternative is a database of student
+# complaints nobody agreed to keep.
+#
+# The route EXISTS ONLY when this block is enabled AND notify_email is set. Enabled with an empty
+# address provisions NOTHING (no topic, no Lambda, no route) and the deploy prints a
+# FeedbackStatus output saying why - an endpoint accepting reports with nowhere to send them
+# would swallow them silently. A NON-empty but malformed address fails synth instead, because
+# that is a typo, and a typo must be loud.
+feedback:
+  enabled: false
+  # The librarian mailbox that receives reports. On the first deploy SNS emails ONE confirmation
+  # link here; until somebody clicks it every publish succeeds and nothing arrives. Prefer a
+  # shared/role address over a person's - staff turnover otherwise ends the feature silently.
+  # Leave empty. The feature is archived, so there is nothing to fill in here.
+  notify_email: ""
+  # Hard cap on the free-text comment (characters). Over it the request is rejected with HTTP 400
+  # and nothing is sent. Feedback text NEVER reaches the model, so the Bedrock guardrails do not
+  # screen it: this cap and plain-text-only rendering are the ONLY controls on what a stranger can
+  # put in a librarian's inbox. A useful "the hours are wrong" report is a sentence or two.
+  max_comment_chars: 1000
+  # Hard cap on the whole request body (bytes, measured after any base64 decode). Over it -> HTTP
+  # 413, before the body is parsed or anything is published. The platform limits (API GW 10 MB,
+  # Lambda 6 MB) are far too high to be a control. Stage throttling above remains the volume
+  # control; this bounds the size of any single report.
+  max_body_bytes: 8192
+  # Cap on how many cited source URLs one report may carry. retrieval.number_of_results (8) plus
+  # the three synthetic tool sources is the real ceiling, so 12 accepts every genuine report from
+  # the widget and rejects a padded one.
+  max_sources: 12

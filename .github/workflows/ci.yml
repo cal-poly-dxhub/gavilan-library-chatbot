@@ -1,0 +1,138 @@
+name: CI
+
+# Runs on every PR into the two long-lived branches, and on direct pushes to them.
+# All four jobs are hermetic: no AWS credentials, no live Bedrock, no deployed endpoint.
+# The eval harness's Bedrock runners and the promptfoo answer-quality loop are deliberately
+# NOT here; they need real credentials, a deployed /query, and cost money per run.
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+
+# A new push to the same branch supersedes the in-flight run for it. Pushes to main/dev
+# are never cancelled so the branch always ends with a complete, reportable result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # Match the Lambda runtime the stack deploys (_LAMBDA_PYTHON = Runtime.PYTHON_3_13 in
+  # infra/infra/infra_stack.py). Testing on anything older would pass here and still break
+  # in the deployed function.
+  PYTHON_VERSION: "3.13"
+
+# Every job runs on every PR, with no `paths:` filters. That is on purpose: a required
+# status check that gets skipped by a paths filter is reported as pending forever, which
+# blocks the PR instead of passing it. The four suites total roughly 11 seconds of actual
+# test time, so filtering would buy nothing anyway. Dependency install dominates the wall
+# clock, and the pip cache handles that.
+jobs:
+  infra:
+    name: infra tests (CDK stack + Lambda handler)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            infra/requirements.txt
+            infra/requirements-dev.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      # Covers both infra/tests/unit files: test_infra_stack.py (Template.from_stack
+      # assertions over the synthesized stack) and test_handler.py (app/handler.py with
+      # boto3 stubbed in sys.modules). pytest.ini scopes collection to tests/ and excludes
+      # cdk.out, so vendored test files inside the bundled deps layer are never collected.
+      #
+      # There is no separate `cdk synth` job. These tests already build the real stack
+      # through load_config() + GavilanChatbotStack(...), so synth would only add coverage
+      # of app.py/cdk.json glue, at the cost of a Node + pinned CDK CLI install and a
+      # network-bound asset bundle (the scraper deps layer shells out to pip --platform,
+      # with a Docker fallback).
+      - name: Run tests
+        run: python -m pytest -v
+
+  scraper:
+    name: scraper tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: scraper
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            scraper/requirements.txt
+            scraper/requirements-dev.txt
+
+      # Unlike infra/ and eval/, these tests need the real runtime deps: the HTML
+      # extraction path exercises trafilatura rather than stubbing it.
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      # Scoped to tests/ explicitly. There is no pytest.ini here, so an unscoped run would
+      # walk scraper_output/ and .venv/ as well.
+      - name: Run tests
+        run: python -m pytest tests -v
+
+  eval:
+    name: eval harness tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: eval
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: eval/requirements-dev.txt
+
+      # requirements-dev.txt only (pytest + PyYAML), NOT requirements.txt. The tests stub
+      # boto3 in conftest.py and inject fake clients, and that stub is skipped if a real
+      # boto3 is importable. Leaving boto3 uninstalled keeps the no-live-AWS guarantee
+      # enforced by the code rather than by convention.
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: python -m pytest tests -v
+
+  frontend:
+    name: widget tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # The widget is dependency-free and there is no package.json in the repo, so there
+      # is nothing to install or cache. Node is here purely as the test runner.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # The test file is its own runner: it sets process.exitCode = 1 on any failure, so a
+      # plain node invocation is a valid pass/fail gate.
+      - name: Run widget contract tests
+        run: node frontend/test/widget.contract.test.js

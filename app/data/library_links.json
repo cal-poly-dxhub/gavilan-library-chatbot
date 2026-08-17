@@ -1,0 +1,64 @@
+{
+  "links": [
+    {
+      "key": "library_homepage",
+      "url": "https://www.gavilan.edu/library/index.php",
+      "label": "Gavilan College Library home page (OneSearch)",
+      "use_when": "The library's front door and the entry point for OneSearch / the library catalog. Use for a general 'where do I start with the library' pointer."
+    },
+    {
+      "key": "gavilan_college_website",
+      "url": "https://www.gavilan.edu/index.php",
+      "label": "Gavilan College website",
+      "use_when": "General Gavilan College information that is NOT a library matter - admissions, registration, counseling, financial aid, programs, the academic calendar."
+    },
+    {
+      "key": "online_textbook_collections",
+      "url": "https://caccl-gavilan.primo.exlibrisgroup.com/discovery/collectionDiscovery?vid=01CACCL_GAVILAN:GAVILAN&lang=en",
+      "label": "Online textbook and e-book collections",
+      "use_when": "The library's online / electronic textbook and e-book collections, for a student who wants to read a textbook online rather than borrow a print copy."
+    },
+    {
+      "key": "research_guides",
+      "url": "https://gavilan.libguides.com/",
+      "label": "Subject research guides (LibGuides)",
+      "use_when": "Librarian-built starting points for a subject, course, or assignment. Good for 'how do I start researching X' pointers."
+    },
+    {
+      "key": "bookstore_course_materials",
+      "url": "https://gavilan.bkstr.com/pages/courses-materials-results",
+      "label": "Gavilan College Bookstore - course materials",
+      "use_when": "Buying or renting a course textbook. The library does not sell textbooks; the bookstore is where students purchase or rent them."
+    },
+    {
+      "key": "campus_map_main",
+      "url": "https://www.gavilan.edu/about/maps/main_map.php",
+      "label": "Gilroy campus map",
+      "use_when": "Finding a building, office, department, or the library itself on the main Gilroy campus."
+    },
+    {
+      "key": "campus_map_interactive",
+      "url": "https://www.gavilan.edu/about/maps/gilroy_interactive_map.php",
+      "label": "Interactive Gilroy campus map",
+      "use_when": "A clickable, interactive version of the Gilroy campus map. Offer alongside the static map."
+    },
+    {
+      "key": "public_safety",
+      "url": "https://www.gavilan.edu/public_safety/index.php",
+      "label": "Gavilan College Public Safety",
+      "use_when": "Campus safety and security - safety escorts, parking, lost and found, reporting an incident, emergency information."
+    },
+    {
+      "key": "interlibrary_loan",
+      "url": "https://www.gavilan.edu/library/ill.php",
+      "label": "Interlibrary Loan (ILL) requests",
+      "use_when": "Requesting a book or article Gavilan does not own, borrowed on the student's behalf from another library. The follow-up when the catalog shows an item is not held."
+    },
+    {
+      "key": "laptop_request",
+      "url": "https://caccl-gavilan.primo.exlibrisgroup.com/discovery/fulldisplay?context=L&vid=01CACCL_GAVILAN:GAVILAN&search_scope=MyInst_and_CI&tab=Everything&docid=alma991320845305313",
+      "label": "Library laptop borrowing",
+      "use_when": "Requesting or borrowing a laptop from the library. This is the catalog record students place the request from."
+    }
+  ]
+}

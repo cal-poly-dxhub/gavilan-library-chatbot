@@ -1,0 +1,44 @@
+{
+  "_readme": [
+    "START INSTRUCTIONS",
+    "This is the widget's settings file, named theme.json.",
+    "You can change the highlight color, font, and starter questions.",
+    "Instructions for changing each one are listed below.",
+    "",
+    "highlightColor:",
+    "  A hex color and nothing else: six digits (\"#8a1c30\") or three (\"#a13\").",
+    "  Color names (\"maroon\") and rgb() values are NOT read.",
+    "",
+    "fontFamily:",
+    "  One of these five words. Fonts are not downloaded, so",
+    "  the choice is limited to what every Mac and Windows machine already has:",
+    "    \"system\":  the visitor's own operating system interface font. This is the default.",
+    "    \"sans\":    Arial or Helvetica.",
+    "    \"serif\":   Georgia or Times New Roman.",
+    "    \"mono\":    a fixed width font, Menlo or Consolas.",
+    "    \"inherit\": whatever font the page the widget sits on is already using.",
+    "",
+    "starterQuestions: the example questions offered under the greeting, before anyone",
+    "  has typed anything. Up to FOUR per language, each up to 120 characters; extra or",
+    "  over-long ones are dropped. \"es\" is optional. Leave it out and Spanish visitors",
+    "  see your English list, because nothing here is machine-translated. Remove the whole",
+    "  starterQuestions block to keep the built-in questions in both languages.",
+    "END INSTRUCTIONS"
+  ],
+  "highlightColor": "#8a1c30",
+  "fontFamily": "system",
+  "starterQuestions": {
+    "en": [
+      "What are the library hours?",
+      "How do I check out a book?",
+      "Where do I find my textbook?",
+      "What research databases are available?"
+    ],
+    "es": [
+      "¿Cuál es el horario de la biblioteca?",
+      "¿Cómo pido prestado un libro?",
+      "¿Dónde encuentro mi libro de texto?",
+      "¿Qué bases de datos de investigación hay?"
+    ]
+  }
+}

@@ -1,0 +1,164 @@
+# Seed golden set for the answer-quality loop - 11 questions covering the bot's main jobs.
+#
+# Each row is: the question a student types, plus `expected_behavior` - a short note the
+# BEHAVIOR rubric interpolates as "what doing the right thing looks like here".
+#
+# `expected_behavior` is BEHAVIORAL GUIDANCE FOR THE JUDGE, NOT AN IDEAL ANSWER TO MATCH.
+# Do not put hours, prices, phone numbers, or titles in it. The bot runs against live data,
+# so any specific fact written here goes stale and turns the eval into a staleness detector.
+# Describe what the bot should DO, not what it should SAY.
+#
+# The larger 27-question set at eval/datasets/baseline_qa.csv is NOT wired in yet - see
+# README.md ("Pointing at the bigger golden set") for why and how.
+
+# --- Operational questions (the bot's core job) ---------------------------------------
+
+- description: '01 hours - operational'
+  vars:
+    question: What are the library's hours?
+    expected_behavior: >-
+      Answer with the library's hours, or - if it cannot retrieve current hours - say so
+      plainly and point the student at where the current hours live (the library website or
+      a librarian). Either is correct. Inventing hours is not.
+
+- description: '02 checkout - operational borrowing'
+  vars:
+    question: How do I check out a book?
+    expected_behavior: >-
+      Explain how borrowing works at this library - what the student needs (a library card
+      or student ID), where to go, and roughly what to expect. If it does not have the
+      details, it should say so and point to a librarian or the library's borrowing page.
+
+- description: '04 services overview - "what do you even do?"'
+  vars:
+    question: What does the library offer?
+    expected_behavior: >-
+      Give a useful overview of what the library provides - the kinds of things available
+      (materials, research databases, study space, equipment, help from librarians). Many
+      askers are brand-new students who do not know what a college library is for, so a
+      genuinely informative answer matters more than a short one. It should not just
+      redirect without saying anything.
+
+- description: '08 printing - operational'
+  vars:
+    question: How do I print something? Where are the printers?
+    expected_behavior: >-
+      Explain printing at the library if it can - where the printers are, how to send a job,
+      whether it costs anything. If printing is handled elsewhere on campus or it cannot
+      find the details, it should say so and point the student to the right place rather
+      than guessing at locations or prices.
+
+- description: '11 contact a librarian - routing'
+  vars:
+    question: How do I contact a librarian?
+    expected_behavior: >-
+      Tell the student how to reach a librarian - the channels available (in person, phone,
+      email, chat, a research-help or contact page) and, if it knows them, when staff are
+      around. Any contact details it gives must come from the library's own content, never
+      be constructed.
+
+# --- Textbooks and course reserves (a dedicated flow in the system prompt) -------------
+
+- description: '03 course textbook - must route to reserves, not the general catalog'
+  vars:
+    question: Do you have the textbook for my class?
+    expected_behavior: >-
+      Recognize this as a COURSE TEXTBOOK question, not a general-catalog question. Correct
+      behavior is either (a) ask one brief clarifying question - which course, or whether
+      they need it briefly versus owning it for the semester - or (b) explain the two paths:
+      course reserves at the library for short-term use, and the bookstore for their own
+      copy. It must NOT report searching the general book catalog and failing to find the
+      textbook; the general catalog does not stock course textbooks.
+
+# --- Research databases (database_catalog is AUTHORITATIVE here) -----------------------
+
+- description: '05 research database that IS held - authoritative confirm'
+  vars:
+    # Held per the library's A-Z databases list. Re-verify against the live catalog
+    # before trusting a failure here - see README.md.
+    question: Do you have access to Opposing Viewpoints In Context?
+    expected_behavior: >-
+      Confirm the library has this database and give the student a way to get to it (the
+      databases page, or the link the lookup returned). It should sound settled, not
+      hedged - the database catalog is authoritative about what is held, so "I think so"
+      or "check with a librarian to see if we have it" is the wrong shape of answer here.
+
+- description: '06 research database that is NOT held - authoritative deny + alternatives'
+  vars:
+    # On the hand-authored not-held list. Re-verify before trusting a failure - see README.md.
+    question: Do you have access to JSTOR?
+    expected_behavior: >-
+      Say clearly that the library does NOT have this database. The catalog is authoritative
+      about absence, so this must be a straight answer, not a hedge or a "check with a
+      librarian to find out". It should then be useful about it - suggest databases the
+      library DOES have that could serve the same need, and/or mention interlibrary loan or
+      a librarian. Hedging, or claiming the library might have it after all, is a failure.
+  assert:
+    # Safe deterministic check: the authoritative not-held path has to actually SAY it is
+    # not available. If none of these phrasings appear, the bot hedged or contradicted the
+    # catalog - the exact regression this row exists to catch.
+    - type: icontains-any
+      metric: says_not_held
+      value:
+        - does not have
+        - doesn't have
+        - do not have
+        - don't have
+        - not available
+        - isn't available
+        - is not available
+        - does not provide
+        - doesn't provide
+        - not subscribe
+        - no access
+        - does not offer
+        - doesn't offer
+
+# --- Live catalog search --------------------------------------------------------------
+
+- description: '07 book on a topic - live catalog search'
+  vars:
+    question: Can you help me find a book about climate change?
+    expected_behavior: >-
+      Search the library's catalog and report what it found, or help the student get to a
+      search. Because the live catalog is evidence and not a verdict, any availability it
+      reports must be framed as what the CATALOG SHOWS rather than a guarantee a copy is on
+      the shelf. It must not claim a search "returned zero results" or that the library
+      "does not have" anything on the topic off a weak match - a poor match is inconclusive,
+      and the honest answer there is that it could not find a good match and a librarian can
+      help.
+
+# --- Out of scope (refuse or route; never fabricate) -----------------------------------
+
+- description: '09 do my homework - out of scope, refuse and route'
+  vars:
+    question: Can you write my essay for me? I need 1000 words on Hamlet by tomorrow.
+    expected_behavior: >-
+      Decline to write the essay. Do it kindly and briefly, without lecturing about academic
+      integrity, then pivot to what the library CAN do - help finding sources, research
+      guides, citation help, a librarian. It must not start writing the essay, or an
+      outline, or a thesis statement.
+  assert:
+    # Safe here specifically: nothing about "write my essay" gives the bot a legitimate
+    # reason to produce a phone number, so a phone-shaped string in this answer means it
+    # invented contact details. (Deliberately NOT applied to row 10 or to the contact
+    # question, where a real phone number from the library's own pages is correct.)
+    - type: not-regex
+      metric: no_invented_phone
+      value: '\(?\b\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b'
+
+- description: '10 general trivia - research/out of scope, route without answering'
+  vars:
+    question: Who was the 12th president of the United States?
+    expected_behavior: >-
+      Recognize this as outside library operations and route it, rather than answering it.
+      It is a general-knowledge/research question, and this bot is explicitly not a research
+      librarian or a general-purpose assistant. Correct behavior is to say it is not what it
+      helps with, and point the student toward a librarian, the library's research help, or
+      the research databases. Answering the trivia question from memory is the failure.
+  assert:
+    # The single unambiguous tell that the bot answered from parametric memory instead of
+    # routing. A correct routing reply has no reason to name him.
+    - type: not-icontains
+      metric: no_trivia_answer
+      value: Zachary Taylor

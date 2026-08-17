@@ -1,0 +1,286 @@
+# yaml-language-server: $schema=https://promptfoo.dev/config-schema.json
+#
+# Answer-quality loop for the Gavilan Library chatbot.
+#
+# WHAT THIS IS: an on-demand tuning tool. It fires each golden question at the DEPLOYED
+# /query endpoint and grades the returned answer on two axes - BEHAVIOR (did it do the right
+# thing?) and GROUNDEDNESS (is the answer supported, or invented?). Change the system prompt /
+# retrieval / tool descriptions, re-run, and read the side-by-side grid in `promptfoo view`.
+#
+# WHAT THIS IS NOT: a CI gate. It costs money (real Bedrock calls on both the bot and the
+# judge), it is slow (a live agentic loop plus live Primo calls per question), and an
+# LLM judge is noisy at the margin. Run it on demand and before a release, not per commit.
+#
+# It is deliberately NOT an exact-match eval. The bot's real holdings change (databases,
+# catalog, hours), so grading its answers against frozen ideal text would measure staleness,
+# not quality. The rubrics grade behavior and support instead.
+#
+# Prereqs (see README.md): Node, AWS creds for Bedrock, and GAV_QUERY_URL set to the
+# deployed POST /query URL.
+
+description: Gavilan Library chatbot - answer quality (behavior + groundedness) vs deployed /query
+
+# The "prompt" is just the student's question. All request shaping happens in the HTTP
+# provider body below, because the system under test is the deployed endpoint, not a model.
+prompts:
+  - '{{question}}'
+
+providers:
+  - id: http
+    label: gavilan-query
+    config:
+      # NEVER hardcode the endpoint - it differs per deploy and is not a repo constant.
+      # Export GAV_QUERY_URL before running (see README.md).
+      url: '{{ env.GAV_QUERY_URL }}'
+      method: POST
+      headers:
+        Content-Type: application/json
+      # The real multi-turn /query contract. Built as a template rather than a static object
+      # so a row can carry prior conversation turns: set `prior_turns` in the dataset and
+      # they are prepended, oldest first, before the current question. Rows that omit it get
+      # a single user turn (a fresh conversation), which is the common case.
+      #
+      # `include_full_context` is the opt-in eval flag the query Lambda supports. It adds a
+      # DEBUG PAYLOAD to the response: `full_context` (the un-deduped, un-truncated KB
+      # passages) and `tool_calls` (an ordered trace of EVERY tool the model invoked, each
+      # entry `{tool, input, status, returned_results, result}`, where `result` is the exact
+      # JSON the model received as that call's toolResult). The widget never sets the flag, so
+      # production behavior is unchanged.
+      body: |
+        {
+          "messages": [
+            {% for t in prior_turns %}{"role": {{ t.role | dump }}, "content": {{ t.content | dump }}},
+            {% endfor %}
+            {"role": "user", "content": {{ question | dump }}}
+          ],
+          "include_full_context": true
+        }
+      # The grid column (and every deterministic assertion) sees ONLY the answer text, so
+      # the side-by-side view stays readable and `contains`/`regex` checks can't accidentally
+      # match against tool output. Everything else rides along in `metadata`, which lands in
+      # results.json per row and which the groundedness assertion pulls out via its own
+      # `transform` (see below).
+      #
+      # `tool_context` is the whole evidence base: every tool's output, in call order. It is a
+      # strict superset of the old KB-only `retrieved_context`, which is why that var is gone -
+      # feeding both would just duplicate the KB passages in the judge prompt.
+      transformResponse: |
+        ({
+          output: json.answer || '',
+          metadata: {
+            tools_used: (json.tool_calls || []).map((t) => t.tool).join(', ') || '(none)',
+            tool_trace: (json.tool_calls || [])
+              .map((t, i) => (i + 1) + '. ' + t.tool + ' ' + JSON.stringify(t.input || {})
+                + ' -> ' + (t.status === 'error' ? 'ERROR' : (t.returned_results ? 'results' : 'no results')))
+              .join('\n'),
+            tool_context: (json.tool_calls || [])
+              .map((t, i) => '[' + (i + 1) + '] TOOL ' + t.tool
+                + '\n    input: ' + JSON.stringify(t.input || {})
+                + '\n    returned: ' + JSON.stringify(t.result, null, 2).split('\n').map((l) => '      ' + l).join('\n').trim())
+              .join('\n\n')
+              // The curated URL table is CONTEXT, not a tool result - it is injected into the
+              // Converse system payload on every request, so it appears in no tool_calls entry.
+              // Appending it here is what keeps a correct, curated link from reading as
+              // ungrounded to the judge below.
+              + '\n\n[SYSTEM CONTEXT] CANONICAL GAVILAN LINKS (given to the bot on every request,'
+              + ' not fetched)\n'
+              + (json.library_links || [])
+                .map((l) => '      ' + l.label + ': ' + l.url)
+                .join('\n'),
+            source_uris: (json.sources || []).map((s) => s.uri).join('\n'),
+          },
+        })
+
+defaultTest:
+  # Rows that don't set `prior_turns` send a single user turn. Overridden per row for
+  # multi-turn cases (e.g. the laptop-renewal follow-up).
+  vars:
+    prior_turns: []
+
+  options:
+    # LLM-as-judge over Bedrock, so no OpenAI key is needed. Same model family the bot
+    # itself generates with; a strong judge matters more than a cheap one on a 11-row set.
+    # AWS creds come from the ambient environment (see README.md).
+    provider:
+      id: bedrock:us.anthropic.claude-sonnet-4-6
+      config:
+        region: us-west-2
+        temperature: 0
+        max_tokens: 1024
+
+  # Every question gets the same four checks. Per-question specifics live in the
+  # `expected_behavior` var (dataset.yaml), which the behavior rubric interpolates.
+  assert:
+    # --- 1. BEHAVIOR -------------------------------------------------------------------
+    - type: llm-rubric
+      metric: behavior
+      value: |
+        You are grading a single reply from the Gavilan College Library chatbot. It is an
+        operational assistant for a community college library: it answers practical questions
+        (hours, borrowing, printing, services, contact, what the library holds) using live
+        lookup tools, and it routes research questions, IT problems, and anything outside the
+        library to a human or the right department. It is explicitly NOT a research librarian
+        and NOT a general-purpose assistant.
+
+        THE STUDENT ASKED:
+        {{ question }}
+
+        THE EXPECTED BEHAVIOR FOR THIS QUESTION:
+        {{ expected_behavior }}
+
+        Grade ONLY whether the reply does the right thing. Judge the behavior, not the wording.
+
+        PASS if the reply does substantially what the expected behavior describes.
+        FAIL if it does something materially different: answers an out-of-scope question
+        instead of routing it, routes an in-scope operational question it should have
+        answered, sends the student to the wrong place, confidently asserts something it
+        clearly could not know, or gives no usable next step.
+
+        Explicitly DO NOT fail a reply for any of these:
+        - Not containing specific facts (exact hours, prices, phone numbers, titles). This
+          eval runs against live data; the correct answer changes over time. Saying "I don't
+          have that - here is who does" is a CORRECT behavior, not a failure.
+        - Being shorter or longer than you would have written it.
+        - Asking one brief clarifying question, when the expected behavior allows for it.
+        - Phrasing, tone, or formatting differences.
+
+        Be strict about routing and about unsupported confidence. Be lenient about everything
+        else.
+
+    # --- 2. GROUNDEDNESS ---------------------------------------------------------------
+    # `transform` reshapes what THIS assertion's judge sees: the answer plus the COMPLETE tool
+    # evidence from provider metadata. The grid column and the other assertions are unaffected -
+    # they still see the bare answer.
+    #
+    # This used to feed only `retrieved_context` (knowledge-base passages), which is one of the
+    # bot's five tools. An answer built from the database catalog, the curated links, or either
+    # Primo search therefore reached the judge with an EMPTY context, and the rubric had to be
+    # written around that blind spot - four of five tools were structurally ungradeable. The
+    # Lambda now returns the full `tool_calls` trace, so the judge sees what the model saw.
+    - type: llm-rubric
+      metric: groundedness
+      transform: |
+        const ctx = (context.metadata && context.metadata.tool_context) || '';
+        const trace = (context.metadata && context.metadata.tool_trace) || '';
+        const uris = (context.metadata && context.metadata.source_uris) || '';
+        return [
+          'THE ANSWER THE BOT GAVE:',
+          output,
+          '',
+          'TOOLS THE BOT CALLED, IN ORDER:',
+          trace.trim() ? trace : '(none - the bot answered without calling any tool)',
+          '',
+          'EVERYTHING THOSE TOOLS RETURNED (the complete evidence the bot had):',
+          ctx.trim() ? ctx : '(NOTHING - no tool was called; see the rubric)',
+          '',
+          'SOURCE LINKS ATTACHED TO THIS ANSWER (assembled by the SERVER from the tools that ran - the model did not write these):',
+          uris.trim() ? uris : '(none)',
+        ].join('\n');
+      value: |
+        You are checking a Gavilan College Library chatbot answer for HALLUCINATION. Grounding
+        in this system is enforced by the prompt, not by a guardrail, so this is the check that
+        matters most.
+
+        You are given the answer, the list of tools the bot called, and the COMPLETE output of
+        every one of those calls - exactly what the bot had in front of it when it wrote the
+        answer. Nothing is withheld from you.
+
+        The bot has four tools, and all four report here:
+        - search_library_info: semantic search of the library website. Returns `passages`.
+        - database_catalog: AUTHORITATIVE lookup of the research-database list. Returns
+          `held: true/false` for a named database (a `held: false` verdict is a solid,
+          citable fact, not a gap), or a list of `databases` for a subject.
+        - search_book_catalog / search_course_reserves: LIVE searches of the library's Primo
+          catalog. Returns `total` plus candidate `results` with availability. These are
+          EVIDENCE, not a verdict: only `total: 0` authoritatively means "not held".
+
+        You are ALSO given a [SYSTEM CONTEXT] block listing the CANONICAL GAVILAN LINKS. That
+        curated table is handed to the bot on every single request - it is not something the bot
+        fetched, and there will never be a tool call for it. Any URL appearing in that block is a
+        REAL, library-approved link that the bot copied, NOT one it constructed. Treat it as
+        support exactly like a tool result.
+
+        A tool result is support. A claim backed by ANY of the tool output above, or by the
+        canonical link block, is grounded, whichever produced it. Do not privilege the
+        knowledge-base passages over the others; do not treat a catalog result or a curated link
+        as weaker evidence.
+
+        THE SOURCE-LINK LIST IS NOT SOMETHING THE MODEL WROTE. The server builds it from the
+        tools that actually ran and attaches it to the answer. A URL that appears there is real
+        and approved by construction - it is NOT a candidate hallucination, and repeating one in
+        the answer text is correct behavior, not a constructed link. Only a URL that appears in
+        NEITHER the tool output NOR that list is suspect.
+
+        AN EMPTY TOOL LIST IS NOT BY ITSELF A FAILURE. Calling no tool is correct for a
+        greeting, a refusal, a routing reply, a clarifying question, or a statement of the
+        bot's own limits. Judge those on whether they assert library FACTS without support.
+
+        FAIL only when you can point at something concretely wrong:
+        - The answer CONTRADICTS the tool output (says a database is held when the catalog says
+          `held: false`, reports availability the catalog record does not show, claims a search
+          returned nothing when `total` is greater than 0, names a course the reserve record
+          does not list).
+        - The answer states a specific, checkable fact (a time, a date, a price, a fee, a room,
+          a call number, a phone number, an email address, a policy limit, a loan period, a
+          named title or author) that NO tool output supports AND that the bot has no plausible
+          way to know. Specific invented detail is the failure mode; general statements about
+          how libraries work are not.
+        - The answer gives a URL or web address that appears in NONE of the tool output and in
+          none of the source links. The bot is instructed never to construct a link from memory.
+        - The answer asserts the library definitely does or does not have something with no
+          support - including calling a fuzzy Primo miss (nonzero `total`, no good match) a
+          confirmed absence.
+
+        PASS when:
+        - Every checkable claim traces to some tool's output, or
+        - The answer is appropriately hedged ("the catalog shows...", "check with a librarian
+          to confirm", "I don't have that information"), or
+        - The answer is a refusal, routing, greeting, or clarifying question that asserts no
+          library facts at all, or
+        - No tool was called and the answer makes no specific unsupported claim.
+
+        Hedged uncertainty is CORRECT behavior for this bot and must never be marked down.
+        Being wrong is worse than saying "I don't know" - grade accordingly.
+
+    # --- 3-4. DETERMINISTIC CHECKS -----------------------------------------------------
+    # (5 below is reporting, not a check.)
+    # Kept few and genuinely safe. These are invariants of the system prompt, not guesses
+    # about what the answer should say.
+
+    # A blank/whitespace answer means the endpoint or the agent loop broke. Distinguishes a
+    # real failure from a merely bad answer, which the rubrics would score confusingly.
+    - type: javascript
+      metric: not_empty
+      value: output.trim().length > 0
+
+    # The system prompt bans em dashes and en dashes outright ("Use a plain hyphen with
+    # spaces, a comma, or split the sentence instead"). Any occurrence is a prompt-compliance
+    # regression, and this is cheap to check exactly.
+    - type: not-regex
+      metric: no_dashes
+      value: '[—–]'
+
+    # --- 5. TOOL TRACE (reporting, not a check) ----------------------------------------
+    # ALWAYS PASSES. It exists so which tools ran on a row is readable straight off the grid,
+    # instead of decoding it from the answer text or digging through results.json. Tool routing
+    # is the model's, driven only by the system prompt and the toolSpec descriptions, so
+    # "did it call the tool we expected?" is a first-class question here. Note the curated URL
+    # table will NEVER appear in this trace: it stopped being a tool and is now injected into the
+    # system payload every request, precisely because the model kept not calling it.
+    - type: javascript
+      metric: tools_called
+      value: |
+        const trace = (context.metadata && context.metadata.tool_trace) || '';
+        return {
+          pass: true,
+          score: 1,
+          reason: trace.trim() ? trace : '(no tools called)',
+        };
+
+tests:
+  # The library staff's own worked examples of what a good answer looks like. This is the
+  # authoritative behavior spec - several rows are expected to FAIL today against the
+  # deployed prompt + knowledge base. That is the point; see README.md ("Known gaps").
+  - file://dataset-staff-examples.yaml
+  # Generic coverage of the four tools and the out-of-scope paths.
+  - file://dataset.yaml

@@ -1,0 +1,2058 @@
+"""Query-path Lambda for the Gavilan Library Chatbot.
+
+Fronted by an API Gateway HTTP API (payload format 2.0) with two routes on this one Lambda:
+  - POST /query -> the real query path (_handle_query):
+      0. _apply_input_guardrail() -> Bedrock `ApplyGuardrail` (source=INPUT) on the BARE
+         user query. It screens for PROMPT_ATTACK and nothing else: a block is an injection
+         attempt, and everything else about how this bot answers - including how it handles
+         a student in crisis - is the system prompt's job, because the screen runs first and
+         would otherwise pre-empt it.
+      1. run_agent() -> an AGENTIC Bedrock Converse tool-use loop under the real system
+         prompt (app/system_prompt.md). NO guardrail is attached to the Converse call: the
+         output guardrail was removed, so nothing screens or rewrites the answer. The model
+         is given FOUR tools: `search_library_info` (KB `Retrieve`), `database_catalog` (authoritative
+         research-database lookup from static JSON), `search_book_catalog` (a LIVE search of
+         the Primo book/media catalog), and `search_course_reserves` (a LIVE search of the
+         Primo course-reserves scope) - the two live catalog tools return evidence the
+         model judges, not an authoritative verdict. The model decides which to call and how
+         often. The loop feeds each tool result back and re-calls Converse until stopReason ==
+         "end_turn" (or a safety iteration cap). Sources accumulate from every tool the model
+         triggered during the loop.
+         The curated table of canonical Gavilan URLs is NOT a tool: it takes no input and
+         returns the same rows every time, so it is injected into the Converse `system`
+         payload on every request instead. See _links_block().
+  - GET /warm -> _handle_warm(): a retrieval-only pre-warm before the first real query. No
+      generation, no guardrail.
+
+Wiring comes from env vars set by the CDK stack.
+
+/query response JSON shape:
+  {
+    "answer": "<generated answer text>",
+    "sources": [
+      {"uri": "<source page url>", "excerpt": "<short snippet of that passage>"},
+      ...
+    ]
+  }
+  - `sources` is deduplicated by uri, in retrieval order, accumulated across every tool
+    retrieval the model ran during the loop. Passages with no resolvable source uri are
+    omitted from `sources` (they still inform the answer). If the model answers without
+    calling the tool (e.g. a greeting), `sources` is [].
+  - When the tool retrieves nothing relevant, the system prompt instructs the model to say
+    it does not have the information.
+  - When the request sets `include_full_context: true`, the response also carries an OPT-IN
+    DEBUG PAYLOAD, for answer-quality eval:
+      * `full_context`: the full, un-deduped, un-truncated KB passages (`[{text, source}]`)
+        the model saw from `search_library_info`.
+      * `tool_calls`: an ordered trace of EVERY tool call the loop made - one entry per
+        toolUse block, `{tool, input, status, returned_results, result}`, where `result` is
+        the exact JSON handed back to the model as that call's `toolResult` content. This is
+        the whole evidence base the model answered from, KB and non-KB alike; `full_context`
+        alone only ever shows one of the four tools.
+      * `library_links`: the curated URL table the model was handed in its `system` payload.
+        It is not a tool result, so it appears in neither field above - without it a correct
+        curated link reads as ungrounded to the eval judge.
+    The widget never sets the flag, so its responses are exactly the `{answer, sources}`
+    shape above. Nothing here changes what is sent to the model.
+  - When the request sets `language: "en"|"es"`, the reply is written in that language even if
+    the question was typed in the other one. The field is OPTIONAL and allowlisted: absent (or
+    unrecognized) means no extra system block at all, so the model keeps auto-detecting the
+    language from the question exactly as it did before. It is a generation-side instruction
+    only - retrieval, the tools, and the knowledge base are untouched. See _extract_language.
+  - When the request sets `include_usage: true`, the response also carries a `usage`
+    object: the BILLABLE units this one question consumed, summed across the whole agent
+    loop (every Converse call, the one input guardrail screen, and each KB retrieval). See
+    _new_usage() for the shape and why each field is there. The demo page's cost meter is
+    the only client that asks for it; the widget never does, so a student's response is
+    byte-identical to what it was before.
+"""
+
+import base64
+import datetime
+import json
+import os
+import ssl
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+import boto3
+
+KNOWLEDGE_BASE_ID = os.environ["KNOWLEDGE_BASE_ID"]
+GENERATION_MODEL_ID = os.environ["GENERATION_MODEL_ID"]
+# Lambda auto-sets AWS_REGION; BEDROCK_REGION lets the stack pin it explicitly.
+REGION = os.environ.get("BEDROCK_REGION") or os.environ.get("AWS_REGION")
+NUMBER_OF_RESULTS = int(os.environ.get("NUMBER_OF_RESULTS", "5"))
+
+# Generation inference knobs, wired from config.yaml by the stack. Defaults are a safety net
+# for local runs without the env set; config.yaml is the source of truth.
+GENERATION_MAX_TOKENS = int(os.environ.get("GENERATION_MAX_TOKENS", "600"))
+GENERATION_TEMPERATURE = float(os.environ.get("GENERATION_TEMPERATURE", "0.2"))
+
+# Max characters accepted for a user query. Over this -> HTTP 400, BEFORE any retrieval or
+# guardrail call. The real server-side size control; the widget maxlength is only advisory UX,
+# and the platform limits (API GW 10MB / Lambda 6MB) are far too high to protect.
+MAX_QUERY_CHARS = int(os.environ.get("MAX_QUERY_CHARS", "2000"))
+
+# Max number of conversation turns (prior + current) used from a request. Single-session history
+# is trimmed to the LAST this-many messages SERVER-SIDE before seeding the Converse loop - the
+# client is never trusted to cap it. Older turns are dropped. See _seed_messages for why the trim
+# can never yield a request Converse rejects (it drops a leading assistant turn and merges any
+# consecutive same-role turns, so the seed always starts with user and stays alternating).
+MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "10"))
+
+# The only conversation roles accepted from the client. A widget "bot" turn maps to "assistant".
+_VALID_ROLES = ("user", "assistant")
+
+# ONE Bedrock guardrail, set by the CDK stack from config.yaml. It may be unset locally, in
+# which case the screen is skipped rather than failing.
+#
+# It runs on the bare user query BEFORE the loop via the ApplyGuardrail API (source=INPUT)
+# and screens PROMPT_ATTACK ONLY. There is no output guardrail: nothing is attached to
+# Converse, so nothing screens, blocks or rewrites the generated answer. And there is no PII
+# policy, so the query the model sees is the query the student typed - a screen that
+# anonymized it would hand the model {NAME} and {ADDRESS} in place of the details that make
+# an urgent message legible. The system prompt owns all of that.
+INPUT_GUARDRAIL_ID = os.environ.get("INPUT_GUARDRAIL_ID")
+INPUT_GUARDRAIL_VERSION = os.environ.get("INPUT_GUARDRAIL_VERSION")
+
+# ApplyGuardrail response fields (verified against the installed bedrock-runtime model).
+# Top-level action is "NONE" or "GUARDRAIL_INTERVENED". With a single content-filter policy
+# configured, an intervention can only ever be a block, so the top-level action IS the
+# decision - see _is_blocked.
+_ACTION_INTERVENED = "GUARDRAIL_INTERVENED"
+_ITEM_BLOCKED = "BLOCKED"
+
+# Last-resort student-facing message if the input guardrail blocks but returns no message
+# text (documented behavior is that `outputs` carries the configured block message, so this
+# is only a defensive fallback and should not normally be reached).
+#
+# BILINGUAL, like the configured block messages in config.yaml, and for the same reason: a
+# guardrail block bypasses the model entirely, so nothing here can be translated on the fly and
+# the widget's language control cannot reach it. A Spanish-speaking student who trips a
+# guardrail would otherwise hit an English wall.
+_FALLBACK_BLOCK_MESSAGE = (
+    "I can't help with that request. Try asking about the Gavilan College Library, like "
+    "hours, checkouts, and finding materials.\n\n"
+    "No puedo ayudarte con esa solicitud. Puedes preguntar sobre la Biblioteca de Gavilan "
+    "College, como horarios, préstamos y cómo encontrar materiales."
+)
+
+# The tools the agent is given. These names are referenced by the system prompt's <tools>
+# section (app/system_prompt.md), so keep the two in sync.
+#   search_library_info - semantic retrieval over the Bedrock KB (hours, services, policies, ...).
+#   database_catalog     - authoritative lookup of the research-database catalog (is X held? what
+#                          databases for subject Y?), from a bundled static JSON.
+SEARCH_TOOL_NAME = "search_library_info"
+CATALOG_TOOL_NAME = "database_catalog"
+# NOTE: there is no library_links TOOL any more. The curated URL directory is injected into the
+# Converse `system` payload on every request instead - see _links_block() for why.
+# search_book_catalog - a LIVE search of the Primo book/media catalog. Unlike database_catalog
+# (authoritative), this returns EVIDENCE (candidate records + availability) and the MODEL judges
+# whether any is a real match; total == 0 is the only clean not-held signal. See the Primo section.
+PRIMO_TOOL_NAME = "search_book_catalog"
+# search_course_reserves - a LIVE search of the Primo CourseReserves scope: textbooks/materials on
+# reserve for a class, searchable by course code or title. Same EVIDENCE-not-verdict posture as
+# search_book_catalog (total == 0 is the clean not-on-reserve signal); see the reserves section.
+RESERVES_TOOL_NAME = "search_course_reserves"
+
+# Safety cap on the Converse tool-use loop: the model can call the tool and be re-invoked at
+# most this many times before we stop and return the best answer so far. Prevents a runaway
+# (or adversarial) loop from spending unboundedly. A factual FAQ needs 1-2 iterations.
+MAX_AGENT_ITERATIONS = int(os.environ.get("MAX_AGENT_ITERATIONS", "5"))
+
+# Shown if the loop hits the iteration cap without the model producing any answer text.
+_MAX_ITERS_FALLBACK_MESSAGE = (
+    "I'm having trouble answering that right now. Please try rephrasing, or reach out to a "
+    "librarian for help."
+)
+
+# Max characters of a passage surfaced as a source excerpt in the response.
+_EXCERPT_CHARS = 300
+
+# Warm path. The widget fires GET /warm on page load to warm the query Lambda container (and
+# exercise the KB Retrieve path) before the first real query. WARM_PATH is matched against the
+# request path; _WARM_QUERY is a throwaway retrieval query (the goal is to warm the path, not to
+# get useful results).
+WARM_PATH = "/warm"
+_WARM_QUERY = "library hours"
+
+# The real system prompt is packaged with the Lambda: app/system_prompt.md lives inside
+# the from_asset(app/) bundle, next to this file. Read once at cold start.
+_PROMPT_PATH = Path(__file__).resolve().parent / "system_prompt.md"
+SYSTEM_PROMPT = _PROMPT_PATH.read_text(encoding="utf-8").strip()
+
+# The model is not told the date by anything else, and the library's hours are published as
+# SEMESTER BLOCKS ("Spring Semester 2026 (January 26 - May 22)"). Without today's date it cannot
+# tell which block is current, so "what are your hours?" gets all three semesters dumped on it -
+# the honest answer for a model that does not know the day. The finaid and bookstore pages are
+# scoped the same way ("Summer Hours: July 6 - August 1, 2026"), so this is not hours-only.
+#
+# PACIFIC, not the Lambda's UTC: after 5pm Pacific, UTC is already tomorrow, which would flip a
+# Friday answer to Saturday's "closed". zoneinfo reads the OS tzdata (present on Amazon Linux
+# 2023); if that lookup ever fails, fall back to a fixed -08:00 rather than silently serving UTC.
+_LIBRARY_TZ = "America/Los_Angeles"
+
+
+def _today_pacific():
+    """Today's date at the library, as YYYY-MM-DD plus the weekday. Never raises."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        now = datetime.datetime.now(ZoneInfo(_LIBRARY_TZ))
+    except Exception:  # noqa: BLE001 - missing tzdata must not take the request down
+        now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-8)))
+    return now.strftime("%A, %Y-%m-%d")
+
+
+# --- Reply language (optional request field) ------------------------------------------------
+#
+# The widget carries a visible English/Español control, and sends `language` ONLY when the
+# person actually chose one. That distinction is the whole design:
+#   - field absent  -> nothing changes. No extra system block, and the model keeps doing what
+#                      it already does well, which is answering in whatever language it was
+#                      asked in. Every pre-existing client (the eval, curl, the legacy
+#                      {"query": ...} shape) is unaffected.
+#   - field present -> one extra system block naming the language to reply in, so an explicit
+#                      Español selection is honored even for a question typed in English.
+# Nothing about retrieval, the tools, or the knowledge base is language-aware: the KB is
+# English and Spanish questions already retrieve from it correctly (measured), so this is a
+# generation-side instruction only.
+#
+# STRICTLY ALLOWLISTED. The code is checked against the table below before it is used, and the
+# prompt text is built from the TABLE's value, never from the client's string - a request field
+# that reached the system prompt verbatim would be a prompt-injection channel.
+_LANGUAGE_FIELD = "language"
+_LANGUAGES = {"en": "English", "es": "Spanish"}
+
+
+def _extract_language(data):
+    """The requested reply language as a supported code, or None if unset/unsupported.
+
+    Tolerant about the shape a client sends (case, surrounding space, a full IETF tag like
+    'es-MX' whose primary subtag is what matters) and strict about the result: anything not in
+    _LANGUAGES yields None, which behaves exactly like no preference at all."""
+    if not isinstance(data, dict):
+        return None
+    raw = data.get(_LANGUAGE_FIELD)
+    if not isinstance(raw, str):
+        return None
+    code = raw.strip().lower().split("-")[0]
+    return code if code in _LANGUAGES else None
+
+
+def _language_block(code):
+    """The system block for an explicitly chosen reply language.
+
+    The <priority_responses> carve-out is not decoration: that section carries the verbatim
+    emergency response (911, the campus-safety number, the safety page URL) and the prompt
+    forbids translating or reformatting it. A blanket "reply in Spanish" arriving after it in
+    the system payload could plausibly override that, which would put a safety-critical,
+    hand-verified message through the model. One clause keeps the existing invariant."""
+    name = _LANGUAGES[code]
+    return (
+        f"The person using the chat has selected {name} as their language. Write your entire "
+        f"reply in {name}, even if they wrote to you in another language. (A "
+        "<priority_responses> reply is still sent exactly as written, in the language it is "
+        "written in.)"
+    )
+
+
+def _system_blocks(language=None):
+    """The Converse `system` payload: the packaged prompt, today's date, the curated links, and
+    - only when the person explicitly chose one - the reply language.
+
+    Separate blocks rather than one interpolated string so the prompt itself stays a static
+    asset - the date, the link table, and the language are the injected parts, and keeping them
+    apart makes that obvious in a trace.
+    """
+    blocks = [
+        {"text": SYSTEM_PROMPT},
+        {
+            "text": (
+                f"Today's date is {_today_pacific()} (Pacific, the library's local time). "
+                "Use it to decide which semester, term, or seasonal hours block currently "
+                "applies, and give the person the one that is in effect now rather than "
+                "listing every block you retrieved. If a date range makes the current block "
+                "ambiguous, say which one you used."
+            )
+        },
+        {"text": _links_block()},
+    ]
+    # Appended last, and only if asked for: with no preference the payload is byte-identical to
+    # what it was before this existed.
+    if language:
+        blocks.append({"text": _language_block(language)})
+    return blocks
+
+# Database catalog (Phase 2b: self-updating).
+#   - The HELD list is regenerated by the scraper's full-tier run (every five days) and written to
+#     S3; this Lambda reads the fresh copy from CATALOG_BUCKET/CATALOG_KEY at query time (cached
+#     per container, see below).
+#   - The bundled app/data/database_catalog.json is the SEED: it provides the hand-authored NOT_HELD
+#     list + catalog_url + default_alternatives (merged in at read time, since absence can't be
+#     scraped), AND a fallback HELD list used before the first scrape or if the S3 read fails.
+# Shape (both S3 and seed): {catalog_url, default_alternatives, held:[{name,subjects,description,
+# aliases}], not_held:[{name,aliases,suggested_alternatives}]}. The S3 object carries only `held`.
+_SEED_CATALOG_PATH = Path(__file__).resolve().parent / "data" / "database_catalog.json"
+_SEED_CATALOG = json.loads(_SEED_CATALOG_PATH.read_text(encoding="utf-8"))
+
+CATALOG_BUCKET = os.environ.get("CATALOG_BUCKET")
+CATALOG_KEY = os.environ.get("CATALOG_KEY", "database_catalog.json")
+# Per-container cache TTL. The catalog is rewritten at most once every five days (and only when the
+# parsed database rows changed), so serving a copy up to this many seconds stale (default 15 min) is
+# fine and avoids an S3 GET on every query; the next lookup after the TTL re-fetches, so a refresh is
+# picked up quickly without a redeploy. A cold container always fetches fresh.
+CATALOG_CACHE_TTL_SECONDS = int(os.environ.get("CATALOG_CACHE_TTL_SECONDS", "900"))
+
+# A catalog answer isn't a scraped-page passage, so it never adds a KB `sources` excerpt. Instead a
+# substantive catalog lookup contributes ONE synthetic source: the library's A-Z database page,
+# where the data comes from and where the user can browse/verify. Deduped like any other source.
+_CATALOG_SOURCE = {
+    "uri": _SEED_CATALOG.get("catalog_url", ""),
+    "excerpt": "Gavilan Library A-Z database list",
+}
+
+# --- library_links: curated canonical URLs -------------------------------------------------
+#
+# A small HAND-AUTHORED table of the library's and college's front-door URLs (library home page,
+# campus map, bookstore, research guides, ILL, laptop record, ...). It exists because NO other
+# path produces these links: the KB only knows the scraped seed pages, database_catalog cites
+# the A-Z page, and the Primo tools cite per-query search URLs. Without it the model could only
+# surface such a link by writing a URL from memory - the exact hallucination the system prompt's
+# <citations> rules forbid.
+#
+# The model gets the WHOLE table, every request, in its `system` payload, and no matching happens
+# here - which entry fits is the model's judgement, made from each row's `label` and `use_when`.
+# Those two fields are therefore load-bearing: they are the only steer on the choice.
+#
+# STATIC and bundled with the Lambda, like the database_catalog SEED: no scraper, no S3, no cache
+# TTL, nothing to refresh at runtime. Editing the JSON + redeploying is the whole update path.
+# The filename comes from config.yaml (library_links.data_file); the stack wires the SAME value
+# into both the Lambda asset bundle and this env var, so the two cannot drift.
+#
+# Boundary with the tools: this table = front-door campus/library POINTERS; database_catalog =
+# research databases; the Primo tools = live catalog/reserves; the KB = scraped library page
+# content.
+LIBRARY_LINKS_FILE = os.environ.get("LIBRARY_LINKS_FILE", "library_links.json")
+_LIBRARY_LINKS_PATH = Path(__file__).resolve().parent / "data" / LIBRARY_LINKS_FILE
+_LIBRARY_LINKS = json.loads(_LIBRARY_LINKS_PATH.read_text(encoding="utf-8")).get("links", [])
+
+# --- Primo book/media catalog tool (search_book_catalog) -----------------------------------
+#
+# A LIVE search of Gavilan's Primo discovery catalog (an undocumented public JSON endpoint the
+# library sanctioned). It is fundamentally different from database_catalog:
+#   - database_catalog is AUTHORITATIVE (a curated list), so it can say "not held".
+#   - Primo is NOT. It always returns fuzzy matches, and its relevance score is query-relative
+#     (a held book can score BELOW not-held noise), so the handler makes NO held/not-held
+#     judgment and applies NO score threshold. It returns EVIDENCE - the top few candidate
+#     records with fields + availability + the total match count - and the MODEL decides whether
+#     any candidate is a real match. `total == 0` is the ONLY clean not-held signal, surfaced raw.
+#
+# This is a live third-party HTTP call INSIDE the Converse loop, a new class of dependency, so:
+#   - every call is timed out (it eats the request/Lambda budget);
+#   - ANY failure (network, timeout, HTTP error, changed/absent fields, parse error) degrades to
+#     a "catalog unavailable" result - it never throws and never kills the query;
+#   - parsing is defensive (the $$C..$$V.. encoding + undocumented shape); missing fields degrade.
+#
+# Endpoint identity (the reverse-engineered discovery API; tied to the institution, not a
+# per-deploy knob, so it stays in code rather than config.yaml):
+PRIMO_SEARCH_URL = "https://caccl-gavilan.primo.exlibrisgroup.com/primaws/rest/pub/pnxs"
+PRIMO_DISCOVERY_URL = "https://caccl-gavilan.primo.exlibrisgroup.com/discovery/search"
+PRIMO_INST = "01CACCL_GAVILAN"
+PRIMO_VID = "01CACCL_GAVILAN:GAVILAN"
+# General local-holdings scope ONLY. Deliberately NOT CourseReserves: Gavilan's general catalog
+# does not stock course textbooks (they live in course reserves + the bookstore), so textbook
+# questions must go to search_course_reserves - which is what the <tools> routing guidance in
+# system_prompt.md tells the model - and never route through this tool.
+PRIMO_SCOPE = "MyInstitution"
+PRIMO_TAB = "LibraryCatalog"
+# Course-reserves scope, used by the SEPARATE search_course_reserves tool: textbooks/materials an
+# instructor placed on hold for a class (short loans at the Course Reserve desk). Reserve records
+# carry a crsinfo field linking them to one or more course codes; this is the scope textbook
+# questions check, complementing the general catalog above.
+PRIMO_RESERVES_SCOPE = "CourseReserves"
+PRIMO_RESERVES_TAB = "CourseReserves"
+
+# Behavioral knobs, wired from config.yaml by the stack (env). Defaults are a local-run safety net.
+PRIMO_TIMEOUT_SECONDS = float(os.environ.get("PRIMO_TIMEOUT_SECONDS", "5"))
+PRIMO_NUMBER_OF_RESULTS = int(os.environ.get("PRIMO_NUMBER_OF_RESULTS", "4"))
+# Total wall-clock cap across all per-result availability lookups (each result needs its own
+# delivery call). Once exceeded, the remaining results report availability "unknown" rather than
+# blocking - bounds worst-case latency of the tool inside the agent loop.
+PRIMO_AVAILABILITY_BUDGET_SECONDS = float(os.environ.get("PRIMO_AVAILABILITY_BUDGET_SECONDS", "8"))
+
+# Fed back to the model when the live lookup fails: it must NOT claim the item is absent, only
+# that the search is down. (Absence may ONLY be stated on a real total == 0 result.)
+_PRIMO_UNAVAILABLE_NOTE = (
+    "The library book catalog search is temporarily unavailable. Do not say whether the library "
+    "holds this item; suggest checking the library catalog directly or asking a librarian."
+)
+_RESERVES_UNAVAILABLE_NOTE = (
+    "The course reserves search is temporarily unavailable. Do not say whether the item is on "
+    "reserve; suggest checking the library catalog directly or asking a librarian."
+)
+
+_agent_runtime = None
+_bedrock_runtime = None
+_catalog_s3 = None
+# Cached merged catalog: {"catalog": <dict>, "at": <monotonic seconds>}. None until first load.
+_catalog_cache = {"catalog": None, "at": 0.0}
+
+
+def _agent_client():
+    global _agent_runtime
+    if _agent_runtime is None:
+        _agent_runtime = boto3.client("bedrock-agent-runtime", region_name=REGION)
+    return _agent_runtime
+
+
+def _bedrock_client():
+    global _bedrock_runtime
+    if _bedrock_runtime is None:
+        _bedrock_runtime = boto3.client("bedrock-runtime", region_name=REGION)
+    return _bedrock_runtime
+
+
+def _catalog_s3_client():
+    global _catalog_s3
+    if _catalog_s3 is None:
+        _catalog_s3 = boto3.client("s3", region_name=REGION)
+    return _catalog_s3
+
+
+def _read_s3_held():
+    """The fresh held list the scraper wrote to S3, or None if unavailable (no bucket configured,
+    object missing before the first scrape, or a read error). None -> caller falls back to the
+    bundled seed held list, so the tool always works."""
+    if not CATALOG_BUCKET:
+        return None
+    try:
+        obj = _catalog_s3_client().get_object(Bucket=CATALOG_BUCKET, Key=CATALOG_KEY)
+        held = json.loads(obj["Body"].read()).get("held")
+        return held if isinstance(held, list) and held else None
+    except Exception as exc:  # noqa: BLE001 - degrade to the bundled seed, never hard-fail a query
+        print(json.dumps({"event": "catalog_s3_read_failed", "error": f"{type(exc).__name__}: {exc}"}))
+        return None
+
+
+def _get_catalog():
+    """The merged catalog the tool reads: the hand-authored not_held + catalog_url +
+    default_alternatives from the bundled seed, with the HELD list from S3 (falling back to the
+    seed's held if S3 is unavailable). Cached per container for CATALOG_CACHE_TTL_SECONDS so a
+    warm container doesn't GET S3 on every query but still picks up a refresh."""
+    now = time.monotonic()
+    if _catalog_cache["catalog"] is not None and (now - _catalog_cache["at"]) < CATALOG_CACHE_TTL_SECONDS:
+        return _catalog_cache["catalog"]
+    held = _read_s3_held()
+    catalog = {
+        "catalog_url": _SEED_CATALOG.get("catalog_url", ""),
+        "default_alternatives": _SEED_CATALOG.get("default_alternatives", []),
+        "held": held if held is not None else _SEED_CATALOG.get("held", []),
+        "not_held": _SEED_CATALOG.get("not_held", []),
+    }
+    _catalog_cache["catalog"] = catalog
+    _catalog_cache["at"] = now
+    return catalog
+
+
+def _extract_source(result):
+    """Pull the public source URL for a KB Retrieve result.
+
+    Order of preference:
+      1. metadata["source_url"] - the public original page URL, ingested per document by the
+         scraper into each document's Bedrock metadata sidecar. This is what we want to show.
+      2. a location URL (e.g. a web crawler's page url).
+      3. the internal S3 URI (s3Location / the bedrock source-uri metadata) as a LAST resort.
+
+    The S3 URI is an internal path, not something to show a student: _build_sources drops any
+    source that resolves only to an s3:// URI so it never reaches the client."""
+    metadata = result.get("metadata") or {}
+    source_url = metadata.get("source_url")
+    if source_url:
+        return source_url
+    location = result.get("location") or {}
+    for key in (
+        "webLocation",
+        "s3Location",
+        "confluenceLocation",
+        "salesforceLocation",
+        "sharePointLocation",
+    ):
+        loc = location.get(key)
+        if isinstance(loc, dict):
+            uri = loc.get("url") or loc.get("uri")
+            if uri:
+                return uri
+    return metadata.get("x-amz-bedrock-kb-source-uri")
+
+
+def retrieve(query):
+    """Knowledge Base Retrieve API. Returns a list of {"text", "source"} dicts."""
+    response = _agent_client().retrieve(
+        knowledgeBaseId=KNOWLEDGE_BASE_ID,
+        retrievalQuery={"text": query},
+        retrievalConfiguration={
+            "vectorSearchConfiguration": {"numberOfResults": NUMBER_OF_RESULTS}
+        },
+    )
+    chunks = []
+    for result in response.get("retrievalResults", []):
+        text = (result.get("content") or {}).get("text")
+        if text:
+            chunks.append({"text": text, "source": _extract_source(result)})
+    return chunks
+
+
+def _tool_config():
+    """The Converse `toolConfig`: four tools the model routes between (toolChoice left at the
+    model's default `auto`, so it may also answer a greeting without any tool):
+      - search_library_info: semantic search over the library website (hours, services, policies,
+        how-to, borrowing, contact, general questions).
+      - database_catalog: authoritative lookup of the research-database catalog - whether a named
+        database is available (including confirming it is NOT), and databases by subject.
+      - search_book_catalog: LIVE search of the Primo book/media catalog - returns candidate
+        records + availability for a title/author/work; EVIDENCE the model judges, not a verdict.
+      - search_course_reserves: LIVE search of the Primo CourseReserves scope - textbooks/materials
+        on reserve for a class, by course code or title; same EVIDENCE-not-verdict posture.
+    The descriptions are deliberately differentiated so the model picks the right one.
+
+    The curated URL directory is NOT here: it is a constant, so it is injected into the `system`
+    payload every request instead of being a tool the model has to remember to call. See
+    _links_block()."""
+    return {
+        "tools": [
+            {
+                "toolSpec": {
+                    "name": SEARCH_TOOL_NAME,
+                    "description": (
+                        "Search the Gavilan College Library's own website content. CALL THIS "
+                        "BEFORE ANSWERING any question about the library or the campus, including "
+                        "ones you think you already know the answer to and ones you suspect are "
+                        "handled by another department - the content covers more than you expect, "
+                        "and answering without checking is how wrong answers happen. A first "
+                        "search is run for you automatically at the start of every conversation "
+                        "turn; call it again yourself whenever those results are thin, off-target, "
+                        "or do not cover part of what was asked. It covers hours, locations, "
+                        "checkout and borrowing policies, laptops and equipment, textbooks and "
+                        "course reserves, services, contact info, campus offices and buildings, "
+                        "the bookstore, and how-to/FAQ questions. Answer from the results it "
+                        "returns rather than from memory. Do NOT use this to check whether a "
+                        "specific named research database is available or to list databases by "
+                        "subject - use database_catalog for that."
+                    ),
+                    "inputSchema": {
+                        "json": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": (
+                                        "The search query describing the library information to "
+                                        "look up."
+                                    ),
+                                }
+                            },
+                            "required": ["query"],
+                        }
+                    },
+                }
+            },
+            {
+                "toolSpec": {
+                    "name": CATALOG_TOOL_NAME,
+                    "description": (
+                        "Look up the library's research-database catalog. Use this for two things: "
+                        "(1) to check whether a SPECIFIC named database or resource is available - "
+                        "e.g. 'do you have JSTOR / EBSCO / Opposing Viewpoints?' - it authoritatively "
+                        "returns whether the database is held, and if not, suggests held alternatives; "
+                        "and (2) to list the databases the library has for a SUBJECT - e.g. 'databases "
+                        "for business / nursing / psychology'. This catalog is authoritative for "
+                        "database availability: trust its held / not-held answer. It does NOT cover "
+                        "hours, services, or policies - use search_library_info for those."
+                    ),
+                    "inputSchema": {
+                        "json": {
+                            "type": "object",
+                            "properties": {
+                                "query_type": {
+                                    "type": "string",
+                                    "enum": ["name", "subject"],
+                                    "description": (
+                                        "'name' to check availability of a specific named database; "
+                                        "'subject' to list databases for a subject area."
+                                    ),
+                                },
+                                "value": {
+                                    "type": "string",
+                                    "description": (
+                                        "The database name (for query_type 'name') or the subject "
+                                        "(for query_type 'subject')."
+                                    ),
+                                },
+                            },
+                            "required": ["query_type", "value"],
+                        }
+                    },
+                }
+            },
+            {
+                "toolSpec": {
+                    "name": PRIMO_TOOL_NAME,
+                    "description": (
+                        "Search the Gavilan College Library's BOOK and MEDIA catalog (Primo) for a "
+                        "specific title, author, or work the student wants to find or borrow - e.g. "
+                        "'do you have The Great Gatsby?', 'is the Citizen Kane film available?', "
+                        "'books by Toni Morrison'. It returns the top few candidate records (title, "
+                        "author, year, type) with the catalog's current availability (status, "
+                        "campus/location, call number) and the total match count. This is EVIDENCE, "
+                        "NOT a verdict: Primo always returns fuzzy matches and its ranking is "
+                        "unreliable, so YOU must decide whether any candidate is really the item "
+                        "asked for, checking ALL returned candidates for a matching title with an "
+                        "available copy (the top-ranked result is often not the available one). Do "
+                        "NOT conclude the library lacks an item unless total is 0. Availability is "
+                        "what the catalog SHOWS, not a guarantee the copy is on the shelf. Use this "
+                        "for books and media the library owns; NOT for research databases (use "
+                        "database_catalog), NOT for hours/services/policies (use search_library_info), "
+                        "and NOT for course textbooks or materials on reserve for a class (use "
+                        "search_course_reserves for those)."
+                    ),
+                    "inputSchema": {
+                        "json": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": (
+                                        "The title, author, or subject to look up in the book/media "
+                                        "catalog."
+                                    ),
+                                }
+                            },
+                            "required": ["query"],
+                        }
+                    },
+                }
+            },
+            {
+                "toolSpec": {
+                    "name": RESERVES_TOOL_NAME,
+                    "description": (
+                        "Search the Gavilan College Library's COURSE RESERVES (Primo) - textbooks and "
+                        "materials an instructor placed on hold for a class, borrowed for short loans "
+                        "at the Course Reserve desk. Use this to check whether a textbook is on "
+                        "reserve, or to list what is on reserve for a course - e.g. 'is the psychology "
+                        "textbook on reserve?', 'what's on reserve for PSYC C1000?', 'do you have the "
+                        "book for MATH 205?'. The query can be a COURSE CODE (formats vary, like 'PSYC "
+                        "C1000' or the older 'PSYCH 10') OR a textbook title. It returns the top few "
+                        "candidate records with title, author, the course code(s) each item is on "
+                        "reserve for, the catalog's current availability (status, location such as the "
+                        "Course Reserve desk, call number), and the total match count. This is "
+                        "EVIDENCE, NOT a verdict: results are fuzzy and the ranking is unreliable (a "
+                        "search can rank the wrong course first), so YOU must confirm a candidate "
+                        "really matches using its course info, checking ALL candidates, not just the "
+                        "first. Do NOT conclude an item is not on reserve unless total is 0. "
+                        "Availability is what the catalog SHOWS, not a guarantee the copy is on the "
+                        "shelf. Use this for textbooks/course materials on reserve; NOT for the "
+                        "general book/media catalog (use search_book_catalog), research databases "
+                        "(use database_catalog), or hours/services (use search_library_info)."
+                    ),
+                    "inputSchema": {
+                        "json": {
+                            "type": "object",
+                            "properties": {
+                                "query": {
+                                    "type": "string",
+                                    "description": (
+                                        "A course code (e.g. 'PSYC C1000', 'MATH 205'), a textbook "
+                                        "title, or a subject to look up in course reserves."
+                                    ),
+                                }
+                            },
+                            "required": ["query"],
+                        }
+                    },
+                }
+            },
+        ]
+    }
+
+
+def _run_search_tool(tool_input, usage=None):
+    """Execute the search_library_info tool: run KB `Retrieve` on the model's query. Returns
+    (chunks, result_json) where result_json is the toolResult payload handed back to the model.
+
+    `usage` is the optional billable-usage tally (see _new_usage); a retrieval that actually
+    runs is counted there. A blank query short-circuits before Retrieve and is not counted,
+    because nothing was billed."""
+    query = ""
+    if isinstance(tool_input, dict):
+        query = (tool_input.get("query") or "").strip()
+    if not query:
+        return [], {"passages": [], "note": "No search query was provided."}
+    if usage is not None:
+        usage["retrievals"] += 1
+    chunks = retrieve(query)
+    passages = [{"text": c["text"], "source": c.get("source")} for c in chunks]
+    if not passages:
+        return chunks, {"passages": [], "note": "No relevant passages were found."}
+    return chunks, {"passages": passages}
+
+
+def _norm(text):
+    """Normalize a name/subject for matching: lowercase, drop punctuation, collapse whitespace."""
+    return " ".join("".join(c if c.isalnum() else " " for c in (text or "").lower()).split())
+
+
+def _name_matches(query_norm, name, aliases):
+    """Whether a normalized query names this database, by its name or any alias. Matches on exact
+    normalized equality or a whole-string containment either way (so 'ebsco' hits the 'EBSCO'
+    alias and 'jstor database' still hits 'JSTOR'), which is safe for specific named-database
+    lookups."""
+    for candidate in [name] + list(aliases or []):
+        cand = _norm(candidate)
+        if not cand:
+            continue
+        if query_norm == cand or query_norm in cand or cand in query_norm:
+            return True
+    return False
+
+
+def _catalog_name_lookup(value):
+    """Authoritatively answer whether a named database is held. Returns structured JSON (the model
+    writes the prose). Held -> {held:true,...}; known-absent -> {held:false, suggested_alternatives};
+    unknown -> {held:false, not in catalog, generic alternatives}."""
+    catalog = _get_catalog()
+    query_norm = _norm(value)
+    for db in catalog.get("held", []):
+        if _name_matches(query_norm, db["name"], db.get("aliases")):
+            return {
+                "held": True,
+                "name": db["name"],
+                "subjects": db.get("subjects", []),
+                "description": db.get("description", ""),
+            }
+    for db in catalog.get("not_held", []):
+        if _name_matches(query_norm, db["name"], db.get("aliases")):
+            return {
+                "held": False,
+                "name": db["name"],
+                "suggested_alternatives": db.get("suggested_alternatives", []),
+            }
+    # Not in either list: the catalog is authoritative for what is held, so an unknown name is not
+    # held. Offer a generic starting point rather than a curated alternative.
+    return {
+        "held": False,
+        "name": value,
+        "suggested_alternatives": catalog.get("default_alternatives", []),
+        "note": "This database was not found in the library's catalog.",
+    }
+
+
+def _catalog_subject_lookup(value):
+    """List the held databases for a subject. Matches the subject query against each database's
+    subject tags (normalized, containment either way). Returns {subject, databases:[{name,
+    description}], note?}."""
+    query_norm = _norm(value)
+    matches = []
+    for db in _get_catalog().get("held", []):
+        for subject in db.get("subjects", []):
+            sub = _norm(subject)
+            if query_norm == sub or query_norm in sub or sub in query_norm:
+                matches.append({"name": db["name"], "description": db.get("description", "")})
+                break
+    result = {"subject": value, "databases": matches}
+    if not matches:
+        result["note"] = "No databases were found for that subject in the catalog."
+    return result
+
+
+def _run_catalog_tool(tool_input):
+    """Execute the database_catalog tool. Returns (result_json, contributed_source) where
+    contributed_source is _CATALOG_SOURCE for a real lookup (name or subject) or None for a bad
+    input - so only substantive catalog answers add the synthetic A-Z-page source."""
+    if not isinstance(tool_input, dict):
+        return {"error": "Invalid catalog input."}, None
+    value = (tool_input.get("value") or "").strip()
+    if not value:
+        return {"error": "No database name or subject was provided."}, None
+    query_type = (tool_input.get("query_type") or "").strip().lower()
+    if query_type == "subject":
+        return _catalog_subject_lookup(value), _CATALOG_SOURCE
+    # Default to a name lookup (the common "do you have X?" case) for 'name' or anything else.
+    return _catalog_name_lookup(value), _CATALOG_SOURCE
+
+
+# --- Curated links: rendered into the Converse system payload ------------------------------
+
+
+def _link_entry(entry):
+    """One curated row reduced to what the model needs: the key, the human label, the URL, and
+    when the link applies. Defensive `.get`s so a malformed row degrades instead of throwing."""
+    return {
+        "key": entry.get("key", ""),
+        "label": entry.get("label", ""),
+        "url": entry.get("url", ""),
+        "use_when": entry.get("use_when", ""),
+    }
+
+
+def _links_block():
+    """The curated link table rendered for the Converse `system` payload.
+
+    WHY THIS IS CONTEXT AND NOT A TOOL. It used to be `library_links`, a tool taking no input and
+    returning every row on every call - a constant function. A constant behind a tool call is
+    context with extra steps plus a chance to forget, and the model took that chance: it would
+    answer "where is the financial aid office" from retrieved text, feel finished, and never
+    reach for the map. That is the measured Tool-Skip failure mode (models skip a required call
+    ~12-26% of the time even when they internally register that it is needed), and no amount of
+    tool-description work fixes it, because the description is only read once the model has
+    already decided to look something up. Preloading deletes the decision.
+
+    Cost: the table is 10 rows (~820 tokens) against the ~363 the deleted toolSpec description
+    charged on every request anyway, so the real delta is ~460 tokens - and a link answer no
+    longer spends a whole extra Converse round trip fetching a constant.
+
+    Contributes nothing to `sources`, exactly as the tool did not: the table says which links
+    EXIST, not which one an answer used, so citing from it would credit pages never mentioned.
+    Links reach the student inline in the answer text instead.
+
+    Revisit if the table outgrows ~30 rows; at that size an always-on block stops being cheap and
+    a tool with real filtering earns its place back."""
+    rows = []
+    for entry in _LIBRARY_LINKS:
+        row = _link_entry(entry)
+        rows.append(f"- {row['label']}: {row['url']}\n  Use when: {row['use_when']}")
+    return (
+        "CANONICAL GAVILAN LINKS. These URLs are curated by the library, verified, and current. "
+        "Together with the source links a tool returns, they are the ONLY web addresses you may "
+        "put in a reply. Copy one exactly as written here; never shorten it, complete it, or "
+        "adjust its path. Pick the entry that fits from its label and its 'Use when' note - that "
+        "judgement is yours. If none of them fits and no tool result supplied a link, describe "
+        "where to go in plain words rather than inventing a URL. Do not list these unprompted or "
+        "attach one to an answer that did not need it.\n\n" + "\n".join(rows)
+    )
+
+
+# --- Primo book/media catalog tool implementation ------------------------------------------
+
+_primo_ssl_ctx = None
+
+
+def _primo_ssl_context():
+    """A certificate-verifying SSL context for the Primo HTTPS calls, resolved once per container.
+
+    Priority: (1) certifi if importable - this is the LOCAL-DEV path (the macOS python.org build
+    ships no OS trust store, so a bare default context fails cert verification); (2) the platform
+    default trust store, which is what the Lambda runtime (Amazon Linux 2023) uses and which is
+    the expected production path; (3) botocore's bundled CA (botocore is always present in the
+    Lambda runtime) as a final belt-and-suspenders. We only accept the default context if it
+    actually loaded CA certs, so a certificate-less environment falls through to (3).
+
+    NOTE: the production (Lambda) leg can only be fully confirmed at deploy - it cannot be
+    exercised offline. See the change summary."""
+    global _primo_ssl_ctx
+    if _primo_ssl_ctx is not None:
+        return _primo_ssl_ctx
+    ctx = None
+    try:
+        import certifi
+
+        ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:  # noqa: BLE001 - certifi absent (e.g. Lambda): try the OS trust store next
+        ctx = None
+    if ctx is None:
+        try:
+            candidate = ssl.create_default_context()
+            if candidate.cert_store_stats().get("x509_ca", 0) > 0:
+                ctx = candidate
+        except Exception:  # noqa: BLE001
+            ctx = None
+    if ctx is None:
+        try:
+            import botocore  # guaranteed in the Lambda runtime; bundles a CA cert file
+
+            cafile = os.path.join(os.path.dirname(botocore.__file__), "cacert.pem")
+            if os.path.exists(cafile):
+                ctx = ssl.create_default_context(cafile=cafile)
+        except Exception:  # noqa: BLE001
+            ctx = None
+    _primo_ssl_ctx = ctx or ssl.create_default_context()
+    return _primo_ssl_ctx
+
+
+def _primo_get_json(url, timeout):
+    """GET a Primo URL and parse JSON. Timed out. Raises on any network / timeout / HTTP / parse
+    error; every caller wraps this and soft-fails (a dead Primo must never kill the request)."""
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout, context=_primo_ssl_context()) as resp:
+        return json.loads(resp.read())
+
+
+def _primo_search_request(query, limit, timeout):
+    """The Primo search call (ranked bib records, NO availability). MyInstitution/LibraryCatalog
+    scope only - the general local catalog, never CourseReserves."""
+    params = {
+        "q": f"any,contains,{query}",
+        "inst": PRIMO_INST,
+        "vid": PRIMO_VID,
+        "scope": PRIMO_SCOPE,
+        "tab": PRIMO_TAB,
+        "pcAvailability": "true",
+        "skipDelivery": "Y",
+        "sort": "rank",
+        "lang": "en",
+        "limit": str(limit),
+        "offset": "0",
+    }
+    return _primo_get_json(f"{PRIMO_SEARCH_URL}?{urllib.parse.urlencode(params)}", timeout)
+
+
+def _primo_delivery_request(record_id, timeout, scope=None):
+    """The per-record delivery call (real-time holdings + availability). Separate from search.
+    `scope` defaults to the general-catalog scope; the reserves tool passes its own scope so the
+    delivery is fetched in the same scope the record was found in."""
+    params = {
+        "inst": PRIMO_INST,
+        "vid": PRIMO_VID,
+        "scope": scope or PRIMO_SCOPE,
+        "lang": "en",
+        "getDelivery": "true",
+    }
+    url = f"{PRIMO_SEARCH_URL}/L/{urllib.parse.quote(record_id)}?{urllib.parse.urlencode(params)}"
+    return _primo_get_json(url, timeout)
+
+
+def _primo_first(field):
+    """First non-empty string in a Primo list field (or the bare string). '' if absent or oddly
+    shaped. Primo display/control fields are almost always single-element lists, but the
+    undocumented shape is not guaranteed, so never index blindly."""
+    if isinstance(field, list):
+        for v in field:
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+    if isinstance(field, str):
+        return field.strip()
+    return ""
+
+
+def _primo_availability(record_id, timeout, scope=None):
+    """Real-time availability for one record from the delivery endpoint, as a dict
+    {status, location, call_number}. Any failure (or a shape we don't recognize) degrades to
+    status 'unknown' - it never raises. NOTE: 'available' here is what the catalog SHOWS, not a
+    guarantee the physical copy is on the shelf; the system prompt phrases it accordingly.
+    `scope` is passed through to the delivery call (the reserves tool uses the reserves scope, so
+    the reserve holding's 'Course Reserve' sublocation surfaces in `location`)."""
+    unknown = {"status": "unknown", "location": "", "call_number": ""}
+    if not record_id:
+        return unknown
+    try:
+        payload = _primo_delivery_request(record_id, timeout, scope=scope)
+    except Exception as exc:  # noqa: BLE001 - degrade to unknown, never fail the whole lookup
+        print(json.dumps({"event": "primo_availability_failed", "error": f"{type(exc).__name__}: {exc}"}))
+        return unknown
+    delivery = payload.get("delivery") if isinstance(payload, dict) else None
+    if not isinstance(delivery, dict):
+        return unknown
+
+    codes = delivery.get("availability")
+    codes = codes if isinstance(codes, list) else []
+    best = delivery.get("bestlocation")
+    best = best if isinstance(best, dict) else {}
+    eservices = delivery.get("electronicServices")
+    eservices = eservices if isinstance(eservices, list) else []
+
+    if best:
+        where = ", ".join(
+            x for x in (best.get("mainLocation"), best.get("subLocation")) if isinstance(x, str) and x
+        )
+        status = best.get("availabilityStatus") or (codes[0] if codes else "") or "unknown"
+        call = best.get("callNumber")
+        return {"status": status, "location": where, "call_number": call if isinstance(call, str) else ""}
+    if eservices:
+        names = ", ".join(
+            (s.get("serviceType") or s.get("displayName") or "online access")
+            for s in eservices
+            if isinstance(s, dict)
+        )
+        return {"status": "online", "location": names, "call_number": ""}
+    displayed = delivery.get("displayedAvailability")
+    if isinstance(displayed, str) and displayed:
+        status = displayed
+    elif codes:
+        status = ", ".join(c for c in codes if isinstance(c, str))
+    else:
+        status = "not available"
+    return {"status": status or "unknown", "location": "", "call_number": ""}
+
+
+def _parse_primo_doc(doc):
+    """One Primo `docs` entry -> {title, author, year, type, record_id}, or None if there is no
+    usable title. Defensive against missing pnx sections and the $$C..$$V.. delimited creator."""
+    if not isinstance(doc, dict):
+        return None
+    pnx = doc.get("pnx")
+    pnx = pnx if isinstance(pnx, dict) else {}
+    display = pnx.get("display")
+    display = display if isinstance(display, dict) else {}
+    control = pnx.get("control")
+    control = control if isinstance(control, dict) else {}
+
+    title = _primo_first(display.get("title"))
+    if not title:
+        return None
+    creator = _primo_first(display.get("creator")) or _primo_first(display.get("contributor"))
+    author = creator.split("$$")[0].strip() if creator else ""
+    return {
+        "title": title,
+        "author": author,
+        "year": _primo_first(display.get("creationdate")),
+        "type": _primo_first(display.get("type")),
+        "record_id": _primo_first(control.get("recordid")),
+    }
+
+
+def _primo_total(data):
+    """The reported total match count. 0 (the only clean not-held signal) if absent/odd-shaped."""
+    info = data.get("info") if isinstance(data, dict) else None
+    total = info.get("total") if isinstance(info, dict) else None
+    return total if isinstance(total, int) else 0
+
+
+def _primo_search_page(query):
+    """A student-facing Primo results URL for this query - the synthetic source and the place to
+    verify catalog holdings (matching how database_catalog cites the A-Z page)."""
+    params = {
+        "query": f"any,contains,{query}",
+        "tab": PRIMO_TAB,
+        "search_scope": PRIMO_SCOPE,
+        "vid": PRIMO_VID,
+        "offset": "0",
+    }
+    return f"{PRIMO_DISCOVERY_URL}?{urllib.parse.urlencode(params)}"
+
+
+def _run_primo_tool(tool_input):
+    """Execute search_book_catalog: a live Primo search plus a per-result availability lookup.
+
+    Returns (result_json, source). result_json carries `total` (the ONLY clean not-held signal,
+    == 0) and up to PRIMO_NUMBER_OF_RESULTS candidate `results` (title/author/year/type +
+    availability) for the MODEL to judge - the handler makes NO held/not-held decision and applies
+    NO score threshold. On a blank query it returns an error result; on ANY live-call failure it
+    soft-fails to a 'catalog_unavailable' result so the model can still answer. `source` is the
+    Primo results page for a lookup that produced candidates (deduped like the catalog source),
+    otherwise None (a no-match or an unavailable lookup contributes no source)."""
+    query = ""
+    if isinstance(tool_input, dict):
+        query = (tool_input.get("query") or "").strip()
+    if not query:
+        return {"error": "No search terms were provided."}, None
+
+    try:
+        data = _primo_search_request(query, PRIMO_NUMBER_OF_RESULTS, PRIMO_TIMEOUT_SECONDS)
+    except Exception as exc:  # noqa: BLE001 - live third-party call: soft-fail, never throw
+        print(json.dumps({"event": "primo_search_failed", "error": f"{type(exc).__name__}: {exc}"}))
+        return {"error": "catalog_unavailable", "note": _PRIMO_UNAVAILABLE_NOTE}, None
+    if not isinstance(data, dict):
+        print(json.dumps({"event": "primo_search_failed", "error": "unexpected response shape"}))
+        return {"error": "catalog_unavailable", "note": _PRIMO_UNAVAILABLE_NOTE}, None
+
+    total = _primo_total(data)
+    docs = data.get("docs")
+    docs = docs if isinstance(docs, list) else []
+
+    results = []
+    # Bound the total time spent on per-result availability lookups; past the budget the rest
+    # report 'unknown' rather than pushing the request toward the Lambda timeout.
+    deadline = time.monotonic() + PRIMO_AVAILABILITY_BUDGET_SECONDS
+    for doc in docs[:PRIMO_NUMBER_OF_RESULTS]:
+        parsed = _parse_primo_doc(doc)
+        if not parsed:
+            continue
+        if time.monotonic() < deadline:
+            availability = _primo_availability(parsed["record_id"], PRIMO_TIMEOUT_SECONDS)
+        else:
+            availability = {"status": "unknown", "location": "", "call_number": ""}
+        results.append(
+            {
+                "title": parsed["title"],
+                "author": parsed["author"],
+                "year": parsed["year"],
+                "type": parsed["type"],
+                "availability": availability,
+            }
+        )
+
+    result_json = {"query": query, "total": total, "results": results}
+    if not results:
+        result_json["note"] = (
+            "No matching records were found in the library catalog."
+            if total == 0
+            else "No usable catalog records were returned for this search."
+        )
+    source = None
+    if results:
+        source = {"uri": _primo_search_page(query), "excerpt": f"Gavilan Library catalog search: {query}"}
+    return result_json, source
+
+
+# --- Course reserves tool implementation (search_course_reserves) --------------------------
+#
+# A FOURTH tool, separate from search_book_catalog like database_catalog is separate. It searches
+# the Primo CourseReserves scope: textbooks/materials an instructor placed on reserve for a class.
+# Same posture as the general catalog tool - EVIDENCE, not a verdict: it returns candidate records
+# for the MODEL to judge, total == 0 is the ONLY clean "not on reserve" signal, every call is timed
+# out and soft-fails, parsing is defensive. The one difference is the crsinfo field, which links a
+# record to one or more COURSE CODES (a single reserve item can serve several courses).
+
+
+def _primo_reserves_search_request(query, limit, timeout):
+    """The Primo search call in the CourseReserves scope. Same shape as the general search, just a
+    different scope/tab - a course code or a title both match here via any,contains."""
+    params = {
+        "q": f"any,contains,{query}",
+        "inst": PRIMO_INST,
+        "vid": PRIMO_VID,
+        "scope": PRIMO_RESERVES_SCOPE,
+        "tab": PRIMO_RESERVES_TAB,
+        "pcAvailability": "true",
+        "skipDelivery": "Y",
+        "sort": "rank",
+        "lang": "en",
+        "limit": str(limit),
+        "offset": "0",
+    }
+    return _primo_get_json(f"{PRIMO_SEARCH_URL}?{urllib.parse.urlencode(params)}", timeout)
+
+
+def _parse_reserve_courses(display):
+    """The course codes a reserve item is on hold for, from the crsinfo field. A single item can be
+    on reserve for MULTIPLE courses. crsinfo is a list of strings shaped like
+    '$$R<code>$$V<code>: <code>; <dept>$$M<code>' (course-code formats vary - 'PSYC C1000' vs the
+    older 'PSYCH 10'); the $$R segment carries the course code. Defensive: crsinfo may be absent, a
+    bare string, or oddly shaped, and a single string can carry more than one $$R segment."""
+    raw = display.get("crsinfo")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    courses = []
+    for entry in raw:
+        if not isinstance(entry, str):
+            continue
+        for part in entry.split("$$"):
+            if part.startswith("R"):
+                code = part[1:].strip().rstrip("\\").strip()
+                if code and code not in courses:
+                    courses.append(code)
+    return courses
+
+
+def _parse_reserve_doc(doc):
+    """One CourseReserves `docs` entry -> {title, author, courses, record_id}, or None if there is
+    no usable title. Defensive against missing pnx sections, the $$C..$$V.. creator, and crsinfo."""
+    if not isinstance(doc, dict):
+        return None
+    pnx = doc.get("pnx")
+    pnx = pnx if isinstance(pnx, dict) else {}
+    display = pnx.get("display")
+    display = display if isinstance(display, dict) else {}
+    control = pnx.get("control")
+    control = control if isinstance(control, dict) else {}
+
+    title = _primo_first(display.get("title"))
+    if not title:
+        return None
+    creator = _primo_first(display.get("creator")) or _primo_first(display.get("contributor"))
+    author = creator.split("$$")[0].strip() if creator else ""
+    return {
+        "title": title,
+        "author": author,
+        "courses": _parse_reserve_courses(display),
+        "record_id": _primo_first(control.get("recordid")),
+    }
+
+
+def _reserves_search_page(query):
+    """A student-facing Primo course-reserves results URL for this query - the synthetic source and
+    the place to verify what is on reserve (mirrors _primo_search_page for the general catalog)."""
+    params = {
+        "query": f"any,contains,{query}",
+        "tab": PRIMO_RESERVES_TAB,
+        "search_scope": PRIMO_RESERVES_SCOPE,
+        "vid": PRIMO_VID,
+        "offset": "0",
+    }
+    return f"{PRIMO_DISCOVERY_URL}?{urllib.parse.urlencode(params)}"
+
+
+def _run_reserves_tool(tool_input):
+    """Execute search_course_reserves: a live Primo CourseReserves search plus a per-result
+    availability lookup.
+
+    Returns (result_json, source). result_json carries `total` (the ONLY clean not-on-reserve
+    signal, == 0) and up to PRIMO_NUMBER_OF_RESULTS candidate `results` (title/author/courses +
+    availability) for the MODEL to judge - the handler makes NO on/not-on-reserve decision. On a
+    blank query it returns an error result; on ANY live-call failure it soft-fails to a
+    'reserves_unavailable' result so the model can still answer. `source` is the reserves results
+    page for a lookup that produced candidates (deduped), otherwise None."""
+    query = ""
+    if isinstance(tool_input, dict):
+        query = (tool_input.get("query") or "").strip()
+    if not query:
+        return {"error": "No course or title was provided."}, None
+
+    try:
+        data = _primo_reserves_search_request(query, PRIMO_NUMBER_OF_RESULTS, PRIMO_TIMEOUT_SECONDS)
+    except Exception as exc:  # noqa: BLE001 - live third-party call: soft-fail, never throw
+        print(json.dumps({"event": "reserves_search_failed", "error": f"{type(exc).__name__}: {exc}"}))
+        return {"error": "reserves_unavailable", "note": _RESERVES_UNAVAILABLE_NOTE}, None
+    if not isinstance(data, dict):
+        print(json.dumps({"event": "reserves_search_failed", "error": "unexpected response shape"}))
+        return {"error": "reserves_unavailable", "note": _RESERVES_UNAVAILABLE_NOTE}, None
+
+    total = _primo_total(data)
+    docs = data.get("docs")
+    docs = docs if isinstance(docs, list) else []
+
+    results = []
+    deadline = time.monotonic() + PRIMO_AVAILABILITY_BUDGET_SECONDS
+    for doc in docs[:PRIMO_NUMBER_OF_RESULTS]:
+        parsed = _parse_reserve_doc(doc)
+        if not parsed:
+            continue
+        if time.monotonic() < deadline:
+            availability = _primo_availability(
+                parsed["record_id"], PRIMO_TIMEOUT_SECONDS, scope=PRIMO_RESERVES_SCOPE
+            )
+        else:
+            availability = {"status": "unknown", "location": "", "call_number": ""}
+        results.append(
+            {
+                "title": parsed["title"],
+                "author": parsed["author"],
+                "courses": parsed["courses"],
+                "availability": availability,
+            }
+        )
+
+    result_json = {"query": query, "total": total, "results": results}
+    if not results:
+        result_json["note"] = (
+            "No items on course reserve matched this search."
+            if total == 0
+            else "No usable course-reserve records were returned for this search."
+        )
+    source = None
+    if results:
+        source = {
+            "uri": _reserves_search_page(query),
+            "excerpt": f"Gavilan Library course reserves search: {query}",
+        }
+    return result_json, source
+
+
+def _guardrail_output_text(response):
+    """The text the guardrail returned in `outputs` - the configured block message. Empty
+    string if absent."""
+    for out in response.get("outputs") or []:
+        if isinstance(out, dict) and out.get("text"):
+            return out["text"]
+    return ""
+
+
+def _is_blocked(response):
+    """Did the input screen block this query?
+
+    The guardrail carries exactly one policy - the PROMPT_ATTACK content filter - and a
+    content filter's only intervention is a block. So the top-level action is the whole
+    decision: "GUARDRAIL_INTERVENED" means a detected injection attempt, "NONE" means the
+    query passes through untouched. There is no mask case any more, because there is no PII
+    policy to anonymize anything, and no per-item scan, because there is no second policy
+    whose per-item action could disagree with the top-level one.
+
+    This also fails closed: an intervention we cannot explain still blocks, rather than
+    silently forwarding a query the guardrail flagged."""
+    return response.get("action") == _ACTION_INTERVENED
+
+
+def _reduce_assessments(assessments):
+    """Privacy-safe summary of guardrail assessments for logging: policy/entity TYPES +
+    actions + counts only, NEVER the raw matched text (item["match"] is the very content the
+    guardrail exists to keep out of plaintext logs).
+
+    Only the PROMPT_ATTACK content filter is configured, so in practice `content_filters` is
+    the field that is ever populated. The rest of the reduction stays because its job is to
+    strip raw text out of WHATEVER Bedrock returns - a summarizer that only knows one shape
+    would leak the first time the response carried another."""
+    content_filters = []
+    topics_blocked = 0
+    words_blocked = 0
+    pii = {}
+    for assessment in assessments or []:
+        for f in (assessment.get("contentPolicy") or {}).get("filters", []) or []:
+            content_filters.append({"type": f.get("type"), "action": f.get("action")})
+        for t in (assessment.get("topicPolicy") or {}).get("topics", []) or []:
+            if t.get("action") == _ITEM_BLOCKED:
+                topics_blocked += 1
+        word_policy = assessment.get("wordPolicy") or {}
+        for w in (word_policy.get("customWords") or []) + (
+            word_policy.get("managedWordLists") or []
+        ):
+            if w.get("action") == _ITEM_BLOCKED:
+                words_blocked += 1
+        sip = assessment.get("sensitiveInformationPolicy") or {}
+        for item in (sip.get("piiEntities") or []) + (sip.get("regexes") or []):
+            # Bucket by entity type + action; never include item["match"].
+            key = f"{item.get('type') or item.get('name')}:{item.get('action')}"
+            pii[key] = pii.get(key, 0) + 1
+    return {
+        "content_filters": content_filters,
+        "topics_blocked": topics_blocked,
+        "words_blocked": words_blocked,
+        "pii": pii,
+    }
+
+
+def _log_input_guardrail(response, decision):
+    """Structured, PII-safe log of the input-screen outcome on every request. This is the
+    only guardrail log line there is - nothing screens the output, so there is nothing to
+    log on the way back out."""
+    print(
+        json.dumps(
+            {
+                "event": "input_guardrail",
+                "action": response.get("action"),
+                "decision": decision,
+                "assessment": _reduce_assessments(response.get("assessments") or []),
+            },
+            default=str,
+        )
+    )
+
+
+def _apply_input_guardrail(query, usage=None):
+    """Screen the bare user query for PROMPT_ATTACK via ApplyGuardrail (source=INPUT), before
+    the agent loop.
+
+    `usage` is the optional billable-usage tally (see _new_usage). ApplyGuardrail reports the
+    text units it charged in its own response, so the screen's cost is recorded here even when
+    it blocks and the request never reaches Converse.
+
+    Returns a (decision, text) pair:
+      ("proceed", <query>)          - nothing intervened; the query is handed to the loop
+                                      EXACTLY as the student typed it (nothing rewrites it).
+      ("block", <blocked message>)  - a detected prompt-injection attempt; the caller returns
+                                      the message with no retrieval and no generation.
+
+    If the guardrail is not wired (local/dev), the query passes through untouched."""
+    if not INPUT_GUARDRAIL_ID or not INPUT_GUARDRAIL_VERSION:
+        return "proceed", query
+
+    response = _bedrock_client().apply_guardrail(
+        guardrailIdentifier=INPUT_GUARDRAIL_ID,
+        guardrailVersion=INPUT_GUARDRAIL_VERSION,
+        source="INPUT",
+        # Bare user text, no qualifiers: qualifiers are the contextual-grounding tagging
+        # path, which this project deliberately does not use.
+        content=[{"text": {"text": query}}],
+    )
+    blocked = _is_blocked(response)
+    _log_input_guardrail(response, "block" if blocked else "clean")
+    if usage is not None:
+        usage["guardrail_calls"] += 1
+        _add_guardrail_units(usage, response.get("usage"))
+
+    if blocked:
+        return "block", _guardrail_output_text(response) or _FALLBACK_BLOCK_MESSAGE
+    return "proceed", query
+
+
+def _message_text(message):
+    """The first text block of a Converse output message (a message may mix text with
+    toolUse blocks; we surface the text). Empty string if there is none."""
+    for block in (message or {}).get("content", []) or []:
+        if isinstance(block, dict) and "text" in block:
+            return block["text"]
+    return ""
+
+
+# --- Tool-call trace (opt-in debug payload only) -------------------------------------------
+#
+# `full_context` shows the KB passages and nothing else, so an answer built from the database
+# catalog or either Primo tool looked context-free to anything reading the
+# response - which made the eval's groundedness axis unwinnable for three of the four tools. The
+# trace below closes that: every toolResult the model received, in order, plus which tool
+# produced it. Recorded from values run_agent already computed; it feeds nothing back into the
+# loop and never appears without the include_full_context flag.
+
+# The key each tool uses for its substantive payload, checked in order. (`links` was here for the
+# retired library_links tool; the directory is now a system block, which the trace carries
+# separately as `library_links` - see _handle_query.)
+_RESULT_PAYLOAD_KEYS = ("passages", "results", "databases")
+
+
+def _returned_results(result_json):
+    """Whether a tool call actually found what it was asked for.
+
+    An error (including a Primo soft-fail) is never a result. Otherwise the first payload key
+    present decides: passages found, candidate records found, databases matched, links returned.
+    A result with none of those keys is a database_catalog NAME lookup, whose answer IS the
+    held/not-held verdict - authoritative either way, so it counts as a result."""
+    if not isinstance(result_json, dict) or "error" in result_json:
+        return False
+    for key in _RESULT_PAYLOAD_KEYS:
+        if key in result_json:
+            return bool(result_json[key])
+    return True
+
+
+def _tool_call_record(name, tool_input, status, result_json):
+    """One entry in the ordered `tool_calls` trace: which tool the model called, the input it
+    passed, the status the loop reported back, whether the call found anything, and the exact
+    JSON the model received as that call's toolResult content."""
+    return {
+        "tool": name,
+        "input": tool_input,
+        "status": status,
+        "returned_results": _returned_results(result_json),
+        "result": result_json,
+    }
+
+
+# --- Billable-usage accounting (opt-in debug payload only) ---------------------------------
+#
+# WHY THIS EXISTS. "What will this cost us" is the question right after "does it work", and
+# nothing in the response could answer it. The hard part is not the arithmetic, it is that one
+# student question is NOT one model call: this is an agentic Converse loop, so a question can
+# be several invocations, and each one resends the whole accumulated conversation (history +
+# system prompt + link table + every tool result so far). Retrieved KB passages ride in those
+# input tokens, and the guardrail bills per 1,000-character text unit rather than per question.
+# None of that is guessable from the outside - it has to be measured, per request, from what
+# Bedrock itself reports.
+#
+# Everything below is recorded from values the loop already receives in its API responses. It
+# feeds nothing back into the model, changes no request, and is attached to the response only
+# behind the include_usage flag.
+
+
+def _camel_to_snake(name):
+    """`sensitiveInformationPolicyUnits` -> `sensitive_information_policy_units`. Used so an
+    unrecognized guardrail usage field AWS adds later still surfaces, under a readable key,
+    instead of being silently dropped by a hardcoded field list."""
+    out = []
+    for ch in str(name):
+        if ch.isupper():
+            out.append("_")
+            out.append(ch.lower())
+        else:
+            out.append(ch)
+    return "".join(out).lstrip("_")
+
+
+def _new_usage():
+    """A zeroed usage tally for one /query request.
+
+    Fields, and what each is for:
+      model_calls   - Converse invocations in this request's loop. This is the number the
+                      cost model cannot guess: the loop runs until end_turn, so a question
+                      that triggers two tool rounds bills three model calls, each resending
+                      everything before it.
+      input_tokens  - summed Converse inputTokens. Dominated by the resent conversation plus
+                      the retrieved passages, NOT by the student's sentence.
+      output_tokens - summed Converse outputTokens (capped per turn by GENERATION_MAX_TOKENS).
+      cache_*       - prompt-cache reads/writes if the model reports them; kept separate
+                      because they are priced differently from plain input tokens.
+      guardrail_calls / guardrail_units - the ONE input screen per question (nothing is
+                      attached to Converse any more, so no turn adds to this). Guardrails
+                      bill per TEXT UNIT, per policy, so units are kept per policy name
+                      rather than as one number.
+      retrievals    - KB Retrieve calls (the priming one plus any the model made). Each
+                      embeds the query and queries the vector index.
+      tool_calls    - every tool the loop ran, including the non-billable Primo ones. Context
+                      for reading the numbers above, not a billed quantity itself.
+    """
+    return {
+        "model_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "guardrail_calls": 0,
+        "guardrail_units": {},
+        "retrievals": 0,
+        "tool_calls": 0,
+    }
+
+
+# Converse `usage` keys -> our snake_case fields. Only these four are summed; totalTokens is
+# derivable and is deliberately not stored twice.
+_CONVERSE_USAGE_FIELDS = {
+    "inputTokens": "input_tokens",
+    "outputTokens": "output_tokens",
+    "cacheReadInputTokens": "cache_read_input_tokens",
+    "cacheWriteInputTokens": "cache_write_input_tokens",
+}
+
+
+def _add_model_usage(usage, response):
+    """Fold one Converse response's token usage into the running tally. Defensive: a response
+    with no `usage` block still counts as a model call, because the call was still billed."""
+    if usage is None:
+        return
+    usage["model_calls"] += 1
+    reported = response.get("usage") if isinstance(response, dict) else None
+    if not isinstance(reported, dict):
+        return
+    for api_key, field in _CONVERSE_USAGE_FIELDS.items():
+        value = reported.get(api_key)
+        if isinstance(value, int):
+            usage[field] += value
+
+
+def _add_guardrail_units(usage, reported):
+    """Fold one guardrail's per-policy text-unit counts into the running tally.
+
+    `reported` is a Bedrock GuardrailUsage map (contentPolicyUnits, topicPolicyUnits,
+    sensitiveInformationPolicyUnits, sensitiveInformationPolicyFreeUnits, ...). Every integer
+    field is summed under its snake_case name rather than a fixed allowlist, so the policies
+    this deployment does not use simply stay absent and a newly added one still shows up.
+    Guardrail pricing is per policy, so these must not be collapsed into a single number."""
+    if usage is None or not isinstance(reported, dict):
+        return
+    for key, value in reported.items():
+        if isinstance(value, int):
+            field = _camel_to_snake(key)
+            usage["guardrail_units"][field] = usage["guardrail_units"].get(field, 0) + value
+
+
+# --- Priming retrieval: the KB is the floor of every turn, not a choice --------------------
+#
+# WHY THIS IS MECHANICAL AND NOT A PROMPT RULE. <tools> already says "you do need one before
+# giving any factual answer about the library. Do not answer library facts from memory." That
+# instruction was live for every observed failure: asked where the financial aid office is, the
+# model declined three times and - told outright to use its retrieve tool - argued that doing so
+# "would just return irrelevant library results", with the answer sitting in the KB the whole
+# time. An instruction that loses an argument with the user will not be fixed by rewording, so
+# the retrieval happens before the model gets a say.
+#
+# The result is injected as a synthetic search_library_info toolResult rather than a <context>
+# block: passages reach the model in the shape it already understands, and `sources`,
+# full_context and the eval trace keep working unchanged. search_library_info stays in the
+# toolConfig, so a weak priming query is recoverable - the model can search again with better
+# terms. Worst case it starts with mediocre context instead of none.
+_PRIMING_USER_TURNS = 3
+_PRIMING_QUERY_MAX_CHARS = 400
+
+
+def _priming_query(messages):
+    """Build the priming retrieval query from the last few USER turns, newest last.
+
+    Not just the newest turn: mid-conversation messages are often pronoun-y fragments ("just give
+    me what i would need to do") that retrieve noise on their own. Carrying the prior turns adds
+    back the subject the follow-up omits."""
+    texts = []
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        for block in msg.get("content") or []:
+            text = block.get("text") if isinstance(block, dict) else None
+            if text and text.strip():
+                texts.append(text.strip())
+        if len(texts) >= _PRIMING_USER_TURNS:
+            break
+    query = " ".join(reversed(texts[:_PRIMING_USER_TURNS]))
+    return query[:_PRIMING_QUERY_MAX_CHARS].strip()
+
+
+def _prime_loop(messages, tool_calls, usage=None):
+    """Retrieve once up front and append the call to `messages` as if the model had made it.
+
+    Mutates `messages` (appends the assistant toolUse + user toolResult pair, preserving the
+    alternation Converse requires) and appends to `tool_calls` so the eval trace shows the
+    priming call like any other. Returns the retrieved chunks.
+
+    Soft-fails: a retrieval error must not take the request down, because the loop can still
+    answer from the other tools. On failure nothing is appended and the model proceeds as before.
+    """
+    query = _priming_query(messages)
+    if not query:
+        return []
+    try:
+        chunks, result_json = _run_search_tool({"query": query}, usage=usage)
+    except Exception as exc:  # noqa: BLE001 - priming is best-effort, never fatal
+        print(
+            json.dumps(
+                {
+                    "event": "priming_retrieval_failed",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        )
+        return []
+
+    tool_use_id = "priming-retrieval"
+    messages.append(
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "toolUse": {
+                        "toolUseId": tool_use_id,
+                        "name": SEARCH_TOOL_NAME,
+                        "input": {"query": query},
+                    }
+                }
+            ],
+        }
+    )
+    messages.append(
+        {
+            "role": "user",
+            "content": [
+                {
+                    "toolResult": {
+                        "toolUseId": tool_use_id,
+                        "content": [{"json": result_json}],
+                        "status": "success",
+                    }
+                }
+            ],
+        }
+    )
+    tool_calls.append(
+        _tool_call_record(SEARCH_TOOL_NAME, {"query": query}, "success", result_json)
+    )
+    if usage is not None:
+        usage["tool_calls"] += 1
+    return chunks
+
+
+def run_agent(messages, usage=None, language=None):
+    """Agentic Bedrock Converse tool-use loop over four tools (KB search, database catalog,
+    live Primo book/media catalog, live Primo course reserves).
+
+    `messages` is the seed conversation in Converse shape (a list of {role, content} turns,
+    starting with user and ending with the newest user turn - see _seed_messages), already
+    input-screened. The system prompt goes in Converse `system`, never into these messages. The
+    loop mutates its own copy of `messages`, so callers should pass a fresh list.
+
+    NO guardrail is attached to the Converse call. The answer is screened by nothing, which is
+    the point: the system prompt is what governs it, and an output filter could only replace a
+    considered reply with canned decline copy. Each turn:
+      - call Converse with the four-tool toolConfig;
+      - if stopReason == "tool_use" -> run the tool for EACH toolUse block the model requested
+        (it may ask for several at once), append the assistant turn and ONE user message carrying
+        all the toolResults, and loop;
+      - any other stopReason (end_turn, max_tokens, ...) -> done, return the answer.
+    Retrieval only happens when the model calls the tool, so `chunks` accumulates across the
+    whole loop (empty if the model answered directly, e.g. a greeting). A safety cap of
+    MAX_AGENT_ITERATIONS bounds the loop.
+
+    Returns {"answer", "chunks", "catalog_sources", "tool_calls"}: `chunks` are the KB
+    passages from search_library_info (drive `sources` + eval full_context); `catalog_sources` are
+    the synthetic source entries the non-KB tools contributed (the A-Z databases page and the
+    per-query Primo search pages; the curated link block contributes none - see _links_block);
+    `tool_calls` is the ordered observability trace of every tool the model invoked (see
+    _tool_call_record). The trace is recorded from what the loop already computed - it never
+    changes what is sent to the model.
+
+    `usage` is the optional billable-usage tally (see _new_usage), mutated in place as the loop
+    runs. It is the only way to see that ONE question can be several billed model calls, each
+    resending everything before it. Pass None (the default) to skip the accounting entirely.
+
+    `language` is the explicitly chosen reply language (see _extract_language), or None. It adds
+    one system block and changes nothing else - no tool, no retrieval, no request shape."""
+    collected_chunks = []
+    catalog_sources = []
+    tool_calls = []
+    answer = ""
+    tool_config = _tool_config()
+
+    # Seed the loop with a retrieval the model did not have to decide to make (see _prime_loop).
+    collected_chunks.extend(_prime_loop(messages, tool_calls, usage=usage))
+
+    for _ in range(MAX_AGENT_ITERATIONS):
+        # No guardrailConfig: the output guardrail is gone, so Converse can never come back
+        # with stopReason "guardrail_intervened" and there is no block branch below.
+        response = _bedrock_client().converse(
+            modelId=GENERATION_MODEL_ID,
+            system=_system_blocks(language),
+            messages=messages,
+            toolConfig=tool_config,
+            # Short, direct, low-variance answers for a factual FAQ bot. The maxTokens/temperature
+            # key names and nesting match the bedrock-runtime Converse inferenceConfig shape.
+            inferenceConfig={
+                "maxTokens": GENERATION_MAX_TOKENS,
+                "temperature": GENERATION_TEMPERATURE,
+            },
+        )
+        _add_model_usage(usage, response)
+
+        out_message = response.get("output", {}).get("message", {}) or {}
+        text = _message_text(out_message)
+        if text:
+            answer = text  # keep the latest model text as the running best answer
+
+        if response.get("stopReason") != "tool_use":
+            # Terminal turn (end_turn / max_tokens / stop_sequence / ...): we have the answer.
+            return {
+                "answer": answer,
+                "chunks": collected_chunks,
+                "catalog_sources": catalog_sources,
+                "tool_calls": tool_calls,
+            }
+
+        # tool_use: echo the assistant turn back verbatim (it carries the toolUse blocks), then
+        # run every requested tool and return all results in a single following user message.
+        messages.append(out_message)
+        tool_results = []
+        for block in out_message.get("content", []) or []:
+            tool_use = block.get("toolUse") if isinstance(block, dict) else None
+            if not tool_use:
+                continue
+            name = tool_use.get("name")
+            if name == SEARCH_TOOL_NAME:
+                chunks, result_json = _run_search_tool(tool_use.get("input"), usage=usage)
+                collected_chunks.extend(chunks)
+                status = "success"
+            elif name == CATALOG_TOOL_NAME:
+                result_json, source = _run_catalog_tool(tool_use.get("input"))
+                # A substantive catalog lookup contributes the synthetic A-Z-page source (deduped).
+                if source and source not in catalog_sources:
+                    catalog_sources.append(source)
+                status = "error" if "error" in result_json else "success"
+            elif name == PRIMO_TOOL_NAME:
+                result_json, source = _run_primo_tool(tool_use.get("input"))
+                # A lookup that produced candidates contributes the Primo results-page source
+                # (deduped; a per-query verify link, unlike the single A-Z page). A soft-fail or a
+                # no-match contributes none. status=error on a soft-fail lets the model recover.
+                if source and source not in catalog_sources:
+                    catalog_sources.append(source)
+                status = "error" if "error" in result_json else "success"
+            elif name == RESERVES_TOOL_NAME:
+                result_json, source = _run_reserves_tool(tool_use.get("input"))
+                # Same posture as the book catalog: a lookup with candidates contributes the
+                # reserves results-page source (deduped); a soft-fail or no-match contributes none.
+                if source and source not in catalog_sources:
+                    catalog_sources.append(source)
+                status = "error" if "error" in result_json else "success"
+            else:
+                # The model requested a tool we did not define; report an error result so it can
+                # recover rather than silently hanging.
+                result_json = {"error": f"Unknown tool: {name}"}
+                status = "error"
+            # Observability only: record what this call was and what it handed back, from the
+            # values already computed above. Nothing below is read by the loop.
+            tool_calls.append(_tool_call_record(name, tool_use.get("input"), status, result_json))
+            if usage is not None:
+                usage["tool_calls"] += 1
+            tool_results.append(
+                {
+                    "toolResult": {
+                        "toolUseId": tool_use.get("toolUseId"),
+                        "content": [{"json": result_json}],
+                        "status": status,
+                    }
+                }
+            )
+        if not tool_results:
+            # stopReason was tool_use but no toolUse block was present: bail rather than loop.
+            break
+        messages.append({"role": "user", "content": tool_results})
+
+    # Iteration cap hit without a terminal turn: return the best answer we have (or a fallback).
+    return {
+        "answer": answer or _MAX_ITERS_FALLBACK_MESSAGE,
+        "chunks": collected_chunks,
+        "catalog_sources": catalog_sources,
+        "tool_calls": tool_calls,
+    }
+
+
+def _build_sources(chunks):
+    """Deduplicate retrieved chunks by source uri for the response `sources` list.
+
+    Only public URLs are surfaced. A chunk whose source resolves only to an internal s3:// URI
+    (e.g. an older document ingested before the public-url sidecar existed) is OMITTED entirely -
+    we never leak internal S3 bucket paths to the client. Fewer, clean sources beats a raw path."""
+    sources = []
+    seen = set()
+    for chunk in chunks:
+        uri = chunk.get("source")
+        if not uri or uri in seen or uri.startswith("s3://"):
+            continue
+        seen.add(uri)
+        sources.append({"uri": uri, "excerpt": chunk["text"][:_EXCERPT_CHARS]})
+    return sources
+
+
+def _parse_body(event):
+    """The JSON object body of an HTTP API (payload format 2.0) event, or None if the body is
+    absent, not valid JSON, or not a JSON object."""
+    body = event.get("body")
+    if body is None:
+        return None
+    if event.get("isBase64Encoded"):
+        body = base64.b64decode(body).decode("utf-8")
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _extract_query(data):
+    """The validated user query from a parsed request body, or None for a missing / non-string
+    / blank query. None yields the caller's clean 400 - never a downstream 500."""
+    if not isinstance(data, dict):
+        return None
+    query = data.get("query") or data.get("question")
+    # A non-string (e.g. {"query": 123} or {"query": {...}}) is truthy but would blow up inside
+    # boto3 as an opaque 500. Reject it here as a clean 400 instead.
+    if not isinstance(query, str):
+        return None
+    query = query.strip()
+    return query or None
+
+
+def _normalize_message(item):
+    """Coerce one client-supplied history entry into {"role", "text"}, or None if unusable.
+
+    Accepts a role of "user" or "assistant" (a widget "bot" turn maps to "assistant"); the text
+    may arrive as `content` or `text` and must be a non-empty string once stripped. Anything
+    malformed returns None so the caller can drop it rather than forwarding junk to Converse."""
+    if not isinstance(item, dict):
+        return None
+    role = item.get("role")
+    if not isinstance(role, str):
+        return None
+    role = role.strip().lower()
+    if role == "bot":
+        role = "assistant"
+    if role not in _VALID_ROLES:
+        return None
+    text = item.get("content")
+    if text is None:
+        text = item.get("text")
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    if not text:
+        return None
+    return {"role": role, "text": text}
+
+
+def _extract_conversation(data):
+    """The user/assistant conversation from a parsed request body (newest turn last), or None if
+    there is no usable user question to answer (-> the caller returns a clean 400).
+
+    Two accepted request shapes:
+      - {"messages": [{"role", "content"}, ...]} - single-session history. Malformed entries are
+        dropped; the conversation MUST end with a user turn (the new question).
+      - {"query": "..."} / {"question": "..."} - the legacy single-turn shape (eval + curl), which
+        becomes a one-message user conversation. Kept working for backward compatibility."""
+    if not isinstance(data, dict):
+        return None
+    raw = data.get("messages")
+    if isinstance(raw, list):
+        msgs = [m for m in (_normalize_message(x) for x in raw) if m]
+        # The newest turn must be the user's question; otherwise there is nothing to answer.
+        if not msgs or msgs[-1]["role"] != "user":
+            return None
+        return msgs
+    # Legacy single-query shape.
+    query = _extract_query(data)
+    if not query:
+        return None
+    return [{"role": "user", "text": query}]
+
+
+def _seed_messages(conversation):
+    """Build the Converse `messages` seed from a normalized conversation, guaranteeing a request
+    Converse will accept (start with user, roles strictly alternate):
+      1. keep only the last MAX_HISTORY_MESSAGES turns (the server-side cap; the client is never
+         trusted to limit history);
+      2. drop any leading assistant turn(s) so the seed starts with a user message (a trailing
+         window of an alternating chat, or a widget greeting, can begin with assistant);
+      3. merge any consecutive same-role turns into one message with multiple text blocks, since
+         Converse/Anthropic reject repeated roles - this covers both a buggy client and any
+         adjacency the trim/drop introduced.
+    The result always starts with user and ends with the newest user turn."""
+    trimmed = conversation[-MAX_HISTORY_MESSAGES:]
+    start = 0
+    while start < len(trimmed) and trimmed[start]["role"] != "user":
+        start += 1
+    trimmed = trimmed[start:]
+    messages = []
+    for msg in trimmed:
+        if messages and messages[-1]["role"] == msg["role"]:
+            messages[-1]["content"].append({"text": msg["text"]})
+        else:
+            messages.append({"role": msg["role"], "content": [{"text": msg["text"]}]})
+    return messages
+
+
+# Optional request flag: when true, /query additionally returns the debug payload - the full
+# retrieved KB passages AND the ordered trace of every tool call the loop made (what the model
+# actually saw). The answer-quality eval sets it; the widget never does.
+_FULL_CONTEXT_FLAG = "include_full_context"
+
+# Optional request flag: when true, /query additionally returns `usage` - the billable units
+# this one question consumed across the whole loop (see _new_usage). SEPARATE from the flag
+# above on purpose: `full_context` ships every retrieved passage, tens of KB of text nobody
+# needs to price a request, while the cost meter wants ~10 integers. A caller that asks for
+# the full debug payload gets `usage` too, since the loop already tallied it.
+_USAGE_FLAG = "include_usage"
+
+
+def _full_context(chunks):
+    """The retrieved passages exactly as they were fed into the model's <context>: full text
+    and source, in retrieval order, with no truncation and no per-source dedup (unlike the
+    public `sources`). Lets the answer-quality eval score faithfulness against what the model
+    actually saw, not the truncated/deduped excerpts."""
+    return [{"text": chunk["text"], "source": chunk.get("source")} for chunk in chunks]
+
+
+def _response(status_code, payload):
+    return {
+        "statusCode": status_code,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(payload),
+    }
+
+
+# Shown to the caller on any upstream failure; the widget renders its retry bubble on any
+# non-2xx, so this stays generic and never leaks internals.
+_UPSTREAM_ERROR_MESSAGE = (
+    "The library assistant is temporarily unavailable. Please try again in a moment."
+)
+
+
+def _error_response(stage, exc):
+    """Log a structured {event, stage, error} record and return a clean JSON error. 502: an
+    upstream Bedrock/OSS dependency failed. Logs the exception type + message (not a raw
+    traceback, and not the user query) so the failing stage is diagnosable without leaking a
+    stack trace to the caller."""
+    print(
+        json.dumps(
+            {
+                "event": "query_failed",
+                "stage": stage,
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+            default=str,
+        )
+    )
+    return _response(502, {"error": _UPSTREAM_ERROR_MESSAGE})
+
+
+def _request_path(event):
+    """Request path for an HTTP API (payload format 2.0) event, e.g. '/query' or '/warm'."""
+    http = (event.get("requestContext") or {}).get("http") or {}
+    return http.get("path") or event.get("rawPath") or ""
+
+
+def _handle_warm():
+    """Warm path (GET /warm): a single KB Retrieve to warm the query Lambda container and the
+    retrieval path before the student's first real query. No generation and no guardrail input
+    screen - there is no user query to screen. The Bedrock Converse path is deliberately left
+    cold."""
+    try:
+        retrieve(_WARM_QUERY)
+    except Exception as exc:  # noqa: BLE001 - warm is fire-and-forget; return a clean error
+        return _error_response("warm", exc)
+    return _response(200, {"warmed": True})
+
+
+def _handle_query(event):
+    """Query path (POST /query): validate -> input screen -> retrieve -> generate.
+
+    Accepts either the single-session history shape ({"messages": [...]}) or the legacy single
+    {"query": ...} shape; both collapse to a normalized conversation whose newest turn is the
+    user's current question."""
+    data = _parse_body(event)
+    conversation = _extract_conversation(data)
+    if not conversation:
+        return _response(400, {"error": "Missing 'query' in request body."})
+    # The newest user turn is the question being asked now; it drives the size cap and the input
+    # screen. Prior turns were already screened when they were first sent, one request each.
+    query = conversation[-1]["text"]
+    # Server-side size cap: reject an oversized query BEFORE any retrieval or guardrail call.
+    # This is a clean 400, distinct from a guardrail block (a 200 carrying the block message).
+    if len(query) > MAX_QUERY_CHARS:
+        return _response(
+            400,
+            {"error": f"Query exceeds the maximum length of {MAX_QUERY_CHARS} characters."},
+        )
+
+    # Opt-in eval payload: the full retrieved passages, added to the response only when the
+    # request explicitly asks (the widget never does, so its responses are unchanged).
+    include_full_context = bool(data and data.get(_FULL_CONTEXT_FLAG))
+    # Opt-in cost payload, gated the same way. The tally is only built when someone asked for
+    # it, so a student's request does not even allocate the dict, let alone return it.
+    include_usage = include_full_context or bool(data and data.get(_USAGE_FLAG))
+    usage = _new_usage() if include_usage else None
+    # Optional, allowlisted reply language. None (the default, and what every client that does
+    # not send the field gets) leaves the system payload and the model's own language detection
+    # exactly as they were.
+    language = _extract_language(data)
+
+    # Everything past validation touches AWS; wrap it so any fault surfaces as a clean, staged
+    # JSON error instead of an opaque 500. `stage` names the step that failed. No retry logic.
+    stage = "input_guardrail"
+    try:
+        # Screen the bare query for a prompt-injection attempt BEFORE the agent runs. A hit is
+        # blocked here and returns immediately - no retrieval, no generation, no Bedrock spend.
+        # Nothing else is screened and nothing is rewritten: a query that proceeds reaches the
+        # model exactly as it was typed, which is what lets the system prompt do its job.
+        decision, blocked_message = _apply_input_guardrail(query, usage=usage)
+        if decision == "block":
+            # A blocked query still paid for the guardrail screen, so the meter still reports.
+            blocked = {"answer": blocked_message, "sources": []}
+            if include_usage:
+                blocked["usage"] = usage
+            return _response(200, blocked)
+        # The agentic loop: Converse tool-use over the four tools. Retrieval and generation
+        # both happen inside; on any fault this whole step reports as the "agent" stage. Seed
+        # it with the trimmed conversation history.
+        stage = "agent"
+        result = run_agent(_seed_messages(conversation), usage=usage, language=language)
+    except Exception as exc:  # noqa: BLE001 - deliberately broad: any AWS/runtime fault
+        return _error_response(stage, exc)
+
+    # Sources: KB passages from search_library_info (deduped by uri) PLUS any synthetic sources
+    # the non-KB tools contributed (the A-Z page and the Primo search pages; the curated link
+    # block contributes none). full_context stays KB-only (what the model semantically
+    # retrieved), so the synthetic sources never pollute eval data.
+    chunks = result["chunks"]
+    sources = _build_sources(chunks)
+    seen = {s["uri"] for s in sources}
+    for cs in result.get("catalog_sources", []):
+        if cs["uri"] and cs["uri"] not in seen:
+            seen.add(cs["uri"])
+            sources.append(cs)
+    payload = {"answer": result["answer"], "sources": sources}
+    if include_full_context:
+        # Opt-in debug payload. `full_context` is the KB passages; `tool_calls` is every tool
+        # result the model saw, which is the only view that covers the three non-KB tools.
+        payload["full_context"] = _full_context(chunks)
+        payload["tool_calls"] = result.get("tool_calls", [])
+        # The curated URLs are context, not a tool result, so they appear in NEITHER of the two
+        # fields above. Without this the eval's groundedness judge sees a URL in the answer with
+        # no supporting evidence anywhere in the payload and marks a correct, curated link as
+        # ungrounded - a silent scoring regression that would read as a quality drop.
+        payload["library_links"] = [_link_entry(e) for e in _LIBRARY_LINKS]
+    if include_usage:
+        payload["usage"] = usage
+    return _response(200, payload)
+
+
+def lambda_handler(event, context):
+    # Two clean routes on one Lambda: /warm (lightweight retrieval-only pre-warm) and
+    # everything else -> the real /query path.
+    if _request_path(event) == WARM_PATH:
+        return _handle_warm()
+    return _handle_query(event)

@@ -1,0 +1,8 @@
+# aws-cdk-lib 2.260.0: its L1 Cfn* constructs support the Bedrock KB + Web Crawler data
+# source and native OpenSearch Serverless CfnIndex (verified 2026-07-01). We deliberately
+# do NOT depend on cdklabs.generative-ai-cdk-constructs (its Bedrock L2s are deprecated)
+# nor aws-cdk.aws-bedrock-alpha (no KB constructs yet).
+aws-cdk-lib==2.260.0
+constructs>=10.5.0,<11.0.0
+# The CDK app reads the repo-root config.yaml at synth time.
+PyYAML>=6.0,<7.0
