@@ -8,8 +8,8 @@ repo-root `config.yaml` at synth time; edit values there, not in the stack.
 
 - `app.py` - CDK entrypoint; loads `config.yaml` and instantiates the stack.
 - `infra/infra_stack.py` - the stack (`GavilanChatbotStack`).
-- `infra/config.py` - `load_config()`, plus the synth-time validators: CORS origins (rejects `*`), feedback resolution, and the scraper tier map.
-- `tests/unit/` - `test_infra_stack.py` (`Template.from_stack` assertions), `test_handler.py`, `test_feedback_handler.py`, `test_theme_handler.py`. All stub boto3, so no live AWS is needed.
+- `infra/config.py` - `load_config()`, plus the synth-time validators: CORS origins (rejects `*`) and the scraper tier map.
+- `tests/unit/` - `test_infra_stack.py` (`Template.from_stack` assertions), `test_handler.py`, `test_theme_handler.py`. All stub boto3, so no live AWS is needed.
 
 ## Commands
 
@@ -39,5 +39,4 @@ does not refill it, so see the chunking note in `CLAUDE.md` for the ingestion jo
 
 The deploy prints everything you need next: the paste-ready embed tag, the CloudFront domain, the
 `/query` URL, the knowledge-base id, the demo-site URL, the settings-editor URL and the one
-command that creates a librarian account for it, and either the `/feedback` URL or a
-`FeedbackStatus` line explaining why there isn't one.
+command that creates a librarian account for it.

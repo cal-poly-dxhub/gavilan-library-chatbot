@@ -10,7 +10,6 @@ RAG chatbot for Gavilan College Library. Answers operational student questions (
 - **Query path:** an agentic Bedrock `Converse` tool-use loop (`run_agent`); the model calls tools and the loop feeds results back until `end_turn`. Four tools: `search_library_info` (KB retrieval), `database_catalog` (research-database availability + subject lookup, authoritative), `search_book_catalog` (Primo general catalog), `search_course_reserves` (Primo course reserves). The curated canonical-URL table is NOT a tool: it takes no input and returns the same rows every call, so it is injected into the Converse `system` payload every request (see `_links_block`). System prompt + date + link table via the Converse `system` param. Requests carry a multi-turn `messages` array (see `/query` contract).
 - **Live catalog (Primo):** `search_book_catalog` + `search_course_reserves` call the Ex Libris Primo discovery API directly - outbound HTTPS to a third party inside the agent loop, NOT an AWS API (no IAM). The query Lambda therefore needs outbound internet to reach Primo; a VPC without a NAT path would silently break these two tools. Every call is timed out and soft-fails, so a slow/broken Primo never kills `/query`.
 - **Ingestion:** a scraper Lambda pulls the library site into the KB source bucket (KB re-ingests) and regenerates the database catalog to S3, on a TIERED schedule + on deploy. Two tiers declared in `config.yaml` under `scraper.tiers`, one EventBridge rule each, tier name passed in the event: `fast` (hours/closures pages, daily) and `full` (the complete sweep, every 5 days). Everything downstream is CHANGE-GATED - see "Scrape cadence and change gating" below
-- **Feedback path:** `POST /feedback` -> its OWN small Lambda (`app/feedback_handler.py`, `sns:Publish` and nothing else) -> an SNS topic whose only subscription is the librarian address in `config.yaml`. Plain-text email, NO server-side store (the email is the record), and the notification carries the source URLs the reported answer cited - that is the whole point, because the fix is a webpage edit (D-20260727-10). SNS not SES: SES's sandbox needs a support request per account, which would break one-click install. See the `/feedback` contract below
 - **Backend:** Lambda + HTTP API (API Gateway v2), Python
 - **Infra:** AWS CDK (Python), L1 `Cfn*` constructs; everything as code
 - **Guardrails:** ONE Bedrock Guardrail, screening the INPUT for `PROMPT_ATTACK` and nothing else (see "Guardrail note")
@@ -112,7 +111,7 @@ Amazon S3 Vectors (`s3vectors.CfnVectorBucket` + `CfnIndex`); the KB `StorageCon
 
 ## `/query` contract (widget builds against this)
 
-**`POST /query` is PUBLIC**, as are `GET /warm` and `POST /feedback`. No token, no API key, no authorizer - the widget is embedded on a public library page, so every caller is anonymous by definition. The abuse controls are stage-level throttling (the real cost cap, and why WAF is excluded), the `PROMPT_ATTACK` input screen and the exact-match CORS allowlist. A pre-launch Cognito gate on this route was DELETED at go-live, not made switchable; do not reintroduce one. `PUT /theme` is the one gated route on this API - see "Widget theme file".
+**`POST /query` is PUBLIC**, as is `GET /warm`. No token, no API key, no authorizer - the widget is embedded on a public library page, so every caller is anonymous by definition. The abuse controls are stage-level throttling (the real cost cap, and why WAF is excluded), the `PROMPT_ATTACK` input screen and the exact-match CORS allowlist. A pre-launch Cognito gate on this route was DELETED at go-live, not made switchable; do not reintroduce one. `PUT /theme` is the one gated route on this API - see "Widget theme file".
 
 `POST /query` request shape (multi-turn): `{ "messages": [ {"role": "user"|"assistant", "content": "<text>"}, ... ] }`, oldest first, newest user turn last. Backward-compatible with the legacy `{ "query": "<text>" }` shape (treated as a single-message conversation). History is client-sent - the Lambda is stateless (no server-side conversation store) - and trimmed server-side to the last 10 messages (`MAX_HISTORY_MESSAGES`) before seeding the Converse loop.
 
@@ -280,40 +279,40 @@ the customer-facing copy lives in the shipped artefacts themselves.
   by `test_no_output_points_at_the_guide_or_the_defaults_download`, which fails on the VALUE too,
   so re-adding either link under a different output name does not slip through.
 
-## `/feedback` contract (the widget's report-an-answer path will build against this)
+## `/feedback` (ARCHIVED - built, never wired to a UI)
 
-`POST /feedback` request shape - an ALLOWLIST of exactly five fields, and an unexpected sixth is a `400` rather than something passed through into a librarian's inbox:
+`POST /feedback` -> its own small Lambda -> an SNS topic -> one email subscription. The backend
+exists (`app/feedback_handler.py`, the stack wiring, `test_feedback_handler.py`), but the widget
+never got a report-an-answer button, so nothing can call it. `config.yaml` ships the block at the
+BOTTOM under an ARCHIVED header with `enabled: false`, and `resolve_feedback` therefore builds
+nothing and emits no deploy output. It is out of the customer-facing docs on purpose.
 
-```json
-{
-  "comment":  "optional free text, capped at feedback.max_comment_chars",
-  "question": "the reported question (required)",
-  "answer":   "the answer the bot gave for it (required)",
-  "sources":  ["https://... the URIs that answer cited"],
-  "reply_to": "optional, only if the student volunteered it"
-}
-```
+Do not present it as a feature or point a librarian at `notify_email`. Turning it back on is a
+config edit, but it needs the widget side built first, or it is an endpoint nobody can reach.
 
-Response: `202 {"received": true}`. Rejections: `400` (unexpected field, missing/blank `question`/`answer`, comment over the cap, non-http or over-count `sources`, malformed `reply_to`), `413` (body over `feedback.max_body_bytes`, checked BEFORE parsing), `502` (SNS publish failed - the report is lost, see below), `503` (no topic wired).
+Three things worth keeping if it is ever revived, because each was decided the hard way:
 
-Not accepted, not derived, not recorded: IP address, user agent, session or request id, any generated report id, and the conversation history. API Gateway puts the caller's IP and user agent in `requestContext.http`; `feedback_handler.py` never reads them. `messages` is not an accepted field.
-
-`sources` is the reason the endpoint exists. The fix for a wrong answer is RAG-first (D-20260727-10): edit the library webpage and the next scheduled scrape of that page's tier corrects the bot, so the email is a work order naming the pages to edit. A report with an empty `sources` is still valid and the email says so explicitly - an answer that cited nothing is itself the finding.
-
-NO SERVER-SIDE STORE, by constraint: no table, no bucket, no logged copy. The email IS the record, so a publish failure loses the report. That is the accepted cost of not keeping a database of student complaints.
-
-What reaches CloudWatch is a receipt, never the report: `feedback_received` (`has_comment`, `comment_chars`, `source_count`, `has_reply_to`), then `feedback_published`, or `feedback_rejected` (`reason`, `status`) / `feedback_publish_failed` (`error` = the exception TYPE only - a botocore message can quote the request parameters, and the request parameter here is the student's text). No comment, question, answer, address or URL is ever an argument to the log function.
-
-Feedback text NEVER reaches the model, so the Bedrock guardrail does NOT screen it (it screens only the query path's input, and only for prompt injection). The only controls that exist are `max_comment_chars`, `max_body_bytes`, `max_sources`, plain-text-only rendering, and control-character stripping. Do not assume a guardrail is catching anything on this path.
-
-The email is PLAIN TEXT and the `Subject` is a CONSTANT - no user-supplied text is interpolated into it, because a subject is the one field that is structurally a mail header. `reply_to` is rendered as a line in the BODY and is never handed to SNS as an address; it is validated to a strict shape (no newline, comma, bracket or display name) as the second line of defense.
+- **`enabled: false`, not enabled-with-a-blank-address.** The blank-address path is the "you
+  forgot something" state: it provisions nothing but prints a `FeedbackStatus` output telling you
+  to go set an address. That is the opposite of archived. Off is a choice and says nothing.
+- **SNS, not SES.** SES starts every account in a sandbox that only sends to pre-verified
+  addresses and needs a support request per account to leave (verified 2026-07-29 on the deploy
+  account: `ProductionAccessEnabled: false`). That would make one-click install into a fresh
+  account the client's problem, for one plain-text notification. SNS email needs one confirmation
+  click by the recipient.
+- **No server-side store, by constraint.** No table, no bucket, no logged copy, no dead-letter
+  queue holding report bodies - a failed publish loses the report, deliberately, because the
+  alternative is a database of student complaints nobody agreed to keep. The cited source URLs
+  were the entire payload: the fix for a wrong answer is a webpage edit (D-20260727-10), so the
+  email was a work order naming the pages. `test_feedback_introduces_no_store` and the
+  log-hygiene tests pin it.
 
 ## Repo layout
 
 - `infra/` - the CDK app. `app.py` loads `config.yaml`; `infra/infra_stack.py` is the whole stack;
   `infra/config.py` holds `load_config()` and the synth-time validators
-  (`resolve_cors_allow_origins` rejects `*`, `resolve_feedback` has three outcomes,
-  `resolve_scraper_tiers` / `resolve_seed_urls`). `tests/unit/` covers the stack via
+  (`resolve_cors_allow_origins` rejects `*`, `resolve_scraper_tiers` / `resolve_seed_urls`,
+  and `resolve_feedback` for the archived path). `tests/unit/` covers the stack via
   `Template.from_stack` plus the three Lambdas with boto3 stubbed. See `infra/README.md`.
 - `app/` - the Lambdas, each bundled alone so none drags in the others' dependencies.
   - `handler.py` - the query path, public and unauthenticated like `/warm`. `run_agent()` runs the Converse tool-use loop over four tools
@@ -374,8 +373,8 @@ The email is PLAIN TEXT and the `Subject` is a CONSTANT - no user-supplied text 
   `vector_store`; `chunking`; `retrieval.number_of_results`; `generation.model_id`; `catalog`;
   `primo` (wired as `PRIMO_*` env, shared by both catalog tools); `library_links.data_file` (the
   stack feeds the SAME value to the asset include and the env var so they cannot drift);
-  `cors.allow_origins`; `demo_site.enabled`; `feedback` (the three caps reach the Lambda as
-  `FEEDBACK_*`; `notify_email` never does - it becomes the SNS subscription); `guardrail`; and
+  `cors.allow_origins`; `demo_site.enabled`; `feedback` (ARCHIVED, at the bottom of the file
+  and shipped off - see the archived-feature note); `guardrail`; and
   `cost_model` (published rates + measured per-question constants + the zero-traffic baseline,
   stamped into the demo page - note `scrapes_per_month` and `reindexes_per_month` are SEPARATE
   numbers, because change gating means most runs re-index nothing).
@@ -392,8 +391,7 @@ The email is PLAIN TEXT and the `Subject` is a CONSTANT - no user-supplied text 
 - **WAF EXCLUDED.** WAF can't attach to HTTP API v2 (would need a second CloudFront fronting the API). Thin threat surface; API Gateway throttling is the real cost-abuse control. Revisit only on a compliance mandate.
 - **CORS `allow_origins: "*"` EXCLUDED.** Locked to `cors.allow_origins` in config.yaml (`https://www.gavilan.edu`, a dev-only `http://localhost:8000`, and the demo site's custom hostname `https://gavbot-demo.calpoly.io`); `infra/config.py` rejects a wildcard at synth. Entries are matched as EXACT full origin strings, so each is scheme + host with no trailing slash and no path. The browser sends a HOST-only `Origin`, so do not add the `/library/` path. CORS is browser-enforced only and is NOT a security boundary (curl/scripts ignore it) - throttling is still the cost cap - but a wildcard would let any page drive the billable `/query` endpoint from its visitors' browsers. Don't "fix" a CORS console error by widening this; add the real origin.
 - **`generative-ai-cdk-constructs` Bedrock L2s EXCLUDED (deprecated).** That is WHY the stack is L1 `Cfn*`. Do not reintroduce.
-- **SES EXCLUDED as the feedback transport; SNS instead.** Not a technical preference - a handoff one. SES starts every account in a sandbox that can only send to pre-verified addresses (verified on the deploy account 2026-07-29: `ProductionAccessEnabled: false`, 200 msg/day, 1 msg/sec, zero verified identities), and leaving it needs a support request per account. That turns one-click install into a fresh AWS account into the client's problem, for a feature whose entire job is a single plain-text notification. SNS email needs one confirmation click by the recipient. Revisit only if the notification ever needs a real From address, HTML, or per-report reply routing - and note that HTML is deliberately excluded here too.
-- **A SERVER-SIDE FEEDBACK STORE EXCLUDED (hard constraint).** No DynamoDB, no bucket, no logged copy of a report. The email IS the record, so a failed publish loses the report. Do not "improve" this with a table or a dead-letter queue holding report bodies: the tradeoff is deliberate (no database of student complaints), and both the log-hygiene tests and `test_feedback_introduces_no_store` pin it.
+- **The FEEDBACK PATH is ARCHIVED, and SES + a server-side store stay EXCLUDED within it.** See the `/feedback` archived note above for all three decisions. Do not revive the path, re-document it for the customer, or "improve" it with a store.
 
 ## Guardrail note
 
@@ -566,17 +564,3 @@ Things learned the hard way. Read before repeating the same work.
   retrieves, because a bigger chunk averages its embedding over more text and can retrieve less
   precisely. Two halves, two instruments: pair it with `eval/retrieval_probe.py` against the live
   index. The 300-token baseline to compare against is recall@1 71%, @3 88%, @5 94%, @8 100%.
-
-**Product shape**
-
-- **An endpoint with no destination is worse than no endpoint.** The feedback path publishes to a
-  topic whose only subscriber is an address in config.yaml, and there is no store - the email is
-  the record. So a `/feedback` route deployed with `notify_email` unset would accept a student's
-  report, return `202`, and drop it: a silent failure in the one feature whose purpose is to break
-  a silence. Hence three outcomes in `resolve_feedback`, not two. `enabled: false` builds nothing
-  and says nothing, which is a choice. Enabled with an EMPTY address builds nothing and emits a
-  `FeedbackStatus` deploy output saying why, because that is a mistake and it should be visible
-  where someone is already looking. Enabled with a MALFORMED address raises at synth, because the
-  only other signal is an SNS subscription nobody can confirm, which looks exactly like a working
-  deployment. The handler still refuses with `503` when its topic env is missing, since "the stack
-  would never do that" is not a runtime guarantee.

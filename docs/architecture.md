@@ -23,8 +23,7 @@ to a human. Built with Cal Poly DxHub, for Gavilan College Library.
 | Live catalog (external) | Ex Libris Primo discovery API | The two catalog tools call Primo directly: a search plus a per-record availability call. Outbound HTTPS to a third party, not an AWS API, so the query Lambda needs outbound internet. Timed out and soft-failing, so a slow Primo never kills `/query`. |
 | LLM (generation) | Bedrock-hosted Claude Sonnet 4.6 via Converse | Through a `us.`-prefixed cross-region inference profile. |
 | Database catalog | Self-updating JSON in a dedicated S3 bucket | The scraper derives the held list from databases.php (HTML anchor parse + a Sonnet enrichment call for subjects/aliases); the hand-authored not-held list is a bundled seed merged at read time; the tool reads from S3 with per-container TTL caching. |
-| Orchestration/API | Lambda + HTTP API (API Gateway v2) | `POST /query`, `GET /warm` and `POST /feedback` are public; `PUT /theme` is the one gated route (theme-admin JWT authorizer, see decision 17). Stage-level throttling covers every route. CORS preflight is API-level and locked to `cors.allow_origins` (never `*`), so a new route inherits it. |
-| Feedback | `POST /feedback` -> own Lambda -> SNS topic -> one email subscription | A student reports a wrong answer; a librarian gets a plain-text email naming the pages that answer cited. No server-side store - the email is the record. Five-field allowlist; nothing about the requester is accepted or logged. See decision 14. |
+| Orchestration/API | Lambda + HTTP API (API Gateway v2) | `POST /query` and `GET /warm` are public; `PUT /theme` is the one gated route (theme-admin JWT authorizer, see decision 17). Stage-level throttling covers every route. CORS preflight is API-level and locked to `cors.allow_origins` (never `*`), so a new route inherits it. |
 | Guardrails | ONE Bedrock Guardrail: PROMPT_ATTACK, input only | `ApplyGuardrail` on the bare query before the loop, and nothing else. No other content filter, no PII policy, no guardrail on Converse. See decision 6. |
 | Widget | Custom vanilla-JS embed, Shadow DOM | Self-injecting single file, reads `data-api-url` from its script tag. Shadow DOM isolates it from host-site CSS. Bilingual chrome (English + Español) from one string table, switched by a header control; an explicit choice rides along as the optional `language` request field. Nothing about a conversation is written down - transcript and language choice live in memory and go with the tab. |
 | Widget hosting | S3 + CloudFront (OAC), same stack | One `cdk deploy` ships backend + widget. OAC, not OAI. Same stack because OAC hits a cross-stack cyclical dependency. |
@@ -63,16 +62,6 @@ loop's KB retrievals, deduped by uri, plus one synthetic source per non-KB tool 
 result: the A-Z databases page for `database_catalog`, a per-query discovery-search URL for each
 Primo tool. The curated link table contributes none. On a block, the blocked message returns with
 empty sources and nothing downstream runs.
-
-**Feedback (runtime).** Browser -> API Gateway -> a separate small Lambda whose role carries
-`sns:Publish` and nothing else. It enforces a five-field allowlist (`comment`, `question`,
-`answer`, `sources`, `reply_to`), a body-byte cap checked before parsing, and a comment-character
-cap; an unexpected field is a `400` rather than a pass-through. It renders a plain-text email -
-what the student said, the reported question and answer, the cited URLs, a Pacific timestamp -
-and publishes it to a topic whose only subscription is the librarian address from config.
-Response `202 {"received": true}`. Nothing is stored anywhere, and no IP, user agent, session or
-generated id is accepted or recorded. The `Subject` is a constant and the optional reply address
-is body text, never a mail header.
 
 **Widget delivery.** The host page's `<script>` tag fetches `widget.js` from CloudFront (private
 S3 via OAC). The widget fetches `theme.json` from the same distribution in parallel with page

@@ -19,7 +19,6 @@ Todo tracker. `architecture.md` is the companion: what the system is, and why.
 - **Bilingual chrome** - one string table plus an optional `language` request field. No corpus change: Spanish already retrieves correctly from the English KB.
 - **Accessibility** - WCAG 2.1 AA audit, then remediation of every failing criterion in the widget. See `accessibility-audit.md`.
 - **Runtime theming** - one `theme.json`, a hosted settings editor with a Cognito-gated `PUT /theme` save, a hosted guide, and a downloadable copy of the defaults.
-- **Feedback** - `POST /feedback` to its own Lambda to SNS to one librarian email. Five-field allowlist, no store, the cited URLs are the payload.
 - **Demo site** - a second bucket and distribution serving one library-styled page that embeds the shipped widget over the shipped delivery path.
 - **Cost visibility** - demo-only meter and estimator behind two opt-ins absent from production, with constants measured against the deployed endpoint.
 - **Eval** - Bedrock job-runner, both formatters, a baseline retrieve run, and the promptfoo answer-quality loop.
@@ -28,7 +27,6 @@ Todo tracker. `architecture.md` is the companion: what the system is, and why.
 
 ## Next
 
-- **Set `feedback.notify_email`** - empty today, so no endpoint is created and the deploy prints a `FeedbackStatus` line saying why. The recipient also has to click the SNS confirmation once.
 - **Remaining library context** - the Q&A set into `eval/datasets/`. Seed URLs and exclusions are settled in `config.yaml`.
 - **Parallelize Primo availability calls** - they run sequentially under a wall-clock budget; fan them out so slow lookups don't push toward the Lambda timeout.
 - **A screen-reader session** - the one check standing between the accessibility work and a written conformance claim.

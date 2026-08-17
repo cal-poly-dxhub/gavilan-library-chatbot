@@ -9,7 +9,7 @@
 | [Architecture](#architecture) | Diagram and full design write-up |
 | [Deployment](#deployment) | Prerequisites and install steps |
 | [Configuration Reference](#configuration-reference) | `config.yaml` settings |
-| [Usage](#usage) | Embedding the widget, theming, feedback, evals |
+| [Usage](#usage) | Embedding the widget, theming, evals |
 | [License](#license) | Project licensing details |
 | [Collaboration](#collaboration) | Contact information for the team |
 | [Disclaimers](#disclaimers) | Legal and usage disclaimers |
@@ -34,7 +34,6 @@ with a human handoff for anything past that.
 - **Live catalog:** `search_book_catalog` + `search_course_reserves` query the Ex Libris Primo discovery API directly - the only external, non-AWS dependency (timed out and soft-failing so a slow or broken Primo never blocks a response)
 - **Ingestion:** a scraper Lambda pulls the library site into the KB source bucket and regenerates the database catalog on a tiered schedule - hours pages daily, the full sweep every five days - with every downstream step change-gated
 - **Backend:** Lambda + API Gateway HTTP API v2 (Python)
-- **Feedback:** `POST /feedback` emails a librarian, via SNS, when someone reports a wrong answer - carrying the pages that answer cited, because fixing the page fixes the bot
 - **Infrastructure:** AWS CDK (Python)
 - **Guardrails:** one Bedrock Guardrail, screening the input for prompt injection only (no other content filter, no PII policy, nothing on the output)
 - **Frontend:** an embeddable, dependency-free JS widget, bilingual (English + Español), themeable at runtime without a redeploy
@@ -42,11 +41,11 @@ with a human handoff for anything past that.
 **Repository structure:**
 
 - `infra/` - CDK app (Knowledge Base, S3 Vectors store, scraper, catalog bucket, Lambdas, API Gateway, IAM)
-- `app/` - Lambda backend (agentic tool-use loop + tools, feedback handler, theme handler)
+- `app/` - Lambda backend (agentic tool-use loop + tools, theme handler)
 - `scraper/` - the ingestion Lambda and its shared fetch/extract code
 - `eval/` - retrieval and answer-quality evaluation harness
 - `frontend/` - chat widget, theming pages, and the demo page
-- `config.yaml` - model, chunking, retrieval, catalog, feedback, and guardrail settings
+- `config.yaml` - model, chunking, retrieval, catalog, and guardrail settings
 - `docs/` - the [install guide](docs/install.md), architecture, and planning
 
 ## Architecture
@@ -95,7 +94,6 @@ sections:
   Primo API wiring
 - **`http_api` / `cors`** - throttling and the exact-match origin allowlist (a wildcard is rejected
   at synth)
-- **`feedback`** - the librarian notification address and the request caps
 - **`guardrail`** - the input prompt-injection screen and its blocked-input message
 - **`cost_model`** - published rates and measured per-question constants
 
@@ -110,11 +108,6 @@ page and the widget mounts itself - no build step, no dependencies, no credentia
 `theme.json` at the widget bucket root, so a librarian can change them without a redeploy. The
 deploy outputs a hosted settings editor for exactly that; see
 [`docs/widget-theming.md`](docs/widget-theming.md).
-
-**Reporting a bad answer.** `POST /feedback` emails the librarian the question, the answer, and the
-pages that answer cited. There is no server-side store by design - the email is the record. The fix
-is usually a webpage edit: correct the page, and the next scheduled scrape of that page's tier
-corrects the bot. Set `feedback.notify_email` in `config.yaml` to switch it on.
 
 **Evaluation.** `eval/` holds the retrieval probe, the offline chunking eval, and a promptfoo
 answer-quality suite. The offline parts run with no credentials; the rest need a deployed stack and
