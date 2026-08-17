@@ -33,10 +33,27 @@ cdk deploy
 
 ## 4. From the outputs
 
+### `DemoSiteUrl`
+
+*The fastest way to confirm the deploy worked.*
+
+The deploy builds a sample library page with the widget already embedded, on its own
+CloudFront distribution, and prints the link here. Open it and ask it your opening hours.
+That is the end-to-end check that the knowledge base actually indexed your pages, and you
+get it before putting anything on your live site.
+
+**Take the URL from your own deploy output.** It is generated per install, so a link copied
+from this guide or from someone else's install will not be yours. The page is kept out of
+search results with a `noindex` meta tag and an `X-Robots-Tag` response header.
+
+To remove it later, set `demo_site.enabled: false` in `config.yaml` and redeploy. That
+deletes the page, its bucket and its distribution, and leaves the widget on your own site
+untouched.
+
 ### `WidgetEmbedTag`
 
-To quickly test: The deploy automatically creates a testing webpage 'https://gavbot-demo.calpoly.io/' with the live widget 
-auto-embedded. Click the link to confirm creation without embedding first.
+To test before you embed anything: the deploy creates a webpage with the live widget already
+on it and prints the link as `DemoSiteUrl` above. Click that to confirm the bot works.
 
 *Puts the bot on your site.*
 
