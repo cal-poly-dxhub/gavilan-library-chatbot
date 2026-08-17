@@ -34,7 +34,9 @@ app/handler.py, scraper/):
     the same stack. A separate concern from the query path - this ships the widget CODE to the
     browser, and the injected widget then uses the query path.
 
-WAF is not deployed, which is why it alone sits in the "Planned" group.
+Only deployed resources are drawn. WAF in particular is excluded from the architecture rather
+than pending - it cannot attach to an HTTP API v2, and stage-level throttling is the real
+cost-abuse control - so it does not belong on this diagram in any form.
 """
 
 import os
@@ -44,7 +46,7 @@ from diagrams.aws.compute import Lambda
 from diagrams.aws.general import Client, InternetAlt1, Users
 from diagrams.aws.ml import Bedrock
 from diagrams.aws.network import APIGateway, CloudFront
-from diagrams.aws.security import Shield, WAF
+from diagrams.aws.security import Shield
 from diagrams.aws.storage import S3
 
 # Write the PNG next to this file (docs/) regardless of the current working directory.
@@ -93,9 +95,6 @@ with Diagram(
         cdn = CloudFront("CloudFront\ndistribution\n(OAC origin)")
         widget_bucket = S3("Private S3 bucket\nwidget.js\n(CloudFront-only)")
 
-    with Cluster("Planned  (not deployed today)", graph_attr={"style": "dashed", "bgcolor": "gray95"}):
-        waf = WAF("AWS WAF")
-
     # --- Ingestion flow: scrape -> S3 markdown + catalog -> KB ingest -> embed -> WRITE vectors ---
     library_site >> Edge(color="darkorange", label="scrape\nseed URLs") >> scraper
     scraper >> Edge(color="darkorange", label="upload\nmarkdown") >> source_bucket
@@ -131,6 +130,3 @@ with Diagram(
     cdn >> Edge(color="purple", style="dashed", label="origin fetch\n(OAC, private)") >> widget_bucket
     cdn >> Edge(color="purple", style="dotted", label="serves widget.js\n(cached at edge)") >> host_page
     host_page >> Edge(color="purple", style="dashed", label="widget injects,\nthen POST /query") >> widget
-
-    # --- Planned components (drawn distinct; no real traffic today) ---
-    waf >> Edge(color="gray", style="dotted", label="planned") >> api
