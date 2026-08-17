@@ -66,11 +66,9 @@ Full design: [`docs/architecture.md`](docs/architecture.md).
 
 ## Install
 
-**[`docs/install.md`](docs/install.md) is the end-to-end guide**: prerequisites, what to change
-before the first deploy, `cdk deploy`, which stack outputs to copy, pasting the embed tag onto
-your site, and handing the settings page to a librarian. It also names the values that are still
-Gavilan-specific and the failure modes that deploy cleanly and break quietly. Read it before you
-deploy.
+**[`docs/install.md`](docs/install.md) is the install guide**: AWS prerequisites, the one config
+value to set first, `cdk deploy`, pasting the embed tag onto your site, and setting up the
+librarian's settings page. Read it before you deploy.
 
 The short version, once you have credentials, Bedrock model access, Node.js, the CDK CLI pinned
 to `2.1129.0`, and a bootstrapped account/region:
