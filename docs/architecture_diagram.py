@@ -8,42 +8,33 @@ generated artifact - regenerate it after editing this file:
 Requires Graphviz (`brew install graphviz`) and the `diagrams` library (`pip install
 diagrams`).
 
-This draws the two paths that carry a student's question: ingestion and query, plus widget
+Scope: the two paths that carry a student's question - ingestion and query - plus widget
 delivery. The theme-save path, the feedback path and the demo site are real parts of the stack
-and are deliberately not drawn - see docs/architecture.md for those.
+and are deliberately not drawn; see docs/architecture.md for those.
 
-Every node/edge below reflects the ACTUAL code (infra/infra/infra_stack.py, config.yaml,
+Every node and edge reflects the ACTUAL code (infra/infra/infra_stack.py, config.yaml,
 app/handler.py, scraper/):
 
-  - Ingestion: a scraper Lambda fetches the curated library seed URLs, extracts clean
-    markdown, uploads it to the KB source S3 bucket, and triggers a KB ingestion job. In the
-    same run it regenerates the database catalog from databases.php (HTML parse + a Sonnet
-    enrichment call) and writes it to a dedicated catalog S3 bucket. Runs on one EventBridge
-    rule per freshness tier - `fast` daily, `full` every five days - and on the one-click
-    deploy Trigger. Every downstream step is change-gated: an unchanged page uploads nothing,
-    an unchanged bucket starts no ingestion job, and unchanged database rows call no model.
-  - Knowledge Base: CfnKnowledgeBase VECTOR, embedding amazon.titan-embed-text-v2:0 (1024
-    dims); FIXED_SIZE chunking on the S3 data source.
-  - Vector store: Amazon S3 Vectors (CfnVectorBucket + CfnIndex, cosine, float32). The KB
-    WRITES to it during ingestion and READS from it during query.
-  - Query path: API Gateway HTTP API v2 (POST /query) -> Lambda python3.13. The request
-    carries a multi-turn messages array (trimmed to the last 10 turns server-side). The handler
-    runs an agentic Bedrock Converse tool-use loop (run_agent) with FOUR tools:
-    search_library_info (KB Retrieve), database_catalog (reads the catalog from S3), and the two
-    live catalog tools search_book_catalog + search_course_reserves, which call the EXTERNAL Ex
-    Libris Primo discovery API directly (a search plus a per-record availability/delivery call).
-    So the query Lambda now reaches a third party on the hot path - it is no longer fully
-    AWS-internal; each Primo call is timed out and soft-fails. NO guardrail is attached to the
-    Converse call - the answer is screened by nothing but the system prompt.
-  - Widget delivery: private S3 bucket (widget.js) fronted by a CloudFront distribution with
-    an OAC-secured origin, built in the SAME stack. Separate concern from the query path:
-    CloudFront + S3 deliver the widget CODE to the browser; the injected widget then uses the
-    API Gateway query path.
+  - Ingestion: the scraper Lambda fetches the curated seed URLs, extracts clean markdown,
+    uploads it to the KB source bucket and triggers an ingestion job; the same run regenerates
+    the database catalog from databases.php (HTML parse + a Sonnet enrichment call) into a
+    dedicated bucket. One EventBridge rule per freshness tier - `fast` daily, `full` every five
+    days - plus the one-click deploy Trigger. Every downstream step is change-gated: an
+    unchanged page uploads nothing, an unchanged bucket starts no ingestion job, and unchanged
+    database rows call no model.
+  - Knowledge Base: CfnKnowledgeBase VECTOR, amazon.titan-embed-text-v2:0 (1024 dims),
+    FIXED_SIZE chunking on the S3 data source, over S3 Vectors (cosine, float32). The KB writes
+    to the index during ingestion and reads from it during query.
+  - Query: API Gateway HTTP API v2 -> Lambda -> an agentic Converse tool-use loop over four
+    tools. Two of them (search_book_catalog, search_course_reserves) call the EXTERNAL Ex Libris
+    Primo API directly, so the query Lambda reaches a third party on the hot path; each call is
+    timed out and soft-fails. The guardrail screens the INPUT for PROMPT_ATTACK once, before the
+    loop - nothing is attached to Converse, so the answer is screened by the system prompt alone.
+  - Widget delivery: a private S3 bucket fronted by CloudFront with an OAC-secured origin, in
+    the same stack. A separate concern from the query path - this ships the widget CODE to the
+    browser, and the injected widget then uses the query path.
 
-Bedrock Guardrails is a real current component, but a deliberately narrow one: ONE guardrail
-screening the INPUT for PROMPT_ATTACK before the loop, with no other content filter, no PII
-policy, and nothing attached to Converse. WAF is NOT deployed today, so it alone remains in
-the "Planned" group.
+WAF is not deployed, which is why it alone sits in the "Planned" group.
 """
 
 import os

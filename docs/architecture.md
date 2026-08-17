@@ -1,7 +1,9 @@
-# Gavilan Library Chatbot — Architecture
+# Gavilan Library Chatbot - Architecture
 
-**What:** RAG chatbot for Gavilan College Library. Answers operational questions (hours, checkout, textbooks, "what does the library offer"), routes research questions and out-of-scope issues.
-**Built with:** Cal Poly DxHub, for Gavilan College Library.
+RAG chatbot for Gavilan College Library. Answers operational questions (hours, checkout,
+textbooks, "what does the library offer") and routes research questions and out-of-scope issues
+to a human. Built with Cal Poly DxHub, for Gavilan College Library.
+
 **Status:** validated end-to-end (query path, four tools, multi-turn, guardrail).
 **Updated:** 2026-08-17
 
@@ -11,79 +13,331 @@
 
 | Layer | Choice | Notes |
 |---|---|---|
-| Ingestion | Scraper Lambda -> S3 source bucket -> Bedrock KB (S3 data source) | Curated seed URLs scraped to clean markdown. TIERED cadence: `fast` (hours/closures pages) daily, `full` (complete sweep) every 5 days - one EventBridge rule per tier, both declared in `config.yaml`. Change-gated end to end: unchanged pages are not uploaded, an unchanged bucket starts no ingestion job, and an unchanged databases page runs no enrichment. Plus the one-click deploy Trigger. |
-| RAG engine | Bedrock Managed Knowledge Base | Managed chunk/embed/store. FIXED_SIZE chunking (600 tokens, 20% overlap). |
-| Vector store | Amazon S3 Vectors | `s3vectors.CfnVectorBucket` + `CfnIndex`; KB `StorageConfiguration` type `S3_VECTORS`, referenced by `IndexArn`. 1024-dim, cosine, `float32`, semantic-only. |
+| Ingestion | Scraper Lambda -> S3 source bucket -> Bedrock KB (S3 data source) | Curated seed URLs scraped to clean markdown. Tiered cadence: `fast` (hours/closures) daily, `full` (complete sweep) every 5 days, one EventBridge rule per tier, both declared in `config.yaml`. Change-gated end to end. Plus a one-click deploy Trigger. |
+| RAG engine | Bedrock Managed Knowledge Base | Managed chunk/embed/store. FIXED_SIZE chunking, 600 tokens, 20% overlap. |
+| Vector store | Amazon S3 Vectors | `CfnVectorBucket` + `CfnIndex`; KB `StorageConfiguration` type `S3_VECTORS`, referenced by `IndexArn`. 1024-dim, cosine, `float32`, semantic-only. |
 | Embeddings | Titan Text Embeddings v2 (1024-dim) | Managed default. |
-| Query path | Agentic `Converse` tool-use loop (Lambda) | `run_agent`: the model calls tools; the loop feeds each `toolResult` back until `end_turn` (iteration cap). Multi-turn `messages` seed; system prompt via the Converse `system` param. |
-| Tools | `search_library_info`, `database_catalog`, `search_book_catalog`, `search_course_reserves` | KB retrieval for general questions; authoritative research-database availability + subject listing; live Primo general-catalog and course-reserves search. Routing via tool descriptions + system-prompt guidance + `toolChoice` auto. |
-| Curated links | Static JSON bundled with the query Lambda, injected into the Converse `system` payload | The library's/college's official front-door URLs (library home page, college site, online textbook collections, research guides, bookstore, campus maps, public safety, ILL, laptop record) so the model cites real links instead of writing one from memory. NOT a tool: it takes no input and returns the same rows every call, and the model kept skipping the call, so it is preloaded instead. Hand-authored; no scraper, no S3, no cache. |
-| Live catalog (external) | Ex Libris Primo discovery API | `search_book_catalog` + `search_course_reserves` call Primo directly (search + per-record availability/delivery call). Outbound HTTPS to a third party, not an AWS API (no IAM); query Lambda needs outbound internet. Timed out + soft-fail so a slow/broken Primo never kills `/query`. |
-| LLM (generation) | Bedrock-hosted Claude Sonnet 4.6 via Converse | Invoked through a `us.`-prefixed cross-region inference profile. |
-| Database catalog | Self-updating JSON in a dedicated S3 bucket | Scraper derives the held list from databases.php (HTML anchor parse + Sonnet enrichment for subjects/aliases); the hand-authored not-held list is a bundled seed merged at read time; the tool reads from S3 with per-container TTL caching. |
-| Orchestration/API | Lambda + HTTP API (API Gateway v2) | `POST /query`, `GET /warm`, and `POST /feedback` when configured - all three public; `PUT /theme` is the one gated route (theme-admin JWT authorizer, see decision 17). Stage-level throttling on the default stage, so it covers every route. CORS preflight is API-level and locked to the `cors.allow_origins` allowlist in config (never `*`), so a new route inherits it rather than declaring its own. |
-| Feedback | `POST /feedback` -> own Lambda -> SNS topic -> one email subscription | A student reports a wrong answer; a librarian gets a plain-text email naming the pages the answer cited. NO server-side store: the email is the record. Five-field payload allowlist; nothing about the requester is accepted or logged. SNS not SES (see decision 12). Gated on `feedback.enabled` + `feedback.notify_email` in config. |
-| Guardrails | ONE Bedrock Guardrail: PROMPT_ATTACK, input only | `ApplyGuardrail` (source=INPUT) on the bare query before the loop, and nothing else. No other content filter, no PII policy, and NO guardrail attached to Converse. The screen runs ahead of the system prompt, so anything it blocked or masked would pre-empt the prompt's crisis handling; the prompt owns safety. See decision 6. |
-| Widget | Custom vanilla-JS embed, Shadow DOM | Self-injecting single file, reads `data-api-url` from its script tag. Shadow DOM isolates from host-site CSS. Bilingual chrome (English + Español) from ONE string table, switched by a header control; an explicit choice rides along as the optional `language` request field. Nothing about a conversation is written down: the transcript and the language choice live in memory and go with the tab. |
-| Widget hosting | S3 + CloudFront (OAC), same stack | One `cdk deploy` ships backend + widget. OAC (not OAI/S3Origin). Same stack because OAC has a cross-stack cyclical-dependency problem. |
-| Widget theming | `theme.json` at the widget bucket root | Highlight colour, font keyword and starter questions, read at init and merged over built-in defaults. Its own CloudFront behavior (CORS + 60s TTL, because a console upload sets no object metadata) and an `exclude` on the widget `BucketDeployment` so the deploy's prune cannot delete it. See decision 16. |
-| Settings editor | `theme-editor.html` at the widget bucket root, `PUT /theme` behind its own Cognito pool | The one theming entry point (`WidgetThemeEditor`). A signed-in librarian edits the fields and Save publishes straight to the live widget through a key-scoped Lambda; unsigned, the same page downloads a ready-to-upload `theme.json`. `WidgetThemeUpload` (an S3-console deep link) is the manual fallback, and `theme-guide.html` documents it. Accounts are created with the printed `ThemeAdminCreateUserCommand`; every later step is self-service through Cognito managed login. |
-| Cost visibility | Demo page only: session meter + monthly estimator | Fed by two opt-ins that are absent from production: the handler's `include_usage` response field and the widget's `data-usage-events` embed attribute. Rates and MEASURED per-question constants live in `config.yaml` (`cost_model`), stamped into the page at deploy as a third placeholder. Published list prices only - no Cost Explorer, no billing API, no account spend. |
-| Demo site | A SECOND private S3 + CloudFront (OAC) pair, same stack | One static page (`frontend/demo-site.html` -> `index.html`) embedding the production widget from the production CDN. The deployed `/query` URL and widget URL are stamped in at deploy time via `s3deploy.Source.data` (CDK tokens resolved during deployment), so nothing is account- or region-specific. Its own bucket because `BucketDeployment` prunes with `s3 sync --delete`; its own distribution so demo-only `noindex` headers never touch the production widget. Gated on `demo_site.enabled` in config. |
-| Config | `config.yaml` (declarative) | Model IDs, vector store, scraper, chunking, retrieval, catalog, and guardrail settings live in config, not code. |
+| Query path | Agentic `Converse` tool-use loop (Lambda) | `run_agent`: the model calls tools; the loop feeds each `toolResult` back until `end_turn`, under an iteration cap. Multi-turn `messages` seed; system prompt via the Converse `system` param. |
+| Tools | `search_library_info`, `database_catalog`, `search_book_catalog`, `search_course_reserves` | KB retrieval for general questions; authoritative research-database availability and subject listing; live Primo general-catalog and course-reserves search. Routed by tool descriptions + system prompt + `toolChoice` auto. |
+| Curated links | Static JSON bundled with the query Lambda, injected into the Converse `system` payload | The library's and college's official front-door URLs, so the model cites real links instead of writing one from memory. Not a tool - see decision 2. Hand-authored; no scraper, no S3, no cache. |
+| Live catalog (external) | Ex Libris Primo discovery API | The two catalog tools call Primo directly: a search plus a per-record availability call. Outbound HTTPS to a third party, not an AWS API, so the query Lambda needs outbound internet. Timed out and soft-failing, so a slow Primo never kills `/query`. |
+| LLM (generation) | Bedrock-hosted Claude Sonnet 4.6 via Converse | Through a `us.`-prefixed cross-region inference profile. |
+| Database catalog | Self-updating JSON in a dedicated S3 bucket | The scraper derives the held list from databases.php (HTML anchor parse + a Sonnet enrichment call for subjects/aliases); the hand-authored not-held list is a bundled seed merged at read time; the tool reads from S3 with per-container TTL caching. |
+| Orchestration/API | Lambda + HTTP API (API Gateway v2) | `POST /query`, `GET /warm` and `POST /feedback` are public; `PUT /theme` is the one gated route (theme-admin JWT authorizer, see decision 17). Stage-level throttling covers every route. CORS preflight is API-level and locked to `cors.allow_origins` (never `*`), so a new route inherits it. |
+| Feedback | `POST /feedback` -> own Lambda -> SNS topic -> one email subscription | A student reports a wrong answer; a librarian gets a plain-text email naming the pages that answer cited. No server-side store - the email is the record. Five-field allowlist; nothing about the requester is accepted or logged. See decision 14. |
+| Guardrails | ONE Bedrock Guardrail: PROMPT_ATTACK, input only | `ApplyGuardrail` on the bare query before the loop, and nothing else. No other content filter, no PII policy, no guardrail on Converse. See decision 6. |
+| Widget | Custom vanilla-JS embed, Shadow DOM | Self-injecting single file, reads `data-api-url` from its script tag. Shadow DOM isolates it from host-site CSS. Bilingual chrome (English + Español) from one string table, switched by a header control; an explicit choice rides along as the optional `language` request field. Nothing about a conversation is written down - transcript and language choice live in memory and go with the tab. |
+| Widget hosting | S3 + CloudFront (OAC), same stack | One `cdk deploy` ships backend + widget. OAC, not OAI. Same stack because OAC hits a cross-stack cyclical dependency. |
+| Widget theming | `theme.json` at the widget bucket root | Highlight colour, font keyword and starter questions, read at init and merged over the built-in defaults. Its own CloudFront behavior (CORS + 60s TTL, because a console upload sets no object metadata) and an `exclude` on the widget `BucketDeployment` so the deploy's prune cannot delete it. See decision 16. |
+| Settings editor | `theme-editor.html` at the widget bucket root, `PUT /theme` behind its own Cognito pool | The one theming entry point (`WidgetThemeEditor`). Signed in, Save publishes to the live widget through a key-scoped Lambda; unsigned, the same page downloads a ready-to-upload `theme.json`. `WidgetThemeUpload` is the S3-console fallback and `theme-guide.html` documents it. Accounts come from `ThemeAdminCreateUserCommand`; everything after that is self-service. See decision 17. |
+| Cost visibility | Demo page only: session meter + monthly estimator | Fed by two opt-ins absent from production: the handler's `include_usage` and the widget's `data-usage-events`. Rates and measured constants live in `config.yaml`, stamped into the page at deploy. Published list prices only - no Cost Explorer, no billing API. |
+| Demo site | A second private S3 + CloudFront (OAC) pair, same stack | One static page embedding the production widget from the production CDN, with the `/query` and widget URLs stamped in at deploy. Its own bucket because `BucketDeployment` prunes; its own distribution so demo-only `noindex` headers never touch the production widget. Gated on `demo_site.enabled`. |
+| Config | `config.yaml` (declarative) | Model ids, vector store, scraper, chunking, retrieval, catalog and guardrail settings live in config, not code. |
 | Deploy | CloudFormation / CDK (Python, L1 constructs) | One-click AWS install. |
-| Logs/eval | CloudWatch (structured logs); Bedrock RAG eval harness | The input screen's outcome is logged per request (types/actions only, never the question). There is no answer-side assessment to log. |
+| Logs/eval | CloudWatch (structured logs); Bedrock RAG eval harness | The input screen's outcome is logged per request - types and actions only, never the question. There is no answer-side assessment to log. |
 
 ---
 
 ## Data flow
 
-**Ingest (tiered schedule + on deploy):** An EventBridge rule per freshness tier invokes the scraper Lambda with `{"tier": "<name>"}`. The Lambda resolves that to a URL list, fetches those pages -> extracts clean markdown -> uploads only the pages whose content fingerprint CHANGED -> starts a KB ingestion job only if the bucket actually moved (FIXED_SIZE chunk -> Titan v2 embed -> S3 Vectors). On a full run it also regenerates the database catalog from databases.php (deterministic HTML anchor parse for names/descriptions/URLs, the min-count guard, then a fingerprint gate, then a Sonnet call for subjects/aliases on newly-added databases only, constrained to the parsed names), and writes it to the catalog S3 bucket - keeping the last-good copy if validation fails or the page is unchanged, and never blocking the KB scrape. It then logs one structured summary line: tier, pages fetched/changed/unchanged, the ingestion decision, and the enrichment call's real token counts. The one-click deploy Trigger invokes with no tier, which resolves to the complete sweep.
+**Ingest (tiered schedule + on deploy).** An EventBridge rule per tier invokes the scraper with
+`{"tier": "<name>"}`. The Lambda resolves that to a URL list, fetches those pages, extracts clean
+markdown, uploads only the pages whose content fingerprint changed, and starts a KB ingestion job
+only if the bucket actually moved (FIXED_SIZE chunk -> Titan v2 embed -> S3 Vectors). A full run
+also regenerates the database catalog from databases.php: a deterministic HTML anchor parse, a
+min-count guard, a fingerprint gate, then a Sonnet call for subjects and aliases on newly-added
+databases only, constrained to the parsed names. It keeps the last-good copy if validation fails
+or the page is unchanged, and never blocks the KB scrape. One structured summary line per run:
+tier, pages fetched/changed/unchanged, the ingestion decision, and the enrichment call's real
+token counts. The deploy Trigger invokes with no tier, which resolves to the complete sweep.
 
-**Query (runtime):** Widget -> API Gateway (HTTP API, POST /query, public - see decision 15) -> Lambda. The request carries a multi-turn `messages` array (legacy `{query}` still accepted), plus an optional allowlisted `language` field when the person picked one in the widget's language control (present -> one extra `system` block naming the reply language; absent -> nothing changes and the model auto-detects as before); history is client-sent (the Lambda is stateless) and trimmed server-side to the last 10 messages before seeding the loop. An input guardrail (`ApplyGuardrail`, source=INPUT) screens the newest user turn for PROMPT_ATTACK - the only thing it screens, and it never rewrites the turn. Then `run_agent` runs the Converse tool-use loop under the system prompt: the model decides when to call `search_library_info` (KB `Retrieve`), `database_catalog` (reads the catalog from S3), or the two live Primo tools `search_book_catalog` / `search_course_reserves` (each a timed-out, soft-failing HTTPS call to the external Ex Libris Primo API); the loop executes each `toolUse` and feeds the `toolResult` back, repeating until `end_turn` (or the iteration cap). No guardrail is attached to any Converse call. Response `{answer, sources[]}` returns to the widget: `sources` accumulate from the loop's KB retrievals (deduped by uri) plus one synthetic source per non-KB tool that returned a result - the A-Z databases page for `database_catalog` and a per-query discovery-search URL for each Primo tool. The curated link table contributes no sources. On an input-screen block the blocked message returns with empty sources, and nothing downstream runs.
+**Query (runtime).** Widget -> API Gateway -> Lambda, over a public `POST /query` (see decision 15). The request carries a multi-turn `messages`
+array (legacy `{query}` still accepted) plus an optional allowlisted `language` field. History is
+client-sent - the Lambda is stateless - and trimmed to the last 10 messages before seeding the
+loop. `ApplyGuardrail` screens the newest user turn for PROMPT_ATTACK, the only thing it screens,
+and it never rewrites the turn. Then `run_agent` runs the Converse tool-use loop under the system
+prompt: the model decides when to call each tool, the loop executes every `toolUse` and feeds the
+`toolResult` back, repeating until `end_turn` or the iteration cap. No guardrail is attached to
+any Converse call. `{answer, sources[]}` returns to the widget - `sources` accumulate from the
+loop's KB retrievals, deduped by uri, plus one synthetic source per non-KB tool that returned a
+result: the A-Z databases page for `database_catalog`, a per-query discovery-search URL for each
+Primo tool. The curated link table contributes none. On a block, the blocked message returns with
+empty sources and nothing downstream runs.
 
-**Feedback (runtime):** Browser -> API Gateway (HTTP API, POST /feedback) -> a SEPARATE small Lambda from the query path, whose role carries `sns:Publish` and nothing else. It enforces a five-field payload allowlist (`comment`, `question`, `answer`, `sources`, `reply_to`), a body-byte cap checked before parsing, and a comment-character cap; an unexpected field is a `400` rather than a pass-through. It then renders a PLAIN TEXT email - what the student said, the reported question and answer, the cited source URLs, and a Pacific timestamp - and publishes it to an SNS topic whose only subscription is the librarian address from config. Response `202 {"received": true}`. Nothing is stored anywhere: no table, no bucket, no logged copy, and no IP / user agent / session or generated id is accepted or recorded. Feedback text never reaches a model, so the guardrail does not screen it - the caps and plain-text rendering are the only controls. The `Subject` is a constant and the optional reply address is body text, never a mail header.
+**Feedback (runtime).** Browser -> API Gateway -> a separate small Lambda whose role carries
+`sns:Publish` and nothing else. It enforces a five-field allowlist (`comment`, `question`,
+`answer`, `sources`, `reply_to`), a body-byte cap checked before parsing, and a comment-character
+cap; an unexpected field is a `400` rather than a pass-through. It renders a plain-text email -
+what the student said, the reported question and answer, the cited URLs, a Pacific timestamp -
+and publishes it to a topic whose only subscription is the librarian address from config.
+Response `202 {"received": true}`. Nothing is stored anywhere, and no IP, user agent, session or
+generated id is accepted or recorded. The `Subject` is a constant and the optional reply address
+is body text, never a mail header.
 
-**Widget delivery:** Browser loads the host library page -> its `<script>` tag fetches `widget.js` from CloudFront (served from private S3 via OAC) -> the widget fetches `theme.json` from the same distribution (cross-origin, CORS-enabled, 60s TTL) in parallel with the rest of page load and waits for it, under a 1.5s cap, before injecting itself, so a themed install is themed on its first paint -> widget injects into the page -> widget calls the API Gateway `/query` (the query flow above). A missing `theme.json` is the normal state of a fresh install and renders the built-in defaults.
+**Widget delivery.** The host page's `<script>` tag fetches `widget.js` from CloudFront (private
+S3 via OAC). The widget fetches `theme.json` from the same distribution in parallel with page
+load and waits on it, under a 1.5s cap, before injecting itself - so a themed install is themed
+on its first paint. A missing `theme.json` is the normal state of a fresh install and renders the
+built-in defaults.
 
-**Demo delivery:** Identical, with the demo page standing in for the host library page: browser loads `DemoSiteUrl` (the demo CloudFront distribution, private S3 via OAC) -> the page's one `<script>` tag fetches `widget.js` from the WIDGET distribution -> the widget posts cross-origin to the same `/query`. Because it is the real embed rather than a copy, the demo exercises the production delivery path end to end, including CORS: the demo distribution's origin is appended to `cors.allow_origins` at deploy as an `Fn::GetAtt`, so a CORS regression shows up on the demo instead of hiding behind a proxy.
+**Demo delivery.** Identical, with the demo page standing in for the host library page: it
+carries one `<script>` tag pointing at the *widget* distribution and posts cross-origin to the
+same `/query`. Because it is the real embed rather than a copy, it exercises the production
+delivery path end to end, including CORS - the demo origin is appended to `cors.allow_origins` at
+deploy, so a CORS regression shows up on the demo instead of hiding behind a proxy.
 
 ---
 
 ## Decisions (resolved)
 
-1. **`Retrieve` via a tool, not `RetrieveAndGenerate`.** Full system-prompt control over out-of-scope and textbook behavior; the model calls Retrieve through `search_library_info`.
-2. **Four tools, model-routed.** `search_library_info` handles hours/services/policies/how-to/borrowing/contact; `database_catalog` is authoritative for research-database availability (confirms when a named database is not held and suggests held alternatives) and subject listings; `search_book_catalog` and `search_course_reserves` search the live Primo general catalog and course reserves. Routing is via the tool descriptions + system-prompt guidance + `toolChoice` auto, not Lambda branches. The curated URL table used to be a fifth tool routed by its `toolSpec` description alone - the cleanest available test of whether description-only routing works. It failed that test: the description already named campus maps explicitly and the model still skipped the call whenever it had already formed an answer. Being a constant function, it moved into the `system` payload instead.
-3. **Self-updating catalog with a robustness guard.** The held list is derived from the site on each scrape; the hand-authored not-held list is a bundled seed merged at read time; a minimum-count/required-field guard keeps the last-good catalog rather than overwrite it with garbage.
-4. **L1 `Cfn*` constructs.** L1 core covers KB, DataSource, S3 Vectors, and guardrails; the `generative-ai-cdk-constructs` Bedrock L2s are excluded (deprecated).
-5. **Same-stack widget hosting, OAC not OAI.** `S3BucketOrigin.with_origin_access_control`; one `cdk deploy`; cross-stack OAC hits a cyclical dependency.
-6. **The guardrails screen prompt attacks and nothing else.** One guardrail, one category, input side only - and the output guardrail is deleted rather than disabled. The reason is ordering: `ApplyGuardrail` runs BEFORE the system prompt does, so every other policy it could carry pre-empts the prompt's `<priority_responses>` crisis handling. A content filter that blocks a message about self-harm answers a student in trouble with canned decline copy; PII anonymization silently rewrites their message, so a name and a street arrive at the model as `{NAME}` and `{ADDRESS}` - the details that make an urgent message legible are exactly the ones it strips. The system prompt owns safety instead: it sees the whole question, it can tell a request for a book about suicide prevention from a person in crisis, and unlike a filter it can RESPOND rather than only refuse. PROMPT_ATTACK is the one exception because it is an attack on the prompt itself, it is input-only by definition, and nothing else defends a public unauthenticated endpoint. Two things follow. (a) Nothing screens the ANSWER - there is no `guardrailConfig` on any Converse call, no `guardrail_intervened` stop reason to handle, and no answer-side assessment to log. (b) Contextual grounding stays excluded on its own separate grounds: it is not supported for conversational chatbot use (it needs fragile `guardContent` tagging), and the system prompt handles grounding.
-7. **WAF excluded.** HTTP API v2 cannot take WAF directly; API Gateway throttling is the cost-abuse control.
-   **CORS is locked, not permissive** (pre-launch hardening): `cors.allow_origins` in config.yaml lists `https://www.gavilan.edu` (the host-only Origin the browser sends for the widget's page, `https://www.gavilan.edu/library/` - the path is irrelevant to CORS) plus a dev-only `http://localhost:8000` for `frontend/demo-live.html`, safe to drop at final launch, plus `https://gavbot-demo.calpoly.io`, the demo site's friendly hostname. That last one is listed by hand rather than derived: the stack already appends the demo distribution's `*.cloudfront.net` origin at deploy, but a browser on the custom hostname sends a DIFFERENT origin string, and CORS matches the full string exactly. The hostname is a DNS + ACM decision made outside this stack (the distribution carries no alternate domain name in CDK), so nothing in the template can discover it. The stack also appends its own widget distribution's origin, because the settings editor is served from there and PUTs `/theme` cross-origin. `infra/config.py` rejects `*` at synth. This is a spend-hygiene control, not a security boundary: CORS is browser-enforced only, so throttling remains the actual cost cap. `allowHeaders` is `Content-Type` plus `Authorization` (for `PUT /theme`, decision 17 - the settings editor sets that header from JavaScript, which makes the save preflighted, so leaving it out kills it at the OPTIONS with a CORS error rather than a 401; the widget sends no such header). `AllowCredentials` stays off: that flag is about cookies and browser-managed HTTP auth, neither of which is in play for a header this code sets by hand.
-8. **Live-catalog tools return evidence, not a verdict.** Unlike `database_catalog` (authoritative from a curated list), Primo relevance scores are query-relative - a held item can score below not-held noise - so `search_book_catalog`/`search_course_reserves` return the top candidate records for the model to judge; `total == 0` is the only clean not-held / not-on-reserve signal and the handler applies no score threshold. Availability comes from a per-record delivery call and is reported as what the catalog SHOWS, not a guarantee. Reliability posture: per-call timeout + total availability budget + soft-fail to a "catalog unavailable" `toolResult`, plus defensive parsing of Primo's `$$`-encoded fields, so a slow/broken external call never kills the loop.
-9. **The demo site is packaging, not a second frontend.** The deployment itself is the demo: `cdk deploy` returns a public URL that already shows the widget working in a library-looking page, so the product can be sent as a link with no setup. Three constraints shaped it. (a) It embeds the SHIPPED widget over the SHIPPED delivery path - one `<script>` tag, no fork, no inline copy - so it cannot drift from what the library pastes on their site. (b) It gets its OWN bucket and distribution: `BucketDeployment` prunes with `s3 sync --delete`, so sharing the widget bucket would put `widget.js` one misconfiguration away from deletion, and a separate distribution keeps the demo's `noindex` response header off the production widget. (c) The endpoint is discovered, never hardcoded - `s3deploy.Source.data` resolves the API and widget URLs during deployment - because one-click install into any account is a project goal and a baked-in endpoint breaks it. It is unmistakably marked (banner + `noindex` meta + `X-Robots-Tag`) and switched off with `demo_site.enabled: false`.
-10. **Cost visibility is a demo affordance, and it is measured rather than modelled.** "What will this cost" is the client's second question, so the shareable demo answers it: a meter for the conversation you just had, and a three-slider monthly estimate split into a fixed floor and a variable part (one blended number answers neither question). Three constraints shaped it. (a) It must be invisible by default - the whole feature sits behind one control in the DEMO banner, and nothing in the library-looking content mentions money, so the demo still works for an audience that only cares whether the bot answers. (b) The per-question constants are MEASURED against the deployed endpoint (`eval/measure_usage.py`, 60 questions), not derived, because the three things that dominate cost are invisible from outside the loop: a question is often several Converse calls, each resending everything; retrieved passages ride in the input tokens; and the guardrail bills per 1,000-character text unit rather than per question. That measurement overturned the expected shape - see the cost lesson in CLAUDE.md. (c) It reads published list prices only. No Cost Explorer call, no billing API, no account spend, and every figure is labelled an estimate. The data path is two independent opt-ins (`include_usage` on the response, `data-usage-events` on the embed), both absent from the production install, so a student's request and response are byte-identical to what they were before.
-11. **Spanish is a frontend affordance, not a second corpus.** Gavilan serves a large Spanish-speaking community, so this is an adoption and equity requirement. Measured first (2026-07-29, by hand against the deployed system): Spanish questions ALREADY retrieve correctly from the English knowledge base and return grounded, specific answers - including the authoritative database tool and the live Primo catalog, accented or not. So nothing about the RAG side changes: no translated corpus, no re-ingest, no chunking or retrieval change. The real gap was the shell: every piece of widget chrome was hardcoded English, so a Spanish speaker saw no signal the bot speaks Spanish before typing, and language auto-detection cannot help because it needs a message first. Hence (a) a VISIBLE English/Español control in the panel header - a discovery affordance for the pre-first-message state, which is its primary justification - backed by one string table so no copy is inline in render code; (b) exactly one optional request field (`language`, allowlisted server-side because it is client text heading for the system payload) and one extra `system` block, leaving the no-preference request byte-identical and the model's own detection untouched; (c) past turns are never retranslated - each message carries the `lang` it was said in, and rewriting history would cost a model call per message and read as the bot editing itself; (d) the guardrail's blocked-input message is bilingual in `config.yaml`, because a block bypasses the model entirely and nothing can translate it at runtime. The <priority_responses> emergency reply stays verbatim in the language it is written in: the language block says so explicitly, since a blanket "reply in Spanish" arriving last in the system payload could otherwise override a hand-verified safety message.
-12. **Freshness is tiered and declarative, and everything downstream is change-gated.** "We changed our hours, when does the bot know?" had one honest answer under a single weekly scrape: "up to a week". Now it is "hours within a day, everything else within five". Both cadences and every URL's tier membership live in `config.yaml` under `scraper.tiers`, validated at synth; the stack builds one EventBridge rule per tier by iterating that map, so a new tier, a retimed one, or a page moving between them is a config edit with no code change. Three things shaped it. (a) Scraping more often had to be nearly free, so each of the three downstream costs is gated on whether content actually changed: markdown is uploaded only when a `content-sha256` stamped in S3 object metadata differs, an ingestion job starts only when the bucket moved, and the Sonnet catalog enrichment - the one meaningful per-run cost, measured at 3,395 in / 3,359 out tokens for a full 46-database enrichment and 242 / 111 for a single added database - runs only when a fingerprint of the PARSED database rows changes. A second consecutive run over unchanged content uploads nothing, indexes nothing and calls no model. (b) None of it may introduce a store: change detection reads S3 object metadata, S3 `LastModified`, and Bedrock's own ingestion-job history, so there is nothing to back up or clean up. (c) The gating had to be safe under the two failure modes it creates. The stale-object prune keys off every configured URL rather than the tier's slice (a daily 3-page run must not decide what is stale), and counts pages found unchanged as live, not just uploaded ones. And because Bedrock allows one ingestion job per data source, an overlap SKIPS rather than throws - which is only safe because the "bucket newer than the last job" rule finds the deferred change on the next run. Deliberately excluded: a manual "refresh now" endpoint and a staff dashboard. Unauthenticated, that is a denial-of-wallet lever on a public endpoint with no WAF; authenticated, it is a permanent ownership burden after the engagement ends.
-13. **Single-session multi-turn, client-carried.** The client sends the full `messages` history on each request; the Lambda is stateless (no DynamoDB, no server-side conversation store) and trims to the last 10 messages before seeding the Converse loop. Legacy `{query}` is treated as a single-message conversation.
-14. **Feedback is a notification, not a dataset - and its payload is the source URLs.** "It said something wrong, how do we fix it?" is the client's question, and the fix is RAG-first (D-20260727-10): correct the library webpage and the next scheduled scrape corrects the bot (see decision 12 - a tier's cadence, not a fixed week). So the notification's job is to tell a librarian WHICH PAGE to edit; carrying the cited source URLs is what makes it a work order instead of a complaint box, and the email says in plain words that editing one of those pages is the fix. Four constraints shaped it. (a) **SNS, not SES.** SES starts every account in a sandbox restricted to pre-verified addresses and needs a support request to leave it (confirmed on the deploy account 2026-07-29: `ProductionAccessEnabled: false`), which would make one-click install into a fresh account the client's problem; an SNS email subscription needs one confirmation click by the recipient. The cost is that SNS mail arrives from an AWS address with no reply routing - acceptable for a notification, and the reason the optional reply address is body text. (b) **No server-side store, by constraint.** No table and no logged copy, so the email is the record and a failed publish loses the report. The alternative was a database of student complaints that nobody agreed to keep. (c) **The payload is an allowlist of five fields, and the request is not.** No IP, user agent, session or generated id, and no conversation history: API Gateway supplies the first two on every request and the handler never reads them, an unexpected sixth field is rejected rather than forwarded, and the comment never appears in a log line. (d) **Nothing screens the text.** Feedback never reaches the model, so the Bedrock guardrail does not apply (and it screens only the query path's input for prompt injection in any case); the controls are the configured caps, plain-text-only rendering, a constant subject line, and control-character stripping. It is also gated harder than the demo site: with no destination address configured the route is not created at all, because an endpoint that accepts reports it cannot deliver breaks the silence this feature exists to break.
+1. **`Retrieve` via a tool, not `RetrieveAndGenerate`.** Full system-prompt control over
+   out-of-scope and textbook behavior.
 
-15. **`POST /query` is public, and that is a decision rather than an omission.** The widget is embedded on a public library page, so every caller is anonymous by definition and there is no credential a student could hold. Three controls carry it instead of an authorizer: stage-level throttling on the default stage (the actual cost cap, and the reason WAF is excluded - see decision 7), the `PROMPT_ATTACK` input screen, and the exact-match CORS allowlist - which is spend hygiene, not a boundary, because CORS is browser-enforced only. A short-lived gate did sit here before launch: while the only thing driving billable `/query` was a shareable demo URL, and a link travels, the route sat behind a Cognito user pool and a native JWT authorizer with one shared account. It came off as a **deletion, not a flag** - a switchable gate would have kept the pool, the shared username and its enrolment commands in a public repo for a control nobody would ever turn back on, and removing code is visible in review where a changed YAML value is not. What survived the removal is one line of CORS config: `Authorization` stays in `allowHeaders`, because the settings editor's `PUT /theme` sends that header and losing it kills theme saves at the preflight rather than at the request. `GET /warm` and `POST /feedback` were never gated - warm runs no generation call, and putting a report path behind a password only loses reports.
+2. **Four tools, model-routed - and the link table is not one of them.** Routing is tool
+   descriptions plus system prompt plus `toolChoice` auto, never Lambda branches. The curated URL
+   table used to be a fifth tool routed by its `toolSpec` description alone, which was the cleanest
+   available test of whether description-only routing works. It failed: the description named
+   campus maps explicitly and the model still skipped the call whenever it had already formed an
+   answer. A constant function does not belong behind a tool call, so it moved into the `system`
+   payload.
 
-16. **Branding is data the customer owns, not a code edit.** At pickup the client deploys this stack into their own AWS account, so the widget bucket and its distribution belong to them - and the three things a customer actually asks to change (the highlight colour, the typeface, the starter questions) should not need an engineer. They are read at runtime from one `theme.json` at the widget bucket root, merged over the built-in defaults. Hand-editing the shipped `widget.js` was rejected outright: it forks the file the next deploy overwrites. Six constraints shaped it. (a) **JSON, never JS** - a `.js` config is executable code running on the library's own pages with the widget's privileges, so the file is data and every value in it is allowlisted; the colour is the one that reaches a stylesheet, so its hex pattern is a security boundary rather than tidiness. (b) **Soft-fail per key**, because the person editing cannot redeploy and cannot read a stack trace: a bad colour costs them the colour, malformed JSON costs them the file, and an unthemed install emits no theme CSS at all, so the default rendering is provably unchanged. (c) **The customer's file has to survive `cdk deploy`** - `BucketDeployment` prunes with `aws s3 sync --delete` and its source will never contain a file they wrote, so the deployment carries the `exclude` prop that scopes the sync (not the identically named argument on `Source.asset`, which only filters the asset and protects nothing); it needs TWO patterns, because `--exclude` fnmatches the full path and `theme.json` therefore covers the root object only. (d) **Highlight colour only, with the text on it derived** rather than configured: black or white, whichever contrasts more, which bottoms out at 4.58:1 over the entire sRGB cube and therefore needs no validation and can reject nothing. A palette of a dozen colour fields is not a design system - the divider, the focus outline and its halo were each measured against the specific surfaces they land on, and exposing them would let a well-meaning edit undo 1.4.11 silently. Font is family only for the same reason: size, weight and line height are what keep the panel readable at 400% zoom. (e) **Enumerated font keywords mapping to stacks that resolve on macOS and Windows with no download**, because a free-text family name would ship a Times fallback to everyone except the person who typed it. (f) **CORS and freshness come from the distribution, not the object**, since a console upload sets no metadata: `theme.json` gets its own cache behavior (60s) and a response-headers policy carrying `Access-Control-Allow-Origin: *` - a world-readable static file on the customer's own CDN, and not the wildcard decision 7 rejects for the billable API. The mount waits on the fetch under a 1.5s cap, so a themed install paints themed on its first frame and a dead CDN costs the launcher that much and no more. The accessibility conformance claim is scoped to the default colours, since the highlight is also a text colour on light surfaces.
+3. **Self-updating catalog with a robustness guard.** The held list is derived from the site each
+   full scrape; the not-held list is hand-authored and merged at read time, because absence cannot
+   be scraped. A minimum-count and required-field guard keeps the last-good catalog rather than
+   overwriting it with garbage.
 
-17. **The settings editor is a static page plus one key-scoped write, and it is the entry point.** The original position was "no settings page at all": a settings UI is a second surface to authenticate, host and maintain after the engagement ends. What shipped keeps most of that saving, because the runtime contract never changed - the widget still reads a `theme.json` from a bucket, so deleting the whole editor would leave theming working. Five things shaped it. (a) **The console round trip was tested and it was the problem.** Download, edit, find the right bucket, drag it in: the account holds around nineteen buckets, the demo-site bucket sits next to the widget one, and an upload into the wrong one succeeds silently and changes nothing. Save removes that trip. (b) **One entry point, not four.** `WidgetThemeEditor` is the only theming output with a starting-point framing; the download, the "Choose defaults" refill, the account controls and the link to `theme-guide.html` live in a settings dialog inside it. `WidgetThemeUpload` survives as the manual fallback the guide walks through, and as the only route for anyone not signed in. Two earlier outputs pointing at the guide and the download were deleted - three routes into one workflow is two more things to leave stale. (c) **Save is gated by its own Cognito pool.** Managed login hosts every password flow, the editor page only redirects (authorization code + PKCE, no implicit grant), and the save Lambda's IAM reaches exactly one object. It revalidates against the widget's rules rather than trusting the page, because "the editor would never send that" is not a runtime guarantee for a file served to every visitor. (d) **The account lifecycle is one CLI command total.** `ThemeAdminCreateUserCommand` runs `admin-create-user` once per librarian; first password, resets, change password and change email are all self-service. No user in CloudFormation: every `AWS::Cognito::UserPoolUser` property is replacement-on-update, so a template-owned user could not change email without wiping the librarian's password. (e) **The page ships deploy-stamped**, like the demo page - four placeholders resolve to the save endpoint and sign-in configuration during deployment, a missing one fails synth, and the committed file carries no absolute URL. It duplicates the widget's validation rules and the defaults file by design, and the contract suite pins every copy so none can drift silently.
+4. **L1 `Cfn*` constructs.** L1 core covers the KB, the data source, S3 Vectors and guardrails; the
+   `generative-ai-cdk-constructs` Bedrock L2s are deprecated and excluded.
+
+5. **Same-stack widget hosting, OAC not OAI.** Cross-stack OAC hits a cyclical dependency.
+
+6. **The guardrail screens prompt attacks and nothing else.** One guardrail, one category, input
+   only - and the output guardrail is deleted rather than disabled. The reason is ordering, not
+   cost. `ApplyGuardrail` runs *before* the system prompt does, so any other policy it carried
+   would pre-empt the prompt's crisis handling: a content filter that blocks a message about
+   self-harm answers a student in trouble with canned decline copy, and PII anonymization silently
+   rewrites their message so a name and a street arrive as `{NAME}` and `{ADDRESS}` - stripping
+   exactly the details that make an urgent message legible. The system prompt owns safety instead,
+   because it sees the whole question, can tell a request for a book about suicide prevention from
+   a person in crisis, and can *respond* rather than only refuse. PROMPT_ATTACK stays because it is
+   an attack on the prompt itself, it is input-only by definition, and nothing else defends a
+   public unauthenticated endpoint. Consequences: nothing screens the answer, so there is no
+   answer-side assessment to log; and contextual grounding stays excluded on separate grounds -
+   unsupported for chatbot use, needs fragile `guardContent` tagging, and the prompt handles
+   grounding.
+
+7. **WAF excluded; CORS locked, not permissive.** HTTP API v2 cannot take WAF directly, so
+   throttling is the cost-abuse control. `cors.allow_origins` lists the library site (a host-only
+   Origin - the `/library/` path is irrelevant to CORS), a dev-only localhost entry, and the demo
+   site's friendly hostname. That last one is hand-listed rather than derived: the stack appends
+   the demo distribution's `*.cloudfront.net` origin at deploy, but a browser on the custom
+   hostname sends a different origin string, CORS matches the full string exactly, and the hostname
+   is a DNS + ACM decision made outside this stack. The stack also appends its own widget
+   distribution's origin, since the settings editor is served from there and PUTs `/theme`
+   cross-origin. `infra/config.py` rejects `*` at synth. This is spend hygiene, not a security
+   boundary - CORS is browser-enforced only, so throttling remains the actual cost cap.
+   `allowHeaders` carries `Authorization` because Save sets it from JavaScript, which makes every
+   `PUT /theme` preflighted; leave it out and the request dies at the OPTIONS with a CORS error
+   rather than a 401.
+
+8. **Live-catalog tools return evidence, not a verdict.** Primo relevance is query-relative - a
+   held item can score below not-held noise - so the two catalog tools return top candidates for
+   the model to judge, `total == 0` is the only clean not-held signal, and the handler applies no
+   score threshold. Availability is reported as what the catalog *shows*, not a guarantee. Per-call
+   timeouts, a total availability budget, soft-fail to a "catalog unavailable" `toolResult`, and
+   defensive parsing of Primo's `$$`-encoded fields keep a slow or broken third party from killing
+   the loop.
+
+9. **The demo site is packaging, not a second frontend.** `cdk deploy` returns a public URL that
+   already shows the widget working in a library-looking page, so the product can be sent as a link
+   with no setup. It embeds the *shipped* widget over the *shipped* delivery path - one `<script>`
+   tag, no fork - so it cannot drift from what the library pastes on their site. It gets its own
+   bucket, because `BucketDeployment` prunes with `s3 sync --delete` and sharing the widget bucket
+   would put `widget.js` one misconfiguration away from deletion, and its own distribution, so the
+   demo's `noindex` header never touches the production widget. The endpoint is discovered rather
+   than hardcoded, because one-click install into any account is a project goal.
+
+10. **Cost visibility is a demo affordance, and it is measured rather than modelled.** "What will
+    this cost" is the client's second question, so the demo answers it: a meter for the
+    conversation you just had, and a monthly estimate split into a fixed floor and a variable part,
+    because one blended number answers neither question. It is invisible by default, behind one
+    control in the demo banner, and nothing in the library-looking content mentions money. The
+    per-question constants are measured over 60 live questions rather than derived, because the
+    three things that dominate cost are invisible from outside the loop: a question is often
+    several Converse calls each resending everything, retrieved passages ride in the input tokens,
+    and the guardrail bills per 1,000-character text unit rather than per question. Published list
+    prices only, every figure labelled an estimate, and the data path is two opt-ins that the
+    production install does not set.
+
+11. **Spanish is a frontend affordance, not a second corpus.** Measured before it was built:
+    Spanish questions *already* retrieve correctly from the English knowledge base and come back
+    grounded and specific, accented or not, including the authoritative database tool and the live
+    catalog. So no translated corpus, no re-ingest, no chunking or retrieval change. The real gap
+    was the shell - every piece of chrome was hardcoded English, so a Spanish speaker saw no signal
+    the bot speaks Spanish *before typing*, and auto-detection cannot close that because it needs a
+    message first. Hence a visible control rather than a sniffer, one string table so no copy sits
+    inline in render code, and exactly one optional request field (allowlisted server-side, since
+    it is client text heading for the system payload) plus one extra `system` block. Past turns are
+    never retranslated: each message carries the language it was said in, and rewriting history
+    would cost a model call per message and read as the bot editing itself. The blocked-input
+    message is bilingual in config, because a block bypasses the model and nothing can translate it
+    at runtime. The emergency reply stays verbatim in the language it is written in - the language
+    block says so explicitly, since a blanket "reply in Spanish" arriving last could otherwise
+    override a hand-verified safety message.
+
+12. **Freshness is tiered and declarative, and everything downstream is change-gated.** "We changed
+    our hours, when does the bot know?" had one honest answer under a single weekly scrape: up to a
+    week. Now it is a day for hours and five for everything else. Cadences and tier membership live
+    in `config.yaml`, validated at synth, and the stack builds one rule per tier by iterating that
+    map - so retiming a tier or moving a page between them is a config edit. Scraping more often
+    had to be nearly free, so each downstream cost is gated on real change: markdown uploads only
+    when a `content-sha256` in S3 object metadata differs, ingestion starts only when the bucket
+    moved, and the Sonnet catalog enrichment runs only when a fingerprint of the *parsed* database
+    rows changes. A second run over unchanged content uploads nothing, indexes nothing, calls no
+    model. None of it introduces a store: change detection reads S3 object metadata, S3
+    `LastModified`, and Bedrock's own ingestion-job history. Two failure modes had to be closed.
+    The stale-object prune keys off every configured URL rather than the tier's slice, because a
+    daily three-page run must not decide what is stale, and it counts unchanged pages as live
+    rather than only uploaded ones. And since Bedrock allows one ingestion job per data source, an
+    overlap skips rather than throws - safe only because the "bucket newer than the last job" rule
+    finds the deferred change next run. Deliberately excluded: a manual "refresh now" endpoint and
+    a staff dashboard. Unauthenticated, that is a denial-of-wallet lever on a public endpoint with
+    no WAF; authenticated, it is a permanent ownership burden after the engagement ends.
+
+13. **Single-session multi-turn, client-carried.** The client sends the full history each request;
+    the Lambda is stateless and trims to the last 10 messages. Legacy `{query}` is a single-message
+    conversation.
+
+14. **Feedback is a notification, not a dataset - and its payload is the source URLs.** The fix for
+    a wrong answer is RAG-first: correct the library webpage and the next scrape of that page's
+    tier corrects the bot. So the notification's job is to name *which page* to edit, which is what
+    makes it a work order rather than a complaint box. Four constraints. **SNS, not SES**: SES
+    starts every account in a sandbox restricted to pre-verified addresses and needs a support
+    request to leave, which would make one-click install into a fresh account the client's problem;
+    an SNS subscription needs one confirmation click. The cost is mail from an AWS address with no
+    reply routing, which is why the optional reply address is body text. **No server-side store, by
+    constraint**: the email is the record, so a failed publish loses the report - the alternative
+    was a database of student complaints nobody agreed to keep. **The payload is an allowlist of
+    five fields and the request is not**: no IP, user agent, session or generated id, and no
+    conversation history; API Gateway supplies the first two and the handler never reads them, an
+    unexpected sixth field is rejected rather than forwarded, and the comment never appears in a
+    log line. **Nothing screens the text**: feedback never reaches the model, so the guardrail does
+    not apply, and the controls are the caps, plain-text rendering, a constant subject and
+    control-character stripping. It is gated harder than the demo site - with no destination
+    configured the route is not created at all, because an endpoint that accepts reports it cannot
+    deliver breaks the silence this feature exists to break.
+
+15. **`POST /query` is public, and that is a decision rather than an omission.** The widget is
+    embedded on a public library page, so every caller is anonymous by definition and there is
+    no credential a student could hold. Three controls carry it instead of an authorizer:
+    stage-level throttling on the default stage (the actual cost cap, and the reason WAF is
+    excluded - see decision 7), the `PROMPT_ATTACK` input screen, and the exact-match CORS
+    allowlist - which is spend hygiene, not a boundary, because CORS is browser-enforced only. A
+    short-lived gate did sit here before launch: while the only thing driving billable `/query`
+    was a shareable demo URL, and a link travels, the route sat behind a Cognito user pool and a
+    native JWT authorizer with one shared account. It came off as a **deletion, not a flag** - a
+    switchable gate would have kept the pool, the shared username and its enrolment commands in
+    a public repo for a control nobody would ever turn back on, and removing code is visible in
+    review where a changed YAML value is not. What survived the removal is one line of CORS
+    config: `Authorization` stays in `allowHeaders`, because the settings editor's `PUT /theme`
+    sends that header and losing it kills theme saves at the preflight rather than at the
+    request. `GET /warm` and `POST /feedback` were never gated - warm runs no generation call,
+    and putting a report path behind a password only loses reports.
+
+16. **Branding is data the customer owns, not a code edit.** At pickup the client deploys into
+    their own account, so the widget bucket is theirs - and the three things a customer asks to
+    change should not need an engineer. Hand-editing the shipped `widget.js` was rejected outright:
+    it forks the file the next deploy overwrites. Six constraints. **JSON, never JS** - a `.js`
+    config is executable code on the library's own pages with the widget's privileges, so the file
+    is data and every value is allowlisted; the colour reaches a stylesheet, so its hex pattern is
+    a security boundary rather than tidiness. **Soft-fail per key**, because the person editing
+    cannot redeploy and cannot read a stack trace: a bad colour costs them the colour, malformed
+    JSON costs them the file, and an unthemed install emits no theme CSS at all, so the default
+    rendering is provably unchanged. **The customer's file has to survive `cdk deploy`** - the
+    deployment carries the `exclude` prop that scopes the sync, not the identically named argument
+    on `Source.asset`, which only filters the asset and protects nothing; it needs two patterns,
+    because `--exclude` fnmatches the full path so `theme.json` covers the root object only.
+    **Highlight colour only, with the text on it derived** - black or white, whichever contrasts
+    more, which bottoms out at 4.58:1 over the whole sRGB cube and so needs no validation and can
+    reject nothing. A dozen colour fields is not a design system: the divider, the focus outline
+    and its halo were each measured against the surfaces they land on, and exposing them would let
+    a well-meaning edit undo 1.4.11 silently. Font is family only for the same reason - size,
+    weight and line height are what keep the panel readable at 400% zoom. **Enumerated font
+    keywords** mapping to stacks that resolve on macOS and Windows with no download, because a
+    free-text family name ships a Times fallback to everyone except the person who typed it.
+    **CORS and freshness come from the distribution, not the object**, since a console upload sets
+    no metadata. The mount waits on the theme fetch under a 1.5s cap, so a themed install paints
+    themed on its first frame and a dead CDN costs the launcher that much and no more. The
+    accessibility conformance claim is scoped to the default colours, since the highlight is also a
+    text colour on light surfaces.
+
+17. **The settings editor is a static page plus one key-scoped write, and it is the entry point.**
+    The original position was no settings page at all - a second surface to authenticate, host and
+    maintain after the engagement ends. What shipped keeps most of that saving, because the runtime
+    contract never changed: the widget still reads a `theme.json` from a bucket, so deleting the
+    editor would leave theming working. The console round trip was tested and it was the problem -
+    the account holds around nineteen buckets, the demo-site bucket sits next to the widget one,
+    and an upload into the wrong one succeeds silently and changes nothing. So there is **one entry
+    point, not four**: the download, the "Choose defaults" refill, the account controls and the
+    link to the guide live in a settings dialog inside the editor, and two earlier outputs pointing
+    at the guide and the download were deleted, because three routes into one workflow is two more
+    things to leave stale. The console deep link survives as the fallback for anyone not signed in.
+    **Save is gated by its own Cognito pool** - managed login hosts every password flow, the page
+    only redirects (authorization code + PKCE, no implicit grant), and the save Lambda's IAM
+    reaches exactly one object. It revalidates against the widget's rules rather than trusting the
+    page, because "the editor would never send that" is not a runtime guarantee for a file served
+    to every visitor. **The account lifecycle is one CLI command total**; everything after it is
+    self-service. No user in CloudFormation - every `AWS::Cognito::UserPoolUser` property is
+    replacement-on-update, so a template-owned user could not change email without wiping the
+    librarian's password. The page ships deploy-stamped like the demo page, so the committed file
+    carries no absolute URL, and its duplicated copies of the widget's validation rules and the
+    defaults file are pinned by the contract suite.
+
+---
 
 ---
 
 ## Verified (2026-07)
 
-- **Bedrock Managed KB:** managed chunk/embed/store; S3 data source; citations via `x-amz-bedrock-kb-source-uri`.
-- **S3 Vectors:** `CfnVectorBucket` + `CfnIndex`; KB `StorageConfiguration` type `S3_VECTORS` is a `oneOf` referenced by `IndexArn` alone (adding `IndexName`/`VectorBucketArn` is rejected at validation). 1024-dim, cosine, `float32`; `non_filterable_metadata_keys` set at index creation for the Bedrock-internal keys, or ingestion fails on the filterable-metadata limit. Semantic search only.
-- **Agentic Converse tool-use:** request carries `toolConfig` (`toolSpec` = name/description/`inputSchema.json`); the model returns `stopReason: tool_use` with a `toolUse` block; reply with a user message carrying a `toolResult`; loop until `end_turn`. `toolChoice` auto.
-- **Bedrock Guardrails:** the input screen runs via the standalone `ApplyGuardrail` API (source=INPUT) and needs `bedrock:ApplyGuardrail` alongside `InvokeModel`. Verified but deliberately NOT used: the output backstop via `guardrailConfig` on Converse (blocked -> `stopReason: guardrail_intervened`) and the PII/sensitive-information policy - both removed, see decision 6. Contextual grounding not supported for chatbot use.
-- **Bedrock native RAG eval (BYOI):** LLM-as-judge. `create_evaluation_job` with `precomputedRagSourceConfig`; retrieve-only metrics ContextCoverage/ContextRelevance; R&G metrics Correctness/Completeness/Faithfulness/Helpfulness/Harmfulness + citation metrics. Uses `referenceResponses`.
-- **CloudFront + S3 (CDK):** OAC via `S3BucketOrigin.with_origin_access_control` (auto-creates the OAC + bucket policy). Bucket needs bucket-owner-enforced ownership. Slow to create/destroy (~15-30 min).
-- **Scraper:** `httpx` + `trafilatura` for page markdown; `extract_database_catalog` parses the databases.php HTML table by link anchor (name = anchor text, description = the rest of the cell), which stays reliable even where the page has no name/description delimiter. **Output stability (2026-07-29):** all 19 seed URLs scraped twice back to back produced byte-identical markdown; the only field that moved anywhere was the sidecar's `scrape_timestamp`, which is why the content fingerprint covers the body + `source_url` + `title` and excludes it. Nothing volatile lives in the document body. **Hours source (2026-07-29):** `about-the-library.php` is the library's single authoritative hours page (semester hours, semester date ranges, holiday closures). `libraryservices.php` claims "current day's hours are listed on the library homepage", but the homepage carries no hours in its HTML at all - every hours reference on it is a link to `about-the-library.php#hours` - so no additional page needs seeding to answer hours questions.
-- **SNS email subscription (feedback):** `sns.Topic` + `sns_subs.EmailSubscription` synthesize `AWS::SNS::Topic` + a standalone `AWS::SNS::Subscription` with `Protocol: email` (verified in `aws-cdk-lib==2.260.0`); `enforce_ssl=True` adds a `AWS::SNS::TopicPolicy` denying non-TLS publishes. CloudFormation creates the subscription in `PendingConfirmation` and SNS mails the recipient a confirmation link - until it is clicked, `Publish` succeeds and nothing is delivered. That one-time click is the whole reason this is cheaper to hand off than SES. SES status on the deploy account, checked 2026-07-29 with `sesv2 get-account` / `list-email-identities`: sandbox (`ProductionAccessEnabled: false`), 200 msg/day, 1 msg/sec, no verified identities.
-- **Primo discovery API (live catalog tools):** verified against the public Ex Libris endpoint - `primaws/rest/pub/pnxs` search (`q=any,contains,...`; `scope=MyInstitution`/`tab=LibraryCatalog` for the general catalog, `scope=CourseReserves` for reserves) plus a per-record `/L/{recordid}?getDelivery=true` call for availability. No auth for discovery. `info.total` is the not-held / not-on-reserve signal; relevance is query-relative (not an absolute threshold). Fields are `$$`-encoded (creator; `crsinfo` carries course-code linkage, and a reserve record can serve multiple courses). Availability is a holding-level rollup ("catalog shows available"), not item-level truth - real-time due dates/copy counts would need the authenticated Alma API.
+- **Bedrock Managed KB:** managed chunk/embed/store; S3 data source; citations via
+  `x-amz-bedrock-kb-source-uri`.
+- **S3 Vectors:** the KB `StorageConfiguration` type `S3_VECTORS` is a `oneOf` referenced by
+  `IndexArn` alone - adding `IndexName`/`VectorBucketArn` is rejected at validation.
+  `non_filterable_metadata_keys` must be set at index creation for the Bedrock-internal keys, or
+  ingestion fails on the filterable-metadata limit. Semantic search only.
+- **Agentic Converse tool-use:** the request carries `toolConfig`; the model returns
+  `stopReason: tool_use` with a `toolUse` block; you reply with a user message carrying a
+  `toolResult` and loop until `end_turn`. `toolChoice` auto.
+- **Bedrock Guardrails:** the input screen runs via the standalone `ApplyGuardrail` API and needs
+  `bedrock:ApplyGuardrail` alongside `InvokeModel`. Verified but deliberately unused: the output
+  backstop via `guardrailConfig` on Converse, and the PII policy - both removed, see decision 6.
+  Contextual grounding is not supported for chatbot use.
+- **Bedrock native RAG eval (BYOI):** LLM-as-judge via `create_evaluation_job` with
+  `precomputedRagSourceConfig`. Retrieve-only metrics ContextCoverage/ContextRelevance; R&G
+  metrics Correctness/Completeness/Faithfulness/Helpfulness/Harmfulness plus citation metrics.
+- **CloudFront + S3 (CDK):** OAC via `S3BucketOrigin.with_origin_access_control`, which
+  auto-creates the OAC and bucket policy. The bucket needs bucket-owner-enforced ownership.
+  Slow to create and destroy, roughly 15-30 minutes each.
+- **Scraper:** `httpx` + `trafilatura` for page markdown; `extract_database_catalog` parses
+  databases.php by link anchor (name = anchor text, description = the rest of the cell), which
+  stays reliable even where the page has no delimiter. **Output stability (2026-07-29):** all 19
+  seed URLs scraped twice back to back produced byte-identical markdown, and the only field that
+  moved anywhere was the sidecar's `scrape_timestamp` - which is why the content fingerprint
+  covers the body, `source_url` and `title` and excludes it. **Hours source (2026-07-29):**
+  `about-the-library.php` is the library's single authoritative hours page. `libraryservices.php`
+  claims the current day's hours are on the homepage, but the homepage carries no hours in its
+  HTML at all - every hours reference on it links to `about-the-library.php#hours` - so no
+  additional page needs seeding to answer hours questions.
+- **SNS email subscription:** `sns.Topic` + `sns_subs.EmailSubscription` synthesize a topic plus a
+  standalone `AWS::SNS::Subscription` with `Protocol: email`, and `enforce_ssl=True` adds a topic
+  policy denying non-TLS publishes. CloudFormation creates the subscription in
+  `PendingConfirmation` and SNS mails the recipient a link - until it is clicked, `Publish`
+  succeeds and nothing is delivered. That one-time click is the whole reason this is cheaper to
+  hand off than SES, whose status on the deploy account was checked on 2026-07-29: sandbox, 200
+  msg/day, no verified identities.
+- **Primo discovery API:** verified against the public Ex Libris endpoint - `primaws/rest/pub/pnxs`
+  search plus a per-record `/L/{recordid}?getDelivery=true` call for availability. No auth for
+  discovery. `info.total` is the not-held signal; relevance is query-relative, not an absolute
+  threshold. Fields are `$$`-encoded, and a reserve record can serve multiple courses.
+  Availability is a holding-level rollup, not item-level truth - real-time due dates and copy
+  counts would need the authenticated Alma API.
