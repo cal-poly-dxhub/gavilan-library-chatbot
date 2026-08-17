@@ -56,7 +56,7 @@ AWS-native:
 - `eval/` — retrieval and answer-quality evaluation harness
 - `frontend/` — chat widget and the deployed demo page
 - `config.yaml` — model, chunking, retrieval, catalog, feedback, and guardrail settings
-- `docs/` — architecture and planning
+- `docs/` — the [install guide](docs/install.md), architecture, and planning
 
 ## Architecture
 
@@ -64,28 +64,16 @@ AWS-native:
 
 Full design: [`docs/architecture.md`](docs/architecture.md).
 
-## Prerequisites
+## Install
 
-- An AWS account, and credentials configured locally (`aws configure` or an SSO profile).
-- **Amazon Bedrock model access** granted in your target region for: Titan Text Embeddings v2 (embeddings), the Claude generation model set in `config.yaml`, and the scraper's enrichment model. Request access in the Bedrock console before deploying, or synth/deploy succeeds but runtime calls fail.
-- Python 3.11+ and Node.js (the CDK CLI is a Node package).
-- The AWS CDK CLI: `npm install -g aws-cdk` (pinned to `2.1129.0`).
-- The account/region bootstrapped for CDK: `cdk bootstrap` (once per account/region).
-- **Outbound internet from the query Lambda.** The two Primo catalog tools call the Ex Libris discovery API directly (not an AWS service, no IAM). The default deploy runs the Lambda outside a VPC, which has outbound access. If you place it in a VPC, it needs a NAT path or those two tools silently fail.
+**[`docs/install.md`](docs/install.md) is the end-to-end guide**: prerequisites, what to change
+before the first deploy, `cdk deploy`, which stack outputs to copy, pasting the embed tag onto
+your site, and handing the settings page to a librarian. It also names the values that are still
+Gavilan-specific and the failure modes that deploy cleanly and break quietly. Read it before you
+deploy.
 
-## Configure
-
-All changeable settings live in `config.yaml` at the repo root (the CDK app reads it at synth). Before deploying, review:
-
-- `data_source.web_crawler.seed_urls` / `scraper.seed_urls` — the library pages to ingest. The defaults point at the Gavilan library site; swap in your own.
-- `cors.allow_origins` — the browser origins allowed to call `/query`. Set this to the site that will host the widget (a wildcard is rejected at synth). Drop the `localhost` dev entry before launch.
-- `generation.model_id`, `catalog.*`, `primo.*`, `guardrail.*` — model IDs and tuning knobs, documented inline.
-
-The eval harness has its own separate config; see [`eval/README.md`](eval/README.md).
-
-## Deploy
-
-All infra commands run from `infra/` with the virtualenv active.
+The short version, once you have credentials, Bedrock model access, Node.js, the CDK CLI pinned
+to `2.1129.0`, and a bootstrapped account/region:
 
 ```bash
 cd infra
@@ -99,6 +87,8 @@ cdk deploy     # needs AWS credentials + a bootstrapped account
 ```
 
 `cdk deploy` provisions everything (KB, S3 Vectors store, scraper, catalog bucket, query Lambda, HTTP API, the guardrail, the CloudFront-fronted widget, and the demo site) and outputs a paste-ready embed tag, the CloudFront domain, the `/query` URL, and the demo site URL. CloudFront is slow to create and destroy (~15-30 min each), so the first deploy takes a while. Tear down with `cdk destroy`.
+
+All changeable settings live in `config.yaml` at the repo root (the CDK app reads it at synth). The eval harness has its own separate config; see [`eval/README.md`](eval/README.md).
 
 ## Demo site
 
