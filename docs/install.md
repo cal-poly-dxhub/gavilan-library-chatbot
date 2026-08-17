@@ -35,6 +35,9 @@ cdk deploy
 
 ### `WidgetEmbedTag`
 
+To quickly test: The deploy automatically creates a testing webpage 'https://gavbot-demo.calpoly.io/' with the live widget 
+auto-embedded. Click the link to confirm creation without embedding first.
+
 *Puts the bot on your site.*
 
 Paste it verbatim into your page, just before `</body>`. It is one `<script>` tag with a
