@@ -8,14 +8,20 @@ generated artifact - regenerate it after editing this file:
 Requires Graphviz (`brew install graphviz`) and the `diagrams` library (`pip install
 diagrams`).
 
+This draws the two paths that carry a student's question: ingestion and query, plus widget
+delivery. The theme-save path, the feedback path and the demo site are real parts of the stack
+and are deliberately not drawn - see docs/architecture.md for those.
+
 Every node/edge below reflects the ACTUAL code (infra/infra/infra_stack.py, config.yaml,
 app/handler.py, scraper/):
 
   - Ingestion: a scraper Lambda fetches the curated library seed URLs, extracts clean
     markdown, uploads it to the KB source S3 bucket, and triggers a KB ingestion job. In the
     same run it regenerates the database catalog from databases.php (HTML parse + a Sonnet
-    enrichment call) and writes it to a dedicated catalog S3 bucket. Runs on a weekly
-    EventBridge schedule and on the one-click deploy Trigger.
+    enrichment call) and writes it to a dedicated catalog S3 bucket. Runs on one EventBridge
+    rule per freshness tier - `fast` daily, `full` every five days - and on the one-click
+    deploy Trigger. Every downstream step is change-gated: an unchanged page uploads nothing,
+    an unchanged bucket starts no ingestion job, and unchanged database rows call no model.
   - Knowledge Base: CfnKnowledgeBase VECTOR, embedding amazon.titan-embed-text-v2:0 (1024
     dims); FIXED_SIZE chunking on the S3 data source.
   - Vector store: Amazon S3 Vectors (CfnVectorBucket + CfnIndex, cosine, float32). The KB
@@ -70,7 +76,7 @@ with Diagram(
     # query hot path - the query Lambda is no longer fully AWS-internal.
     primo_api = InternetAlt1("Primo / Ex Libris\nDiscovery API\n(external, non-AWS)")
 
-    with Cluster("Ingestion  (weekly schedule + on deploy)"):
+    with Cluster("Ingestion  (tiered schedule + on deploy)"):
         scraper = Lambda("Scraper Lambda\n(fetch + extract;\nregenerate catalog)")
         source_bucket = S3("KB source bucket\n(markdown)")
         catalog_bucket = S3("Catalog bucket\n(database_catalog.json)")

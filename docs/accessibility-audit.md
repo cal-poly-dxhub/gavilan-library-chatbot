@@ -8,6 +8,11 @@ E205.4). Level A and AA criteria are in scope; AAA items are marked as such and 
 **Status:** audited, then remediated in the same branch - see
 [Remediation](#remediation) for what was fixed, what was deferred, and the re-measured numbers.
 The findings below are left exactly as first written, as the dated record of what was found.
+
+**Line references are as of `6c07630` and do not resolve against the current file.** `widget.js`
+was 1,429 lines then and has more than doubled since (theming, the bilingual chrome). Read them
+as pointers into that commit, or search for the symbol instead. The deferred items and the
+demo-page finding were re-checked against the current file on 2026-08-17 and all still stand.
 **Result:** 22 findings - 18 in the widget, 4 in the demo page. No blockers: 4 serious, 7 moderate,
 11 minor. All text contrast already passes; the real gaps are screen-reader semantics and focus
 containment.
@@ -76,7 +81,7 @@ to the widget). All five failing success criteria are addressed.
 | [F5](#f5) | 1.4.11 | **fixed** | Two-tone ring, not a flat colour: `outline: 3px solid #1a1d21; outline-offset: 2px` plus `box-shadow: 0 0 0 2px #ffffff` filling the offset gap. Per-background numbers below. |
 | [F6](#f6) | 1.4.11 | **partly fixed** | The three that matter now clear 3:1 with one token, `--line: #7d8894`: typing dots **3.25:1** on the bot bubble (was 2.27:1), composer border **3.61:1** on white (was 1.57:1), suggestion chip border **3.48:1** on the thread and 3.61:1 on its own fill (was 1.31:1). The four decorative rules (table cell borders, sources rule, panel border) are deliberately unchanged - see the deferred list. |
 | [F7](#f7) | none | **fixed** | Selector deepened to `.msg--bot .bubble.bubble--error` (0,2,1 beats 0,2,0). It now renders `#fdecea` / `#8a1c12` at **8.14:1**, and `identicalToNormalBubble` is `false` where it used to be byte-identical. |
-| [F8](#f8) | 3.1.2 | **partly fixed** | `root.lang = "en"`, so the widget's own chrome declares its language instead of inheriting the host page's (1 `lang` attribute inside the shadow root, was 0). The ANSWERS are still unmarked - that needs a language field on the `/query` response, which is a contract change and belongs to the Spanish work. |
+| [F8](#f8) | 3.1.2 | **partly fixed** | The widget's own chrome declares its language instead of inheriting the host page's (1 `lang` attribute inside the shadow root, was 0). Superseded since by the bilingual work, which stamps `lang` on every message wrapper - but with the widget's *selected* language, not a language the backend reports. A student who leaves the UI in English and types Spanish still gets a Spanish answer inside an `en` subtree. Closing that needs a language field on the `/query` response. |
 | [F9](#f9) | 1.3.1 | **fixed** | Markdown headings emit real `h3`-`h6` (`#` -> h3, offset by two because the host page owns h1/h2, clamped at h6). Verified `## Fall hours` -> `H4`, and `.md-heading` now pins `font-size: 1em` so a real h5/h6 does not render smaller than body text: measured 15px / weight 700, identical to the old `<p>`. |
 | [F10](#f10) | 1.3.1 | **fixed** | `scope="col"` on header cells: `["col","col"]` where it was `[null,null]`. Data cells get none. |
 | [F11](#f11) | none | deferred | See below. |
@@ -135,9 +140,10 @@ still looks like a tint.
 
 ### Test coverage
 
-`frontend/test/widget.contract.test.js` grew from 65 to 80 tests, one per behaviour changed above,
-including the WCAG arithmetic recomputed from the colour values actually in the file - so a later
-"just lighten it a bit" edit fails in CI rather than in someone else's audit.
+`frontend/test/widget.contract.test.js` grew from 65 to 80 tests at the time of this pass, one
+per behaviour changed above, including the WCAG arithmetic recomputed from the colour values
+actually in the file - so a later "just lighten it a bit" edit fails in CI rather than in someone
+else's audit. The suite has kept growing since with the work that followed it.
 
 **One existing test was deliberately changed:** the test that pinned the composer's softened
 brand-tinted focus outline (`widget.contract.test.js:1136` at the time of the audit, flagged under
