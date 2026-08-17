@@ -35,10 +35,9 @@ cdk deploy
 
 ### `DemoSiteUrl`
 
-*The fastest way to confirm the deploy worked.*
+Quick testing of the widget.
 
-The deploy builds a sample library page with the widget already embedded, on its own
-CloudFront distribution, and prints the link here. Open it and ask it your opening hours.
+The deploy builds a sample library page with the widget already embedded and prints the link. Open it and ask it your opening hours.
 That is the end-to-end check that the knowledge base actually indexed your pages, and you
 get it before putting anything on your live site.
 
@@ -51,9 +50,6 @@ deletes the page, its bucket and its distribution, and leaves the widget on your
 untouched.
 
 ### `WidgetEmbedTag`
-
-To test before you embed anything: the deploy creates a webpage with the live widget already
-on it and prints the link as `DemoSiteUrl` above. Click that to confirm the bot works.
 
 *Puts the bot on your site.*
 
