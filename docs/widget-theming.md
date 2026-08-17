@@ -155,8 +155,9 @@ against `#ffffff` and `#f1f3f6` before it goes live.
   exist exactly once and only inside the panel, and an unsigned download is still
   `defaults/theme.json` byte for byte.
 - The editor's **Save** goes through `PUT /theme` on the stack's HTTP API, gated by the
-  permanent theme-admin Cognito pool (email sign-in, managed login hosts every password
-  flow) and served by `app/theme_handler.py`, whose IAM reaches exactly one object: the
+  theme-admin Cognito pool - the only sign-in in the product (email sign-in, managed login
+  hosts every password flow) - and served by `app/theme_handler.py`, whose IAM reaches
+  exactly one object: the
   root `theme.json`. Librarian accounts are created with the printed
   `ThemeAdminCreateUserCommand` output (one `admin-create-user`, invitation by email);
   everything after that - first password, resets, change password, change email - is

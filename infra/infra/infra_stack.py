@@ -135,15 +135,6 @@ _THEME_ADMIN_EMAIL_PLACEHOLDER = "PROJECT_EMAIL_HERE"
 _DEMO_PAGE_FILE = "demo-site.html"
 _DEMO_API_URL_TOKEN = "__API_URL__"
 _DEMO_WIDGET_SRC_TOKEN = "__WIDGET_SRC__"
-# The demo page's embed also carries the sign-in gate's Cognito ids (see the auth section).
-# Same mechanism as the two URLs above: placeholders here, CDK tokens resolved at deploy.
-_DEMO_USER_POOL_ID_TOKEN = "__USER_POOL_ID__"
-_DEMO_CLIENT_ID_TOKEN = "__CLIENT_ID__"
-# The one shared demo login, spelled into the two setup commands the stack prints so they are
-# copy-paste runnable rather than a template to fill in. It is a NAME, not a credential - the
-# password is chosen by the deployer at step 2 and never appears here or anywhere in the repo.
-# The pool signs in by plain username, so this needs no @ and carries no email attribute.
-_DEMO_AUTH_USERNAME = "gavtesting"
 # The demo page's cost meter/estimator reads its rates and measured constants from
 # config.yaml's cost_model block, stamped in here as a JSON literal. Unlike the two URLs
 # above this is a SYNTH-time value (no CDK token), but it goes through the same placeholder
@@ -1160,90 +1151,14 @@ class GavilanChatbotStack(Stack):
         # The Lambda queries the KB at runtime, so it must not exist before the KB.
         query_lambda.node.add_dependency(knowledge_base)
 
-        # --- Sign-in gate for /query: Cognito user pool + app client ------------------
-        #
-        # TEMPORARY, AND IT COMES OFF AT GO-LIVE. The bot is not on gavilan.edu yet, so the only
-        # thing driving /query is a demo link that anyone with the URL can point at billable
-        # Bedrock spend. Throttling caps the rate, not the bill, and CORS is browser-enforced
-        # only - neither is an answer to "a stranger found the link".
-        #
-        # Deliberately NOT behind a config flag. A gate you can turn off from a YAML file is a
-        # gate that gets left off, and there is no environment here to fork: one stack, one demo
-        # URL, one shared account. Removing it at go-live is a code deletion, which is visible in
-        # review, rather than a value change nobody sees.
-        #
-        # The pool holds ONE shared account, created by hand after deploy (see the
-        # DemoAuthSetupCommands output). No credentials in the repo, none in CDK, none in
-        # CloudFormation parameters - a password in a template is a password in the console, in
-        # the changeset, and in the stack events.
-        demo_auth_pool = cognito.UserPool(
-            self,
-            "DemoAuthUserPool",
-            user_pool_name="gavilan-library-demo-access",
-            # Nobody signs themselves up: the captain creates the one account with the CLI.
-            self_sign_up_enabled=False,
-            # PLAIN USERNAME. `username=True` alone emits neither UsernameAttributes nor
-            # AliasAttributes (verified against aws-cdk-lib 2.260.0), which is what lets
-            # `admin-create-user --username gavtesting` succeed: an email-only pool would reject
-            # a name that is not an address, and would need an email attribute alongside it.
-            # This is a shared demo login handed over in a sentence, not a person's account, so
-            # a fake address is one more thing to explain and get wrong.
-            #
-            # SIGN-IN OPTIONS CANNOT BE CHANGED AFTER THE POOL IS CREATED. Switching this later
-            # replaces the pool, which changes the pool id the widget and the demo page are
-            # built with - so it is settled here, before the first deploy, or not cheaply at all.
-            sign_in_aliases=cognito.SignInAliases(username=True),
-            # No self-service recovery, deliberately: there is no verified email or phone on this
-            # account to send a code to, and nobody but the deployer should be able to move its
-            # password. NONE synthesizes RecoveryMechanisms `admin_only` - the same CLI path that
-            # created the account is the only way to reset it.
-            account_recovery=cognito.AccountRecovery.NONE,
-            password_policy=cognito.PasswordPolicy(
-                min_length=12,
-                require_lowercase=True,
-                require_uppercase=True,
-                require_digits=True,
-                require_symbols=True,
-            ),
-            # One-click uninstall: the whole gate disappears with `cdk destroy`, and with the
-            # code deletion at go-live.
-            removal_policy=RemovalPolicy.DESTROY,
-        )
-
-        # Public client (no secret): the widget is JavaScript in a browser, so a client secret
-        # would be readable by anyone who views source - it would be theatre, and Cognito refuses
-        # the unsigned browser call anyway unless the client is public.
-        #
-        # USER_PASSWORD_AUTH, not SRP: the widget does one unsigned fetch to cognito-idp with no
-        # SDK and no build step. SRP needs big-integer crypto that no dependency-free widget is
-        # going to carry. The tradeoff is that the password crosses the wire (inside TLS) instead
-        # of never leaving the browser; for a shared demo account behind a link, that is the right
-        # trade. Do not read this as a pattern for real student accounts.
-        demo_auth_client = demo_auth_pool.add_client(
-            "DemoAuthClient",
-            user_pool_client_name="gavilan-library-demo-widget",
-            generate_secret=False,
-            auth_flows=cognito.AuthFlow(user_password=True),
-            # One day, matching "one sign-in covers the session". This is also Cognito's maximum
-            # for an access token. The widget keeps the token in a variable and nothing else, so
-            # a reload signs in again regardless of what the token says.
-            access_token_validity=Duration.days(1),
-            # The widget never uses the refresh token it is handed. Pinning refresh validity to
-            # the access token's lifetime means the copy it throws away cannot outlive the
-            # session by the 30-day default.
-            refresh_token_validity=Duration.days(1),
-            id_token_validity=Duration.days(1),
-            prevent_user_existence_errors=True,
-            disable_o_auth=True,
-        )
-
         # --- Theme-editor sign-in: its own Cognito pool + managed login ----------------
         #
-        # PERMANENT, unlike the demo gate above: it survives go-live, because it gates a
-        # WRITE (the settings editor's Save rewrites the live theme.json) rather than demo
-        # spend. Its own pool on purpose - the demo pool is a shared throwaway login that
-        # is deleted at go-live, holds a plain-username account, and must not be touched
-        # (its sign-in options are immutable and its pool id is baked into every embed).
+        # THE ONE SIGN-IN LEFT IN THE PRODUCT, and the only Cognito pool in the stack.
+        # It gates a WRITE (the settings editor's Save rewrites the live theme.json), not
+        # reads and not spend: POST /query is public, and stage throttling plus the input
+        # guardrail are what hold that side. A short-lived demo gate used to sit on /query
+        # behind a second pool; it was deleted at go-live rather than switched off, so
+        # nothing here has a demo counterpart to be confused with.
         #
         # This pool holds named librarian accounts and the whole lifecycle is self-service
         # from the hosted editor page: sign-in, the forced first-password change and
@@ -1261,10 +1176,9 @@ class GavilanChatbotStack(Stack):
             user_pool_name="gavilan-library-theme-admin",
             # Accounts exist only through the printed admin-create-user command.
             self_sign_up_enabled=False,
-            # EMAIL is the sign-in attribute: these are real, personal addresses (unlike
-            # the demo pool's word-of-mouth username), and the address doubles as the
-            # invitation and recovery channel. Sign-in options are immutable after pool
-            # creation, same as the demo pool - settled here or not cheaply at all.
+            # EMAIL is the sign-in attribute: these are real, personal addresses, and the
+            # address doubles as the invitation and recovery channel. Sign-in options are
+            # immutable after pool creation - settled here or not cheaply at all.
             sign_in_aliases=cognito.SignInAliases(email=True),
             # Cognito sends a verification code when an email needs verifying; required
             # alongside keep_original below.
@@ -1394,12 +1308,12 @@ class GavilanChatbotStack(Stack):
         # Methods cover the real routes: POST (/query), GET (/warm), and OPTIONS (the preflight
         # the gateway answers itself).
         #
-        # Authorization is in allow_headers because /query is gated (below). The widget sets that
-        # header explicitly from JavaScript, which makes every /query a preflighted request: leave
-        # it out and the browser fails at the OPTIONS, before the POST is ever sent, and the
-        # symptom is a CORS error rather than a 401. AllowCredentials still stays OFF - that flag
-        # is about cookies and browser-managed HTTP auth, neither of which is in play for a
-        # header this code sets by hand.
+        # Authorization is in allow_headers for PUT /theme: the settings editor sets that header
+        # from JavaScript, which makes the save a preflighted request - leave it out and the
+        # browser fails at the OPTIONS, before the PUT is ever sent, and the symptom is a CORS
+        # error rather than a 401. AllowCredentials stays OFF - that flag is about cookies and
+        # browser-managed HTTP auth, neither of which is in play for a header that page sets by
+        # hand. The widget sends no Authorization header at all: /query is public.
         http_api = apigwv2.HttpApi(
             self,
             "ChatbotHttpApi",
@@ -1428,41 +1342,21 @@ class GavilanChatbotStack(Stack):
         query_integration = apigwv2_integrations.HttpLambdaIntegration(
             "QueryIntegration", query_lambda
         )
-        # Native JWT authorizer - no authorizer Lambda, so nothing to cold-start, nothing to pay
-        # for, and no code of ours in the auth decision. API Gateway fetches the pool's JWKS and
-        # validates signature, issuer, audience and expiry itself.
-        #
-        # AUDIENCE IS THE APP CLIENT ID, and that works because of a documented quirk: a Cognito
-        # ACCESS token carries no `aud` claim, it carries `client_id`. API Gateway "validates
-        # client_id only if aud is not present" (Control access to HTTP APIs with JWT
-        # authorizers), so the access token the widget sends validates against this exact entry.
-        # An ID token would match on `aud` instead; the widget deliberately sends the access
-        # token and never the ID token, which carries the account's attributes for no benefit.
-        demo_auth_authorizer = apigwv2_authorizers.HttpJwtAuthorizer(
-            "DemoAuthAuthorizer",
-            f"https://cognito-idp.{self.region}.amazonaws.com/{demo_auth_pool.user_pool_id}",
-            jwt_audience=[demo_auth_client.user_pool_client_id],
-            authorizer_name="gavilan-library-demo-access",
-            identity_source=["$request.header.Authorization"],
-        )
-        # /query ONLY. This is the one billable route: every Bedrock call, every guardrail unit
-        # and every Primo lookup hangs off it.
+        # PUBLIC. This is the one billable route - every Bedrock call, every guardrail unit and
+        # every Primo lookup hangs off it - and it takes no authorizer, because it is embedded on
+        # a public library page where every visitor is anonymous by definition. The controls that
+        # do the work are the stage throttling below (the actual cost cap, and why WAF was
+        # excluded), the PROMPT_ATTACK input screen, and the CORS allowlist. A pre-launch demo
+        # gate once sat here, only because the demo URL was the sole thing driving spend before
+        # gavilan.edu carried the widget; it was deleted rather than made switchable.
         http_api.add_routes(
             path="/query",
             methods=[apigwv2.HttpMethod.POST],
             integration=query_integration,
-            authorizer=demo_auth_authorizer,
         )
         # Lightweight pre-warm route: the widget pings GET /warm on load to warm the query
         # Lambda (retrieve-only) before the student's first query. (S3 Vectors itself has no
         # cluster to wake; this just avoids a cold Lambda on the first real query.)
-        #
-        # DELIBERATELY UNGATED. It fires on page load, before anyone could have signed in, so
-        # gating it would only guarantee a cold first query. What it costs is one KB Retrieve -
-        # no generation call, no guardrail units, none of the ~10,700 input tokens a /query
-        # carries - so it is not the spend this gate exists to stop. Same for /feedback below:
-        # an SNS publish is not Bedrock spend, and putting a report path behind a shared
-        # password would just lose reports.
         http_api.add_routes(
             path="/warm",
             methods=[apigwv2.HttpMethod.GET],
@@ -1480,12 +1374,20 @@ class GavilanChatbotStack(Stack):
 
         # --- Theme save path: PUT /theme -> its own Lambda -> the one S3 object --------
         #
-        # The settings editor's Save. Same native-JWT-authorizer pattern as the demo gate,
-        # against the theme-admin pool: API Gateway validates the librarian's access token
-        # (audience = the app client id, because a Cognito ACCESS token carries client_id
-        # rather than aud) before the Lambda ever runs. Its own small function, like the
-        # feedback path: this code needs PutObject on one key plus one invalidation, and
-        # nothing the query handler carries.
+        # The settings editor's Save, and the only gated route on this API. A NATIVE JWT
+        # authorizer - no authorizer Lambda, so nothing to cold-start, nothing to pay for and
+        # no code of ours in the auth decision: API Gateway fetches the pool's JWKS and
+        # validates signature, issuer, audience and expiry itself before the Lambda ever runs.
+        #
+        # AUDIENCE IS THE APP CLIENT ID, and that works because of a documented quirk: a
+        # Cognito ACCESS token carries no `aud` claim, it carries `client_id`, and API Gateway
+        # "validates client_id only if aud is not present" (Control access to HTTP APIs with
+        # JWT authorizers). An ID token would match on `aud` instead; the editor deliberately
+        # sends the access token, which is also the one the user-scoped cognito-idp calls in
+        # its account panel need.
+        #
+        # Its own small function, like the feedback path: this code needs PutObject on one key
+        # plus one invalidation, and nothing the query handler carries.
         theme_admin_authorizer = apigwv2_authorizers.HttpJwtAuthorizer(
             "ThemeAdminAuthorizer",
             f"https://cognito-idp.{self.region}.amazonaws.com/{theme_admin_pool.user_pool_id}",
@@ -1829,8 +1731,6 @@ class GavilanChatbotStack(Stack):
                     _DEMO_API_URL_TOKEN,
                     _DEMO_WIDGET_SRC_TOKEN,
                     _DEMO_COST_MODEL_TOKEN,
-                    _DEMO_USER_POOL_ID_TOKEN,
-                    _DEMO_CLIENT_ID_TOKEN,
                 )
                 if token not in demo_html
             ]
@@ -1852,13 +1752,8 @@ class GavilanChatbotStack(Stack):
                 _DEMO_COST_MODEL_TOKEN,
                 json.dumps(config.get("cost_model", {}), sort_keys=True),
             )
-            demo_html = (
-                demo_html.replace(_DEMO_WIDGET_SRC_TOKEN, widget_src)
-                .replace(_DEMO_API_URL_TOKEN, query_url)
-                # The demo page is the thing the gate exists for, so its embed carries the
-                # sign-in ids. Discovered, never hardcoded - same reason as the two URLs.
-                .replace(_DEMO_USER_POOL_ID_TOKEN, demo_auth_pool.user_pool_id)
-                .replace(_DEMO_CLIENT_ID_TOKEN, demo_auth_client.user_pool_client_id)
+            demo_html = demo_html.replace(_DEMO_WIDGET_SRC_TOKEN, widget_src).replace(
+                _DEMO_API_URL_TOKEN, query_url
             )
             # Its own bucket, so the default prune (`aws s3 sync --delete`) is scoped to the demo
             # and can never reach widget.js. distribution_paths invalidates the page (and only
@@ -1874,18 +1769,10 @@ class GavilanChatbotStack(Stack):
 
         # --- Outputs: ready-to-paste embed tag + raw domain / API URL ------------------
         #
-        # The embed carries the sign-in ids because /query is gated: a tag without them renders a
-        # widget that cannot obtain a token and gets a 401 on every question. Both ids are public
-        # by design (they identify the pool, they do not open it) - the password is the secret,
-        # and it lives only in the captain's head and Cognito.
-        #
-        # THESE THREE ATTRIBUTES COME OFF TOGETHER at go-live: delete the auth section above,
-        # drop data-user-pool-id/data-client-id here and in frontend/demo-site.html.
-        embed_tag = (
-            f'<script src="{widget_src}" data-api-url="{query_url}"'
-            f' data-user-pool-id="{demo_auth_pool.user_pool_id}"'
-            f' data-client-id="{demo_auth_client.user_pool_client_id}" defer></script>'
-        )
+        # ONE attribute, and it is the endpoint. Everything else the widget can do is opt-in by a
+        # further data-* attribute the library's tag deliberately omits (data-usage-events, which
+        # only the demo page carries), so this is the whole production embed.
+        embed_tag = f'<script src="{widget_src}" data-api-url="{query_url}" defer></script>'
 
         CfnOutput(
             self,
@@ -1973,56 +1860,6 @@ class GavilanChatbotStack(Stack):
                 "--temporary-password keeps a password out of shell history. Run again "
                 "with another address for another librarian, or add --message-action "
                 "RESEND to refresh an expired invitation."
-            ),
-        )
-        # --- Sign-in gate: the ids, and the two commands that create the one account ---
-        #
-        # NEEDS THE DEPLOYER'S OWN AWS CREDENTIALS. CDK cannot do this step: creating the user
-        # here would mean a password in the template, and a password in a template is a password
-        # in the console, the changeset and the stack events. So the stack prints the commands
-        # and a human runs them once.
-        CfnOutput(
-            self,
-            "DemoAuthUserPoolId",
-            value=demo_auth_pool.user_pool_id,
-            description="Cognito user pool gating POST /query (temporary demo access).",
-        )
-        CfnOutput(
-            self,
-            "DemoAuthClientId",
-            value=demo_auth_client.user_pool_client_id,
-            description="Cognito app client id the widget signs in with (public, no secret).",
-        )
-        CfnOutput(
-            self,
-            "DemoAuthCreateUserCommand",
-            value=(
-                "aws cognito-idp admin-create-user"
-                f" --region {self.region}"
-                f" --user-pool-id {demo_auth_pool.user_pool_id}"
-                f" --username {_DEMO_AUTH_USERNAME}"
-                " --message-action SUPPRESS"
-            ),
-            description=(
-                "Step 1 of 2, run once after deploy with your own AWS credentials. "
-                "The pool signs in by plain username, so no email attribute is needed and "
-                "the name can be anything. SUPPRESS skips the invite; step 2 sets the password."
-            ),
-        )
-        CfnOutput(
-            self,
-            "DemoAuthSetPasswordCommand",
-            value=(
-                "aws cognito-idp admin-set-user-password"
-                f" --region {self.region}"
-                f" --user-pool-id {demo_auth_pool.user_pool_id}"
-                f" --username {_DEMO_AUTH_USERNAME}"
-                " --password 'CHOOSE-A-PASSWORD' --permanent"
-            ),
-            description=(
-                "Step 2 of 2. --permanent is REQUIRED: without it the account stays in "
-                "FORCE_CHANGE_PASSWORD and sign-in returns a NEW_PASSWORD_REQUIRED challenge "
-                "instead of a token, which the widget can only report as a failed sign-in."
             ),
         )
         CfnOutput(
