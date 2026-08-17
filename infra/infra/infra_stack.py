@@ -231,8 +231,9 @@ class GavilanChatbotStack(Stack):
         # Live Primo book/media catalog tool (search_book_catalog) behavioral knobs. Optional so a
         # config without a `primo` block still synths; the handler carries matching defaults.
         primo_cfg = config.get("primo", {})
-        # Curated library_links tool: a STATIC table bundled with the query Lambda (no S3, no
-        # scraper, no TTL), so its one knob is the bundled filename. Read once here and used for
+        # Curated link table: STATIC data bundled with the query Lambda (no S3, no scraper, no
+        # TTL) and injected into the Converse system payload - not a tool. Its one knob is the
+        # bundled filename, read once here and used for
         # BOTH the asset include and the handler env var, so a rename cannot leave the Lambda
         # bundling one file and reading another. Optional; the handler carries the same default.
         library_links_file = config.get("library_links", {}).get("data_file", "library_links.json")
@@ -670,13 +671,13 @@ class GavilanChatbotStack(Stack):
             )
 
         # One-click install: invoke the (existing) scraper ONCE during `cdk deploy` so the KB is
-        # populated the moment the stack comes up - no manual invoke, no waiting for the weekly
-        # schedule. Uses the stable aws-cdk-lib `triggers.Trigger` (a CDK-managed invoker), NOT a
+        # populated the moment the stack comes up - no manual invoke, no waiting for the next
+        # scheduled run. Uses the stable aws-cdk-lib `triggers.Trigger` (a CDK-managed invoker), NOT a
         # hand-rolled custom resource.
         #   - invocation_type=EVENT: fire-and-forget. The trigger succeeds once the function is
         #     invoked, REGARDLESS of the scrape's result - a flaky site, a partial-page failure, or
         #     the async ingestion never fails or blocks the deploy. (REQUEST_RESPONSE, the default,
-        #     would make the deploy wait on and fail with the scraper.) The weekly schedule retries,
+        #     would make the deploy wait on and fail with the scraper.) The tier schedules retry,
         #     so a one-time install hiccup is self-healing.
         #   - execute_after: run only after the scraper AND its targets exist - it writes to the
         #     source bucket and calls StartIngestionJob on the data source.

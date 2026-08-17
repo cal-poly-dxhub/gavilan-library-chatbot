@@ -16,7 +16,7 @@ RAG chatbot for Gavilan College Library. Answers operational student questions (
 - **Guardrails:** ONE Bedrock Guardrail, screening the INPUT for `PROMPT_ATTACK` and nothing else (see "Guardrail note")
 - **Config:** `config.yaml` at repo root; single source of truth for changeable knobs
 - **Frontend:** vanilla JS widget (Shadow DOM, dependency-free). Bilingual chrome (English + Español) from one string table, switched by a control in the panel header; an explicit choice is sent as `language` on the request
-- **Runtime theming:** the customer changes the highlight colour, the font family and the starter questions by uploading ONE `theme.json` to the widget bucket root - no redeploy, no code edit. Fetched at init, merged over built-in defaults, soft-failing per key. See "Widget theme file" below and `docs/widget-theming.md`
+- **Runtime theming:** the customer changes the highlight colour, the font family and the starter questions through ONE `theme.json` at the widget bucket root - no redeploy, no code edit. Fetched at init, merged over built-in defaults, soft-failing per key. A signed-in librarian edits it on the hosted settings editor and Save publishes it through `PUT /theme`; the S3-console upload is the fallback. See "Widget theme file" below and `docs/widget-theming.md`
 - **Demo site:** one static page (`frontend/demo-site.html`) on its OWN S3 + CloudFront, embedding the production widget from the production CDN. `cdk deploy` stamps the live API + widget URLs AND the `cost_model` block into it, and outputs `DemoSiteUrl`. Toggle with `demo_site.enabled` in config.yaml
 - **Cost visibility (demo only):** the demo page carries a session cost meter + a monthly estimator behind one control in the DEMO banner. It is fed by the widget's opt-in `data-usage-events` attribute (absent from the production embed) and the handler's opt-in `include_usage` flag. Rates + measured constants live in `config.yaml` under `cost_model`; re-measure with `eval/measure_usage.py`
 
@@ -59,7 +59,7 @@ Then (from `infra/`, venv active):
 - Deploy: `cdk deploy` (needs AWS creds; account pending)
 - Teardown: `cdk destroy` (removes the S3 Vectors bucket + index, the catalog bucket, and the KB source/widget buckets)
 
-Pinned: `aws-cdk-lib==2.260.0`, CDK CLI `2.1129.0`.
+`aws-cdk-lib==2.260.0` is pinned in `infra/requirements.txt`. The CDK CLI is not pinned anywhere in the repo; this was built against `2.1129.0`.
 
 ### Changing `chunking` in config.yaml
 
@@ -118,7 +118,7 @@ Amazon S3 Vectors (`s3vectors.CfnVectorBucket` + `CfnIndex`); the KB `StorageCon
 
 Response shape: `{ "answer": "<text>", "sources": [ {"uri": "<page url>", "excerpt": "<snippet>"} ] }`
 
-`sources` is deduplicated by uri; it accumulates from every `search_library_info` retrieval the model ran during the loop, plus one synthetic source per tool that returned a result: the library A-Z databases page for `database_catalog`, a per-query Primo discovery-search URL for each of `search_book_catalog` and `search_course_reserves`, The curated link table contributes NO sources: it reports which links exist, not which one the answer used. `_extract_source` prefers the public `source_url` (the scraper's per-document metadata sidecar) over the internal S3 URI; a source that resolves only to an `s3://` URI is omitted so no bucket path reaches the client. If the model answers without a tool call (e.g. a greeting), `sources` is `[]`.
+`sources` is deduplicated by uri; it accumulates from every `search_library_info` retrieval the model ran during the loop, plus one synthetic source per tool that returned a result: the library A-Z databases page for `database_catalog`, a per-query Primo discovery-search URL for each of `search_book_catalog` and `search_course_reserves`. The curated link table contributes NO sources: it reports which links exist, not which one the answer used. `_extract_source` prefers the public `source_url` (the scraper's per-document metadata sidecar) over the internal S3 URI; a source that resolves only to an `s3://` URI is omitted so no bucket path reaches the client. If the model answers without a tool call (e.g. a greeting), `sources` is `[]`.
 
 Optional reply language: a request may carry `language: "en"|"es"`. Present -> ONE extra Converse `system` block telling the model to write its whole reply in that language, so an explicit Español selection is honored even for a question typed in English. Absent or unrecognized -> no block at all, and the model keeps auto-detecting the language from the question (which it already does correctly). The code is ALLOWLISTED against `_LANGUAGES` and the prompt text is built from the handler's own table, never from the client's string - the field is client-supplied text heading for the system payload, so that is a security boundary, not tidiness. Nothing else is language-aware: retrieval, the four tools, and the KB are untouched (the KB is English and Spanish questions retrieve from it correctly - measured, see the Lessons entry).
 
@@ -133,169 +133,152 @@ Query flow (`run_agent`): the newest user turn is the current question; the trim
 At pickup the client deploys this stack into their OWN account, so the widget bucket and its
 distribution are theirs. Three things they will ask to change - the highlight colour, the font
 and the starter questions - are read at RUNTIME from `theme.json` at the widget bucket root.
-No redeploy, no settings page (a second surface to auth, host and maintain after handover), no
-hand-editing a shipped file. The customer guide is a HOSTED page, `theme-guide.html`, at the
-widget bucket root; the page is its own source of copy, edited in place.
-`docs/widget-theming.md` stays as the repo's developer guide.
+No redeploy, no hand-editing a shipped file. `docs/widget-theming.md` is the developer guide;
+the customer-facing copy lives in the shipped artefacts themselves.
+
+**The file**
 
 - **JSON, never JS.** A `.js` config is executable code on the library's page with the widget's
-  privileges. Every value is allowlisted: the colour matched against a hex pattern (it is
-  concatenated into a stylesheet, so that regex is a security boundary - anything carrying `;`
-  or `}` would let the file restyle or hide the widget), the font looked up in a table we own,
-  the questions rendered as text nodes.
-- **Soft-fails per key**; malformed JSON (or the 404 every install serves until the first
-  upload) falls back entirely. An unthemed install emits ZERO theme CSS, so its rendering is
-  provably byte-identical to the pre-theme widget.
-- **The customer's file must survive `cdk deploy`.** `BucketDeployment` prunes with `aws s3
-  sync --delete` and the source will never contain a file the customer wrote, so the widget
-  deployment carries `exclude=["theme.json", "defaults/*"]`. That is the **BucketDeployment**
-  prop (it scopes the sync command), NOT the identically named argument on `Source.asset`
-  (which only filters what is packed into the asset and protects nothing). Both are in that
-  one call. **TWO patterns, and the second is not redundant:** `--exclude` fnmatches against
-  the FULL path with the sync root prepended, so `theme.json` covers the root object and
-  nothing under a prefix - with only that entry, `defaults/theme.json` is deleted on every
-  deploy (measured against aws-cli 2.35.11, not assumed). Pinned by
-  `test_the_theme_file_is_outside_the_prune_scope`.
-- **TWO theming outputs, and the editor is the entry point.** `WidgetThemeEditor` is the
-  hosted settings-editor page and carries the "Start here" framing; its Description says
-  that Save publishes straight to the live widget, because an editor that reads like it
-  only produces a file sends the customer into the console for a step Save already did.
-  `WidgetThemeUpload` is the `https://` S3-console deep link to the widget bucket's object
-  list, kept because the guide's console procedure names it BY OUTPUT NAME (deleting it
-  would break the page it is quoted on) and because it is the only route for anyone not
-  signed in. Both are `https://` so the CloudFormation Outputs tab renders them as links:
-  the bucket name is generated per install, the account holds ~19 buckets, and the
-  demo-site bucket sits next to the widget one (an upload into the wrong one succeeds
-  silently and changes nothing), so a name to match by eye is the failure mode being
-  designed out. Both carry a Description, because the Outputs tab is the only entry point
-  anyone has.
-  **`WidgetThemeGuide` and `WidgetThemeDownload` are DELETED - do not reintroduce them.**
-  Once Save wrote the live file and the editor's settings panel held both the same
-  download and the only link to the guide, those two rows were a second and third route
-  into one workflow, i.e. two more things to leave stale. Pinned from the other side by
-  `test_no_output_points_at_the_guide_or_the_defaults_download`, which fails on the VALUE
-  too, so re-adding either link under a different output name does not slip through.
-  A signed-in librarian never touches the console at all; the one CLI step anywhere is
-  creating their account.
-- **`defaults/theme.json` is the download** - a deployment-owned copy of the built-in
-  defaults, ALREADY named `theme.json` (hence the prefix: a second file of that name at the
-  root would BE the customer's), served `Content-Disposition: attachment` so a click saves it
-  rather than rendering JSON in a tab. Its `_readme` is an ARRAY of lines that documents
-  every key, every font keyword and both caps in the file itself, with NO URL: once
-  downloaded it travels alone, its reader has no GitHub access, and JSON takes no comments,
-  so the file must explain itself. The file is its own source of truth; the contract
-  suite pins its canonical form (byte equality against a two space serialisation), its
-  key order AND the self-documentation. It replaced `theme.example.json`; the repo must
-  never contain a root `frontend/theme.json`.
-- **`theme-guide.html` is the hosted guide**, one self-contained page at the widget bucket
-  root, and its own source of copy (edit the HTML directly). No scripts, no
-  external CSS or fonts, no absolute URLs; its links are RELATIVE
-  (`defaults/theme.json` and `theme-editor.html`), so it works on any distribution domain
-  with no deploy-time stamping. It rides the widget deployment as a SECOND source (the
-  prune keeps what its own sources contain, so the pinned exclude list is untouched) and
-  must never move under `defaults/`, whose deployment-wide attachment header would
-  download it instead of rendering it. It has NO stack output: its only route in the whole
-  product is the guide link in the editor's settings panel, and the page frames itself as
-  the manual version of the editor and links back to it twice. The contract suite pins all
-  of that, including that it names no deleted output.
-- **`theme-editor.html` is the hosted settings editor**, a second self-contained page at
-  the bucket root and the ONE theming page an output links (`WidgetThemeEditor`). A form with a
-  colour picker, font choices, question fields and a live widget miniature; it seeds from
-  the DEPLOYED root `theme.json` (falling back to `defaults/theme.json`, then built-ins)
-  so the customer edits their live theme, and its Download button builds a `theme.json`
-  in the repo's pinned serialisation, `_readme` included. It ships as the THIRD source of
-  the widget deployment (same prune argument, same never-under-`defaults/` rule) but via
-  `Source.data`, DEPLOY-STAMPED like the demo page: four placeholders
-  (`__THEME_SAVE_URL__`, `__THEME_AUTH_BASE__`, `__THEME_CLIENT_ID__`,
-  `__THEME_COGNITO_IDP__`) resolve to the save endpoint and sign-in config at deploy, a
-  missing one fails synth, and the committed file still carries no absolute URL. Scripts
-  are allowed on THIS page (unlike the guide) but no innerHTML and nothing persistent:
-  sessionStorage holds exactly ONE key (`gavtheme-oauth`, the in-flight PKCE handshake,
-  removed on return), tokens live in JS variables, and the refresh token is dropped
-  unread. It duplicates the widget's validation rules and the defaults file BY DESIGN,
-  and the contract suite pins every copy against widget.js and `defaults/theme.json` so
-  none can drift silently (the save Lambda's Python copy is pinned by
-  `test_theme_handler.py`).
-- **The main view is the fields, the preview and Save; everything else is one control
-  away.** Once Save wrote the live file the console upload became a fallback rather than
-  the workflow, so the page stopped teaching it: the download, a "Choose defaults" refill
-  and the account controls live in a settings panel (a native `<dialog>`, so Escape closes
-  it and focus returns to the control that opened it - the page adds the `focus()` call
-  anyway). Two rules the contract suite pins. The download MOVED and must never disappear:
-  an unsigned visitor has no other route to a `theme.json`, and its bytes are pinned
-  identical to `defaults/theme.json`. And "Choose defaults" refills from the page's ONE
-  embedded defaults block (`seedForm(builtinState)`) - a second hardcoded copy of the
-  shipped values would drift - leaving the save itself to the librarian.
-- **Save is gated by a Cognito pool** (`gavilan-library-theme-admin`) - the ONLY pool and
-  the only sign-in anywhere in the product, since it guards a write rather than a read.
-  Signed in, the editor's Save PUTs the built file to `PUT /theme` on the shared HTTP API,
-  behind its own native JWT authorizer (audience = the app CLIENT ID, because a Cognito
-  ACCESS token carries `client_id` and no `aud`, and API Gateway validates `client_id`
-  only when `aud` is absent - do not "fix" this to an ID token); a small dedicated Lambda
-  (`app/theme_handler.py`) revalidates
-  against the widget's rules (allowlisted keys, hex pattern, font keywords, 4/120 caps -
-  violations are a 400, not a soft drop), rewrites the file in the pinned serialisation,
-  writes the ONE object its IAM allows (`theme.json` at the widget bucket root) and
-  invalidates `/theme.json`. Unsigned, Save reads "Sign in to save" and the page is the
-  download-only editor; unstamped (repo copy), Save stays hidden entirely.
-- **The account lifecycle is self-service; one CLI command total.** The pool signs in by
-  EMAIL (immutable choice), self sign-up off, strong password policy, recovery by
-  verified email at priority 1, email changes verified before they apply
-  (`keep_original`), and a 90-day temporary-password validity instead of the 7-day
-  default. Sign-in, the forced first-password change and forgot-password are Cognito
-  MANAGED LOGIN's hosted pages (v2 + `CfnManagedLoginBranding`, domain prefix
-  `gavilan-theme-<account id>`; the editor page only redirects, authorization code +
-  PKCE - no implicit grant, tokens in URL fragments land in browser history). Change
-  password / change email run as user-scoped cognito-idp calls from the page's account
-  panel with the librarian's own access token (scope `aws.cognito.signin.user.admin`).
-  Accounts are created by the `ThemeAdminCreateUserCommand` output: `admin-create-user`
-  with `PROJECT_EMAIL_HERE` substituted twice (the email IS the `--username` value),
-  `--desired-delivery-mediums EMAIL` (the default is SMS - omit it and the invitation
-  never arrives), `Name=email_verified,Value=true` (what makes self-service reset work),
-  and NO temporary password (Cognito generates one; the invitation template must carry
-  BOTH `{username}` and `{####}` or nothing is delivered). Another librarian = same
-  command with another address; a stale invitation = same command plus
-  `--message-action RESEND`. No user in CloudFormation and no admin email in
-  config.yaml: every `AWS::Cognito::UserPoolUser` property is replacement-on-update, so
-  a template-owned user could not change email without wiping the librarian's password.
-- **`content_disposition` applies to a WHOLE `BucketDeployment`**, which is why the download
-  gets its own rather than riding along with `widget.js` - a `<script src>` that comes back as
-  a file download is a broken widget. That second deployment shares the widget bucket, which
-  is normally how `widget.js` gets deleted by accident (see the Lessons entry); it is safe on
-  exactly two properties, `prune=False` and `destination_key_prefix="defaults"`, plus the
-  matching exclude above. The stack NEVER writes the root `theme.json` - no seeding.
-- **Highlight colour ONLY.** No background or text knob: twelve colour values are not tokens,
-  and the divider, focus ring and halo were each measured against specific light surfaces to
-  clear 3:1. Text ON the highlight is DERIVED - black or white, whichever contrasts better -
-  and needs no validation: the worst case over the whole sRGB cube is the black/white crossover
-  at 4.58:1, above the 4.5:1 floor. Everything drawn on the header (washes, its own rings)
-  follows that derived ink rather than a hardcoded `#fff`, or a pale highlight gets an invisible
-  focus ring. The two-tone `--focus-ring`/`--focus-halo` pair is NOT themeable.
+  privileges. Every value is allowlisted: the colour against a hex pattern (it is concatenated
+  into a stylesheet, so that regex is a security boundary - anything carrying `;` or `}` would
+  let the file restyle or hide the widget), the font against a table we own, the questions
+  rendered as text nodes.
+- **Soft-fails per key.** Malformed JSON, or the 404 every install serves until the first save,
+  falls back entirely. An unthemed install emits ZERO theme CSS, so its rendering is provably
+  byte-identical to the pre-theme widget.
+- **Highlight colour ONLY.** No background or text knob: twelve colour values are not tokens, and
+  the divider, focus ring and halo were each measured against specific light surfaces to clear
+  3:1. Text ON the highlight is DERIVED - black or white, whichever contrasts better - and needs
+  no validation, since the worst case over the whole sRGB cube is the black/white crossover at
+  4.58:1. Everything drawn on the header follows that derived ink rather than a hardcoded `#fff`,
+  or a pale highlight gets an invisible focus ring. The two-tone `--focus-ring`/`--focus-halo`
+  pair is NOT themeable.
 - **Font: enumerated keywords, family only.** `system` (default) / `sans` / `serif` / `mono` /
   `inherit`. Never size, weight or line-height - those are wired to the panel's zoom/reflow
   clamps, so a font-size field turns a branding change into an accessibility regression. Every
   stack resolves on macOS AND Windows with no download and no `@font-face`, because a customer
-  typing a locally-installed family name would ship a Times fallback for everyone else and
-  never see it. Bitter belongs to the DEFAULT theme, so the Google Fonts fetch is conditional
-  on `fontFamily == "system"`.
+  typing a locally-installed family name would ship a Times fallback for everyone else and never
+  see it. Bitter belongs to the DEFAULT theme, so the Google Fonts fetch is conditional on
+  `fontFamily == "system"`.
 - **Starter questions: per-language, max four each, 120 chars.** Over-long entries are dropped,
   not truncated. Spanish is optional and falls back to the customer's ENGLISH list, not to our
-  built-in Spanish (which may now ask about a service they removed). No machine translation.
-- **CORS + TTL come from the DISTRIBUTION, not the object** - the customer uploads through the
-  S3 console and sets no metadata. `theme.json` gets its own cache behavior on the widget
-  distribution: a 60s cache policy plus a response-headers policy carrying
-  `Access-Control-Allow-Origin: *` and `Cache-Control: max-age=60`. The `*` is NOT the wildcard
-  `config.py` rejects for the API - that one guards a billable POST endpoint; this is a
-  world-readable static file on the customer's own CDN, and an exact allowlist would add no
-  secrecy and one silent failure mode (a staging subdomain nobody listed). `widget.js` delivery
-  is untouched: the default behavior keeps `CACHING_OPTIMIZED` and takes no CORS header.
-- **No flash of default colours.** The fetch runs in parallel with page load and the mount
-  WAITS on it, capped at `CONFIG.themeTimeoutMs` (1.5s) - so a themed install paints themed on
-  the first frame and a dead CDN delays the launcher by at most that before showing defaults.
-  `mount()` itself stays synchronous and theme-free (that is what the contract tests drive).
-- **Conformance scope:** the accessibility audit measured DEFAULT colours. Derived ink is safe
-  at any highlight, but the highlight is also a text colour on light surfaces (links, source
-  links, starter chips), so a custom one is the customer's to verify.
+  built-in Spanish, which may ask about a service they removed. No machine translation.
+- **No flash of default colours.** The fetch runs in parallel with page load and the mount WAITS
+  on it, capped at `CONFIG.themeTimeoutMs` (1.5s). `mount()` itself stays synchronous and
+  theme-free, which is what the contract tests drive.
+- **Conformance scope:** the accessibility audit measured DEFAULT colours. Derived ink is safe at
+  any highlight, but the highlight is also a text colour on light surfaces (links, source links,
+  starter chips), so a custom one is the customer's to verify.
+
+**Delivery, and the two ways a deploy could destroy the customer's work**
+
+- **The customer's file must survive `cdk deploy`.** `BucketDeployment` prunes with `aws s3 sync
+  --delete` and the source will never contain a file the customer wrote, so the widget deployment
+  carries `exclude=["theme.json", "defaults/*"]`. That is the **BucketDeployment** prop, which
+  scopes the sync command - NOT the identically named argument on `Source.asset`, which only
+  filters what is packed into the asset and protects nothing. Both are in that one call.
+  **TWO patterns, and the second is not redundant:** `--exclude` fnmatches the FULL path with the
+  sync root prepended, so `theme.json` covers the root object and nothing under a prefix - with
+  only that entry, `defaults/theme.json` is deleted on every deploy (measured against aws-cli
+  2.35.11, not assumed). Pinned by `test_the_theme_file_is_outside_the_prune_scope`.
+- **`content_disposition` applies to a WHOLE `BucketDeployment`**, which is why the download gets
+  its own rather than riding along with `widget.js` - a `<script src>` that comes back as a file
+  download is a broken widget. That second deployment shares the widget bucket, which is normally
+  how `widget.js` gets deleted by accident (see the Lessons entry); it is safe on exactly two
+  properties, `prune=False` and `destination_key_prefix="defaults"`, plus the matching exclude
+  above. The stack NEVER writes the root `theme.json` - no seeding.
+- **CORS + TTL come from the DISTRIBUTION, not the object**, because a console upload sets no
+  metadata. `theme.json` gets its own cache behavior: a 60s cache policy plus a response-headers
+  policy carrying `Access-Control-Allow-Origin: *` and `Cache-Control: max-age=60`. That `*` is
+  NOT the wildcard `config.py` rejects for the API - that one guards a billable POST endpoint;
+  this is a world-readable static file on the customer's own CDN, and an exact allowlist would
+  add no secrecy and one silent failure mode (a staging subdomain nobody listed). `widget.js`
+  delivery is untouched: the default behavior keeps `CACHING_OPTIMIZED` and takes no CORS header.
+
+**The three shipped pages and files**
+
+- **`defaults/theme.json` is the download** - a deployment-owned copy of the built-in defaults,
+  ALREADY named `theme.json` (hence the prefix: a second file of that name at the root would BE
+  the customer's), served `Content-Disposition: attachment` so a click saves it rather than
+  rendering JSON in a tab. Its `_readme` is an ARRAY of lines documenting every key, every font
+  keyword and both caps, with NO URL: once downloaded it travels alone and its reader has no
+  GitHub access, and JSON takes no comments, so the file must explain itself. The contract suite
+  pins its canonical form (byte equality against a two-space serialisation), its key order and
+  the self-documentation. The repo must never contain a root `frontend/theme.json`.
+- **`theme-guide.html` is the hosted guide**, one self-contained page at the bucket root and its
+  own source of copy. No scripts, no external CSS or fonts, no absolute URLs; its links are
+  RELATIVE (`defaults/theme.json`, `theme-editor.html`), so it works on any distribution domain
+  with no deploy-time stamping. It rides the widget deployment as a SECOND source and must never
+  move under `defaults/`, whose deployment-wide attachment header would download it instead of
+  rendering it. It has NO stack output: its only route in the product is the guide link in the
+  editor's settings panel.
+- **`theme-editor.html` is the hosted settings editor**, the THIRD source of that deployment and
+  the ONE theming page an output links. It seeds from the DEPLOYED root `theme.json` (falling
+  back to `defaults/theme.json`, then built-ins) so the customer edits their live theme, and its
+  Download button builds a `theme.json` in the pinned serialisation, `_readme` included. Shipped
+  via `Source.data` and DEPLOY-STAMPED like the demo page: four placeholders
+  (`__THEME_SAVE_URL__`, `__THEME_AUTH_BASE__`, `__THEME_CLIENT_ID__`, `__THEME_COGNITO_IDP__`)
+  resolve at deploy, a missing one fails synth, and the committed file carries no absolute URL.
+  Scripts are allowed on THIS page, unlike the guide, but no innerHTML and nothing persistent:
+  sessionStorage holds exactly ONE key (`gavtheme-oauth`, the in-flight PKCE handshake, removed
+  on return), tokens live in JS variables, and the refresh token is dropped unread. It duplicates
+  the widget's validation rules and the defaults file BY DESIGN, and the contract suite pins
+  every copy against `widget.js` and `defaults/theme.json` so none can drift silently; the save
+  Lambda's Python copy is pinned by `test_theme_handler.py`.
+- **The main view is the fields, the preview and Save; everything else is one control away.**
+  Once Save wrote the live file the console upload became a fallback rather than the workflow, so
+  the page stopped teaching it: the download, a "Choose defaults" refill and the account controls
+  live in a native `<dialog>`. Two rules the contract suite pins. The download MOVED and must
+  never disappear - an unsigned visitor has no other route to a `theme.json`, and its bytes are
+  pinned identical to `defaults/theme.json`. And "Choose defaults" refills from the page's ONE
+  embedded defaults block (`seedForm(builtinState)`), because a second hardcoded copy of the
+  shipped values would drift.
+
+**Saving, and the outputs**
+
+- **Save is gated by its own Cognito pool** (`gavilan-library-theme-admin`) - the ONLY pool and
+  the only sign-in anywhere in the product, since it guards a write rather than a read. Signed
+  in, Save PUTs
+  the built file to `PUT /theme`, behind a native JWT authorizer whose audience is the APP CLIENT
+  ID - a Cognito ACCESS token has no `aud` claim, it has `client_id`, and API Gateway validates
+  `client_id` only when `aud` is absent, so do not "fix" this to an ID token. `app/theme_handler.py`
+  revalidates against the widget's rules (allowlisted keys, hex pattern, font keywords, 4/120
+  caps - violations are a 400, not a soft drop), rewrites the file in the pinned serialisation,
+  writes the ONE object its IAM allows and invalidates `/theme.json`. Unsigned, Save reads "Sign
+  in to save" and the page is the download-only editor; unstamped (the repo copy), Save stays
+  hidden entirely.
+- **The account lifecycle is self-service; one CLI command total.** The pool signs in by EMAIL
+  (immutable choice), self sign-up off, strong password policy, recovery by verified email,
+  email changes verified before they apply (`keep_original`), 90-day temporary-password validity
+  instead of the 7-day default. Sign-in, the forced first-password change and forgot-password are
+  Cognito MANAGED LOGIN's hosted pages (v2 + `CfnManagedLoginBranding`, domain prefix
+  `gavilan-theme-<account id>`); the editor page only redirects, authorization code + PKCE, no
+  implicit grant, because tokens in URL fragments land in browser history. Change password and
+  change email run as user-scoped `cognito-idp` calls with the librarian's own access token
+  (scope `aws.cognito.signin.user.admin`). Accounts come from `ThemeAdminCreateUserCommand`:
+  `admin-create-user` with `PROJECT_EMAIL_HERE` substituted twice (the email IS the `--username`),
+  `--desired-delivery-mediums EMAIL` (the default is SMS - omit it and the invitation never
+  arrives), `Name=email_verified,Value=true` (what makes self-service reset work), and NO
+  temporary password (Cognito generates one; the invitation template must carry BOTH `{username}`
+  and `{####}` or nothing is delivered). Another librarian is the same command with another
+  address; a stale invitation is the same command plus `--message-action RESEND`. No user in
+  CloudFormation and no admin email in config.yaml: every `AWS::Cognito::UserPoolUser` property
+  is replacement-on-update, so a template-owned user could not change email without wiping the
+  librarian's password.
+- **TWO theming URL outputs, and the editor is the entry point.** `WidgetThemeEditor` carries the
+  "Start here" framing and says Save publishes straight to the live widget, because an editor
+  that reads like it only produces a file sends the customer into the console for a step Save
+  already did. `WidgetThemeUpload` is the S3-console deep link, kept because the guide's console
+  procedure names it BY OUTPUT NAME and because it is the only route for anyone not signed in.
+  Both are `https://` so the Outputs tab renders them as links, and both carry a Description,
+  because that tab is the only entry point anyone has: the bucket name is generated per install,
+  the account holds ~19 buckets, and the demo-site bucket sits next to the widget one, where an
+  upload succeeds silently and changes nothing.
+  **`WidgetThemeGuide` and `WidgetThemeDownload` are DELETED - do not reintroduce them.** Once
+  Save wrote the live file and the settings panel held both the download and the only link to the
+  guide, those rows were a second and third route into one workflow. Pinned from the other side
+  by `test_no_output_points_at_the_guide_or_the_defaults_download`, which fails on the VALUE too,
+  so re-adding either link under a different output name does not slip through.
 
 ## `/feedback` contract (the widget's report-an-answer path will build against this)
 
@@ -327,31 +310,80 @@ The email is PLAIN TEXT and the `Subject` is a CONSTANT - no user-supplied text 
 
 ## Repo layout
 
-- `infra/` - CDK Python app. Provisions the S3 Vectors store (`CfnVectorBucket` + `CfnIndex`), the KB role, `AWS::Bedrock::KnowledgeBase` (S3_VECTORS storage) + `AWS::Bedrock::DataSource` type S3, the KB source bucket, the scraper Lambda (+ deps layer, weekly schedule, one-click deploy Trigger), the dedicated catalog bucket, the query path (Lambda + own role, HTTP API with `POST /query` and `GET /warm`, both public and unauthenticated), the theme save path (a second Cognito pool with managed login + hosted domain + branding, its own JWT authorizer on `PUT /theme`, and the key-scoped theme-save Lambda - see "Widget theme file"), and - when `feedback` is configured - the feedback path (SNS topic + email subscription + its own small Lambda/role/log group + `POST /feedback`). Also hosts the widget (private S3 + CloudFront OAC, `BucketDeployment` of `frontend/widget.js` only) in the SAME stack (OAC cross-stack cyclical dependency), the demo site (a SECOND private S3 + CloudFront OAC pair, see below), and defines the Bedrock guardrail (one `CfnGuardrail` + one `CfnGuardrailVersion`). Outputs a paste-ready embed tag + CloudFront domain + `/query` URL + `DemoSiteUrl`.
-  - `app.py` - CDK entrypoint; loads `config.yaml`, passes to stack
-  - `infra/infra_stack.py` - the stack (`GavilanChatbotStack`)
-  - `infra/config.py` - `load_config()`; resolves repo-root `config.yaml` from `__file__`. Also the synth-time validators: `resolve_cors_allow_origins()` (rejects `*`) and `resolve_feedback()` (three outcomes: off / on-with-a-destination / a malformed address, which raises)
-  - `tests/unit/` - `test_infra_stack.py` (Template.from_stack assertions), `test_handler.py` (boto3 stubbed, payload-2.0 events), `test_feedback_handler.py` (same stubbing, for the feedback Lambda)
-- `app/` - query Lambda. `handler.py`: HTTP API (payload 2.0) entrypoint; `run_agent()` runs the agentic Converse tool-use loop over four tools (`search_library_info` -> KB `Retrieve`; `database_catalog` -> reads the catalog from S3; `search_book_catalog` + `search_course_reserves` -> live Primo API calls, client inline in `handler.py`, no import). `_links_block()` renders the bundled link table into the `system` payload. Wiring from env vars set by the stack. boto3 provided by the runtime.
-  - `system_prompt.md` - finalized system prompt (`<tools>` section carries the four-tool routing guidance; `<textbook_flow>` routes course textbooks to `search_course_reserves`); read once at cold start, passed via Converse `system`. Packaged via `Code.from_asset(app/)`. NOTE: the curated link table is deliberately absent from `<tools>` because it is no longer a tool - `<citations>` governs it instead, naming the injected CANONICAL GAVILAN LINKS block as one of exactly two permitted link sources.
-  - `data/database_catalog.json` - bundled seed catalog: the hand-authored not-held list + a fallback held list, merged with the S3 held list at read time.
-  - `data/library_links.json` - bundled, hand-authored table of canonical Gavilan URLs, rendered into the Converse `system` payload by `_links_block()` (library home page, college site, online textbook collections, research guides, bookstore, campus maps, public safety, ILL, laptop record). Fully static: no scraper, no S3, no cache. Edit + redeploy to change.
-  - `feedback_handler.py` - the feedback Lambda (`POST /feedback`), a SEPARATE function from the query handler and bundled alone: validate the five-field allowlist, render plain text, one `sns:Publish`. Its own role holds `sns:Publish` on the topic and nothing else, and it never imports `handler.py` (which would drag in the prompt, the seed catalog and the KB env vars it has no use for).
-  - `theme_handler.py` - the theme-save Lambda (`PUT /theme`, behind the theme-admin JWT authorizer), same bundled-alone shape: revalidate the theme against the widget's rules, rewrite it in the pinned serialisation, `s3:PutObject` the ONE key (`theme.json` at the widget bucket root - its IAM reaches nothing else) and soft-fail a CloudFront invalidation of `/theme.json`. Pinned against widget.js and `defaults/theme.json` by `tests/unit/test_theme_handler.py`.
-  - `primo_search.py` - standalone CLI for exploring the Primo discovery API (dev tool; NOT imported by the handler and NOT in the `from_asset` bundle).
-- `scraper/` - scraper Lambda source. `scraper.py` (pure fetch/extract, incl. `extract_database_catalog` HTML parse, plus the tier helpers `all_seed_urls`/`urls_for_tier` shared by the Lambda and the CLI; `--tier` on the CLI) + `lambda_function.py` (gated S3 upload, gated KB ingestion, catalog regeneration: parse -> guard -> fingerprint gate -> Sonnet enrichment -> write to the catalog bucket). Own `.venv`/tests (needs trafilatura). `requirements-dev.txt` pins pytest to the same version as `infra/` and `eval/`; the tests need the runtime deps too, so install both files.
-- `eval/` - Bedrock RAG eval harness (boto3 tooling, NOT CDK). Runs on demand against deployed infra; cannot run offline. Retrieve-only formatter (chunking eval) + retrieve-and-generate formatter (answer quality, bring-your-own-inference). `capture_outputs.py` is a STUB until the bot is deployed. Separate `eval_config.yaml`.
-  - `measure_usage.py` - measures what a question actually COSTS, by POSTing `/query` with `include_usage` and fitting the results. Prints the paste-ready `cost_model.measured` block for config.yaml. On demand only (it spends real Bedrock money); re-run after anything that moves token usage - `retrieval.number_of_results`, `chunking`, the system prompt, the link table, `generation.max_tokens`.
-- `frontend/` - embeddable widget + the demo page. FOUR files ship, to two SEPARATE buckets:
-  - `widget.js` - the production widget (production-clean, no mock code); reads its endpoint from its `<script>` tag's `data-api-url`, POSTs a multi-turn `{messages: [...]}` array, renders `{answer, sources}`. It carries NO credential and NO auth code: it sends `Content-Type` and nothing else, because `/query` is public. The ONLY file in the widget bucket. **Bilingual:** every user-visible string lives in the `STRINGS` table (keyed by language code, above the `END LOCALIZATION` banner); render code below that banner calls `t(key)` and holds no copy, which the contract suite enforces by scanning the file. The header carries a two-button English/Español toggle (real buttons, `aria-pressed`, group `aria-label`, visible focus ring - no ID-based ARIA, which cannot cross the shadow boundary), and switching sets `lang` on the host element AND the shadow root container. Each message is stamped with the language it was said in, so a switch relabels the chrome and NOT the transcript: past turns are never retranslated (that would cost a model call per message). The canned greeting + starter questions DO re-render on a switch, but only before the first message - they are the panel's opening state, not a turn anyone took. The language is session-only, deliberately: the widget stores nothing in the browser and a contract test pins that. The table covers the SCREEN-READER-ONLY text too (the per-turn speaker labels, the pending bubble's status region), because a label nobody can see is still read aloud - and because that text is invisible to any check that looks at the rendered page. Two things the toggle must NOT do, both of them accessibility fixes it would otherwise undo: the launcher takes no `aria-label` in any language (its visible text is its whole accessible name, WCAG 2.5.3), and re-seeding the opening state has to re-point the composer's `aria-describedby` at the NEW greeting bubble, or a switch leaves it aimed at a removed node.
-  - `defaults/theme.json` - the downloadable copy of the runtime theme file, deployed to `defaults/theme.json` in the widget bucket by its OWN `BucketDeployment` (`prune=False`, prefix-scoped, `Content-Disposition: attachment`) and overwritten on every deploy. The contract suite tests it as code: every value in it equals a built-in default, it is byte-identical to its own canonical two space serialisation (so no reformat lands silently), and its `_readme` array has to document every key, every font keyword and both caps with no external URL.
-  - `theme-guide.html`: the hosted customer guide, one self-contained page at the widget bucket root, shipped by the widget `BucketDeployment` as a second source. The page is its own source of copy; no scripts, no external anything; its links are the relative `defaults/theme.json` and `theme-editor.html`. NO stack output points at it - it is the manual version of the editor, reached only from that editor's settings panel.
-  - `theme-editor.html`: the hosted settings editor, a third source of the widget `BucketDeployment` (via `Source.data`, deploy-stamped with the save endpoint + sign-in config), linked by the `WidgetThemeEditor` stack output. A self-contained form (scripts inline, nothing external, no innerHTML, nothing stored beyond the one-session PKCE handshake key) that seeds from the live root `theme.json`, saves it back through `PUT /theme` when a librarian is signed in via managed login, and downloads a ready-to-upload replacement in the pinned serialisation either way. The main view is the fields, the preview and Save; the download, the "Choose defaults" refill, the link to `theme-guide.html` and the account controls are in a `<dialog>` settings panel behind one control in the top right. That panel link is the guide's ONLY route in the product. Its copies of the widget's validation rules and of the defaults file are pinned by the contract suite.
-  - `demo-site.html` - the shareable demo page, uploaded as `index.html` to the demo bucket. A Gavilan-Library-styled sample page (local CSS only, nothing hotlinked from gavilan.edu) carrying the SAME one-line embed a library page would, so it cannot fork or drift from the shipped widget. Two placeholders, `__WIDGET_SRC__` and `__API_URL__`, are stamped at DEPLOY time (`s3deploy.Source.data` resolves CDK tokens during deployment) - nothing in it is account- or region-specific. Renaming either placeholder fails synth.
-  - `mock.js` (dev-only fetch stub) + `demo.html` (offline mock harness) + `demo-live.html` (local page against the deployed API, needs the `localhost:8000` CORS entry) + `test/widget.contract.test.js` (zero-dep Node tests) never ship; dependency direction is one-way (widget never references the mock).
-- `config.yaml` - declarative settings at repo root; `cost_model` (published AWS rates + the MEASURED per-question constants + the zero-traffic baseline inputs, stamped into the demo page at deploy; note `scrapes_per_month` and `reindexes_per_month` are SEPARATE numbers because change gating means most runs re-index nothing), embedding model, `vector_store` (S3 Vectors names, data_type, distance_metric, non-filterable keys), `scraper.tiers` (per-tier schedule + URLs; the only declaration of cadence and tier membership) + `kb_exclude_urls`, `chunking`, `retrieval.number_of_results`, `generation.model_id`, `catalog` (enrichment model, S3 key, guard threshold, cache TTL), `primo` (the live-catalog knobs `timeout_seconds`, `number_of_results`, `availability_budget_seconds`, wired as `PRIMO_*` env; `search_course_reserves` reuses the same knobs), `library_links.data_file` (the bundled link-table filename; the stack feeds the SAME value to the Lambda asset include and the `LIBRARY_LINKS_FILE` env so they cannot drift), `cors.allow_origins` (the HTTP API browser allowlist), `demo_site.enabled` (the shareable demo page; when on, the stack appends the demo distribution's origin to the CORS allowlist as a deploy-time token), `feedback` (`enabled`, `notify_email`, `max_comment_chars`, `max_body_bytes`, `max_sources`; the three caps reach the feedback Lambda as `FEEDBACK_*` env vars, and `notify_email` never does - it becomes the SNS subscription), `guardrail` (`name`, the one-entry `content_filters` list, `blocked_input_messaging` - there is no output guardrail and no PII entity list). CDK reads it at synth via `infra/config.py`. Edit values here, do not hardcode in the stack.
-- `docs/` - design docs (`architecture.md`, `build-plan.md`, architecture diagram), the accessibility audit, and `widget-theming.md` (the developer guide to `theme.json`). The customer facing theming copy lives in the shipped artefacts themselves: `frontend/theme-guide.html` and the `_readme` inside `frontend/defaults/theme.json`.
-- `.github/workflows/ci.yml` - the GitHub Actions checks (see CI under Commands). Four hermetic jobs, one per test surface.
+- `infra/` - the CDK app. `app.py` loads `config.yaml`; `infra/infra_stack.py` is the whole stack;
+  `infra/config.py` holds `load_config()` and the synth-time validators
+  (`resolve_cors_allow_origins` rejects `*`, `resolve_feedback` has three outcomes,
+  `resolve_scraper_tiers` / `resolve_seed_urls`). `tests/unit/` covers the stack via
+  `Template.from_stack` plus the three Lambdas with boto3 stubbed. See `infra/README.md`.
+- `app/` - the Lambdas, each bundled alone so none drags in the others' dependencies.
+  - `handler.py` - the query path, public and unauthenticated like `/warm`. `run_agent()` runs the Converse tool-use loop over four tools
+    (`search_library_info` -> KB `Retrieve`; `database_catalog` -> the catalog from S3;
+    `search_book_catalog` + `search_course_reserves` -> live Primo, client inline, no import).
+    `_links_block()` renders the bundled link table into the `system` payload. Wiring from env
+    vars; boto3 from the runtime.
+  - `system_prompt.md` - `<tools>` carries the four-tool routing, including that course textbooks
+    go to `search_course_reserves` and not the general catalog; `<priority_responses>` is checked
+    first and answers safety and emergency messages verbatim with no tool call; `<citations>`
+    names the injected CANONICAL GAVILAN LINKS block as one of exactly two permitted link
+    sources, which is why the link table is deliberately absent from `<tools>`.
+  - `data/database_catalog.json` - the hand-authored not-held list plus a fallback held list,
+    merged with the S3 held list at read time.
+  - `data/library_links.json` - the hand-authored canonical URLs. Fully static: no scraper, no
+    S3, no cache. Edit and redeploy to change.
+  - `feedback_handler.py` / `theme_handler.py` - the two small Lambdas. Neither imports
+    `handler.py`. Each holds exactly the IAM it needs: one `sns:Publish`, one `s3:PutObject` on
+    one key.
+  - `primo_search.py` - a dev CLI for exploring the Primo API. Not imported, not bundled.
+- `scraper/` - `scraper.py` (pure fetch/extract, the `extract_database_catalog` HTML parse, and
+  the tier helpers shared by the Lambda and the CLI) + `lambda_function.py` (gated upload, gated
+  ingestion, catalog regeneration: parse -> guard -> fingerprint gate -> enrichment -> write).
+  Own `.venv` and tests; the tests need the runtime deps, so install both requirements files.
+- `eval/` - the Bedrock RAG eval harness, on demand against deployed infra, plus `promptfoo/`
+  for answer quality. `run_chunking_eval.py` and the unit tests are the only parts that run
+  offline. `measure_usage.py` prints the `cost_model.measured` block for config.yaml and spends
+  real money; re-run it after anything that moves token usage - `retrieval.number_of_results`,
+  `chunking`, the system prompt, the link table, `generation.max_tokens`.
+- `frontend/` - FIVE files ship, to two buckets. To the widget bucket: `widget.js` (which
+  carries NO credential and NO auth code - it sends `Content-Type` and nothing else, because
+  `/query` is public),
+  `defaults/theme.json`, `theme-guide.html`, `theme-editor.html` (the last three are covered
+  under "Widget theme file"). To the demo bucket: `demo-site.html`, uploaded as `index.html` -
+  a Gavilan-styled sample page with local CSS only, carrying the SAME one-line embed a library
+  page would, so it cannot fork from the shipped widget; placeholders for the widget src, the
+  `/query` URL and the `cost_model` block are stamped at deploy, and renaming one fails synth.
+  `mock.js`, `demo.html`, `demo-live.html` and `test/widget.contract.test.js` never ship, and the
+  dependency direction is one-way - the widget never references the mock.
+  - `widget.js` is **bilingual**: every user-visible string lives in the `STRINGS` table above the
+    `END LOCALIZATION` banner, and render code below it calls `t(key)` and holds no copy, which
+    the contract suite enforces by scanning the file. The header toggle is real buttons with
+    `aria-pressed` and a group `aria-label` - no ID-based ARIA, which cannot cross the shadow
+    boundary - and switching sets `lang` on the host element and the shadow root container. Each
+    message is stamped with the language it was said in, so a switch relabels the chrome and NOT
+    the transcript; retranslating past turns would cost a model call each. The greeting and
+    starter questions DO re-render on a switch, but only before the first message, because they
+    are the panel's opening state rather than a turn anyone took. The table covers the
+    SCREEN-READER-ONLY text too - a label nobody can see is still read aloud, and it is invisible
+    to any check that looks at the rendered page. Two things the toggle must NOT undo: the
+    launcher takes no `aria-label` in any language (its visible text is its whole accessible name,
+    WCAG 2.5.3), and re-seeding the opening state has to re-point the composer's
+    `aria-describedby` at the NEW greeting bubble, or a switch leaves it aimed at a removed node.
+    The widget uses NO browser storage at all - no `localStorage`, no `sessionStorage`, no
+    cookie, no `indexedDB` - and the contract suite pins that by scanning the source.
+- `config.yaml` - every changeable knob, read at synth by `infra/config.py`. Notable blocks:
+  `scraper.tiers` (the only declaration of cadence and tier membership) + `kb_exclude_urls`;
+  `vector_store`; `chunking`; `retrieval.number_of_results`; `generation.model_id`; `catalog`;
+  `primo` (wired as `PRIMO_*` env, shared by both catalog tools); `library_links.data_file` (the
+  stack feeds the SAME value to the asset include and the env var so they cannot drift);
+  `cors.allow_origins`; `demo_site.enabled`; `feedback` (the three caps reach the Lambda as
+  `FEEDBACK_*`; `notify_email` never does - it becomes the SNS subscription); `guardrail`; and
+  `cost_model` (published rates + measured per-question constants + the zero-traffic baseline,
+  stamped into the demo page - note `scrapes_per_month` and `reindexes_per_month` are SEPARATE
+  numbers, because change gating means most runs re-index nothing).
+- `docs/` - `install.md` (the deployer's five-step walkthrough), `architecture.md`,
+  `build-plan.md`, the architecture diagram, the accessibility audit, and `widget-theming.md`.
+  The customer-facing theming copy lives in the shipped artefacts themselves:
+  `frontend/theme-guide.html` and the `_readme` inside `frontend/defaults/theme.json`.
+- `.github/workflows/ci.yml` - four hermetic jobs, one per test surface. See CI under Commands.
 
 ## Excluded (do not reintroduce)
 
@@ -376,7 +408,7 @@ Needs `bedrock:ApplyGuardrail` on the guardrail ARN alongside `InvokeModel`, or 
 ## Hard rules
 
 - **No Git by default.** Do not commit, stage, push, or take any other git/GitHub action unless the task order explicitly instructs a commit. When it does, follow that instruction exactly and do nothing else with git.
-- **Behavior and tool routing live in the system prompt + tool descriptions, not hardcoded Lambda branches.** Tool choice is the model's (`toolChoice` auto); textbook clarifying questions and out-of-scope handling are prompt instructions.
+- **Behavior and tool routing live in the system prompt + tool descriptions, not hardcoded Lambda branches.** Tool choice is the model's (`toolChoice` auto); textbook routing, safety responses and out-of-scope handling are prompt instructions.
 
 ## Writing style
 
@@ -390,24 +422,161 @@ Never hide failures. Show all test results, including failures, in full.
 
 Things learned the hard way. Read before repeating the same work.
 
-- **Verify CDK construct APIs against the installed package, not memory.** The Bedrock construct surface is in flux and training data is stale. For `aws-cdk-lib==2.260.0`, introspect the installed package. Example current gotcha: `CfnKnowledgeBase` `S3VectorsConfiguration` is a `oneOf` - pass `IndexArn` alone; adding `IndexName`/`VectorBucketArn` too makes CloudFormation reject it at validation ("2 subschemas matched instead of one").
-- **HTTP API v2 is in `aws-cdk-lib` core as of 2.260.0.** `HttpApi` + `CorsPreflightOptions` live in `aws_cdk.aws_apigatewayv2`, `HttpLambdaIntegration` in `aws_cdk.aws_apigatewayv2_integrations`. The old `-alpha` packages are gone (import fails) and are NOT needed. HTTP API not REST (~71% cheaper for a Lambda-proxy job). `HttpLambdaIntegration` defaults to payload format 2.0.
-- **CloudFront is slow to create AND destroy (~15-30 min each).** The widget distribution dominates `cdk deploy`/`destroy` wall-clock. Actual serving behavior (OAC read, cache, HTTPS redirect) is only verifiable at deploy.
-- **OAC + `auto_delete_objects` dependency cycle.** Do NOT add an explicit `distribution.node.add_dependency(bucket)`: the origin already references the bucket, and the explicit edge pulls in the bucket's auto-delete custom resource, which `DependsOn` the OAC bucket policy, which `DependsOn` the distribution -> a synth-blocking cycle. Surfaces in `Template.from_stack` (tests) even when plain `cdk synth` looks fine; keep infra tests in the loop.
-- **Config keys reach the from_asset Lambdas ONLY as stack-set env vars** (the bundle excludes config.yaml). A new runtime knob needs three touches - config.yaml, stack env-wiring, handler read - or it silently no-ops. Synth-time-only keys (throttle limits) are read by the stack directly and don't need the bridge.
-- **Invoking a Claude model needs a us.-prefixed inference profile** (bare model IDs are rejected), which requires `InvokeModel*` on the profile ARN plus foundation-model ARNs across routed regions, not the single-ARN on-demand grant. Applies to both the query Lambda's generation model and the scraper's catalog-enrichment model.
-- **A live third-party API in the agent loop must never be able to kill a request.** `search_book_catalog`/`search_course_reserves` hit the undocumented Primo discovery endpoint (search + a per-record delivery call for availability), whose fields use a `$$C..$$V..` / `$$R..$$V..$$M..` encoding - parse it defensively (never index blindly; a shape change must degrade, not throw). Every call is timed out with a total availability budget, and any failure soft-fails to a "catalog unavailable" toolResult so the loop still answers. Availability from the delivery call is a report of what the catalog SHOWS, not a guarantee a copy is on the shelf - the prompt phrases it that way, and `total == 0` is the only authoritative not-held signal (Primo relevance scores are query-relative, so the model judges matches).- **A constant does not belong behind a tool call.** `library_links` took no input and returned the same rows every call, and the model kept not calling it: it would answer "where is the financial aid office" from retrieved text, feel finished, and never fetch the map. That is the measured **Tool-Skip** failure mode (frontier models skip a required call 12-26% of the time - [ToolFailBench](https://arxiv.org/html/2607.04686v1)), and tool-description work cannot fix it, because a description is only read once the model has already decided to look something up. Worse, tool necessity is [linearly decodable from hidden states at AUROC 0.89-0.96](https://arxiv.org/html/2605.09252v1) - the model *knows* and doesn't act, so more instruction is not the missing ingredient. The same source found prompt-only interventions move the whole tool-call distribution rather than the boundary. Fix: preload it. Anything small, static, and usually-relevant belongs in context, not behind a call the model has to remember to make. Revisit only if such a table outgrows ~30 rows.
-- **Moving data out of a tool result silently breaks the eval judge.** The groundedness judge grades against `tool_calls`. Anything the model sees that is NOT a tool result (the curated links, now a `system` block) appears nowhere in that trace, so a correct, curated URL reads as an invented one and scores as ungrounded - a scoring regression that looks exactly like a quality drop. Any change that relocates evidence must add it to the debug payload AND tell the judge prompt it exists, in the same commit.
-- **A second `BucketDeployment` into the widget bucket would delete widget.js.** `BucketDeployment` defaults to `prune=True`, which is `aws s3 sync --delete`: on every deploy it removes destination objects its own source does not contain. Two deployments sharing one bucket therefore fight, and whichever CloudFormation runs last wins - production widget delivery would break intermittently, not reproducibly. `destination_key_prefix` does scope the prune (verified in `aws-cdk-lib==2.260.0`: "if it's set with prune: true, it will only prune files with the prefix"), and so does `exclude`, but both are a config away from wrong. The demo site gets its OWN bucket and its OWN distribution instead, so the interference is structurally impossible; `test_demo_site_does_not_change_widget_delivery` pins that the widget path is byte-identical with the demo on and off. **The theme-defaults deployment is the ONE exception, and it earns it by being unable to fight:** `prune=False` means it deletes nothing at all, `destination_key_prefix="defaults"` means it writes nowhere else, and the widget deployment's `exclude` covers that prefix - so neither can reach the other's objects whichever runs last. The real invariant is not "one deployment per bucket" but **one PRUNING deployment per bucket**, which is what `test_only_one_deployment_prunes_each_bucket` now asserts directly.
-- **Deploy-time values reach a STATIC file via `s3deploy.Source.data`, not an env var.** The "config only reaches Lambdas as env vars" rule has no equivalent for a hosted page - a hardcoded endpoint in HTML would break one-click install in a fresh account. `Source.data(key, content)` resolves CDK tokens *during deployment*: CDK stages the file with `<<marker:0xbaba:N>>` placeholders and the deployment custom resource substitutes them from `SourceMarkers` (an `Fn::GetAtt` per marker). Verified in the synthesized template and the staged asset. Note it substitutes EVERY literal occurrence, comments included - so do not spell the placeholder out in the file's own documentation.
+**CDK and AWS**
 
-- **Cost scales with LOOP LENGTH, not conversation depth - the opposite of the obvious guess.** Measured over 60 live questions (`eval/measure_usage.py`, 2026-07-29): a question costs ~$0.043, and **91% of that is input tokens**. The intuition that "history is client-carried and resent every turn, so deep conversations get expensive fast" is measurably wrong here: a prior turn adds only **~54 tokens** to a ~10,700-token call, because `_seed_messages` rebuilds history from TEXT turns only - the tool results and retrieved passages behind an earlier answer are never resent. It also stops growing at the `MAX_HISTORY_MESSAGES` trim. What actually moves cost is whether the model needs a second Converse call (measured 1.23 calls/question), because that resends the entire ~10,700-token context again - worth about fifty turns of history growth in one go. First questions need that second call far more often than follow-ups do, which drags a naive cost-vs-position fit NEGATIVE and would read as "conversations get cheaper as they go". Divide by `model_calls` before fitting depth, or you measure neither effect. Practical consequence: the lever on cost is `retrieval.number_of_results` and the priming retrieval (they set the 10,700), not conversation length.
-- **Serving Spanish was a FRONTEND problem, not a retrieval one.** Verified by hand against the deployed system (2026-07-29): Spanish questions already retrieve correctly from the ENGLISH knowledge base and come back grounded and specific, including the authoritative database tool ("¿Tienen JSTOR?" -> correctly not held, with held alternatives) and the live Primo catalog ("un libro sobre la Revolución Mexicana" -> 12 titles). Unaccented input works too. So do NOT translate the corpus, re-ingest, or touch chunking/retrieval for a language feature - all of that is cost and risk for a problem that does not exist. The actual gap was the shell around the conversation: every piece of widget chrome was hardcoded English, so before typing anything a Spanish speaker had no signal the bot speaks Spanish, and auto-detection cannot close that gap because it needs a message first. That is why the control is a VISIBLE affordance rather than a language sniffer, and why the whole backend change is one optional request field and one system block.
-- **`cdk deploy` does NOT re-scrape unless the scraper Lambda itself changed.** Verified in the synthesized template, not assumed: `execute_on_handler_change=True` ties the install Trigger to the function's `currentVersion`, so the trigger's `HandlerArn` is a `Ref` to a `ScraperFunctionCurrentVersion<hash>` resource whose LOGICAL ID hashes the code asset plus the function configuration (env vars, layers, memory, timeout, role). Deploy anything that leaves those alone - a widget tweak, a demo-page edit, a query-Lambda change - and the logical id is byte-identical, the custom resource's properties are unchanged, CloudFormation does not re-run it, and no scrape fires. That is why deploys can look like they "didn't do anything". The corollary is the trap: a change to `config.yaml` that only moves a scraper ENV VAR *does* change the version hash and *does* re-fire, so a config-only edit is not always cost-free.
-- **The extracted markdown is byte-stable; the metadata sidecar is not.** Measured 2026-07-29 by scraping all 19 seed URLs twice back to back: all 19 `.md` files byte-identical, all 19 sidecars different, and `scrape_timestamp` was the ONLY differing field (line 5 of each). So content hashing works, but only if the timestamp is excluded from the hash - include it and every page looks changed on every run, the gate becomes an expensive no-op, and the KB re-ingests forever. There is no scrape timestamp, nonce, or nondeterministic ordering in the document BODY, so nothing had to be removed from the corpus. The catalog object had the same problem in a different place: its `generated_at` field made it churn on every run, which the fingerprint gate now stops by skipping the write entirely.
-- **Change gating silently removes the prune's safety net if you let it.** `prune_stale_objects` deletes objects not in the expected set, and the expected set unions in "what this run wrote" as a guard against the slug-derivation in `expected_kb_keys` drifting from `result.slug`. That union used to cover the whole corpus for free, because every successful page was re-uploaded every run. Once unchanged pages stop uploading, a page can be live, correct, and outside the union - one slug-scheme change away from being deleted. Pages found UNCHANGED must count as live too (`live_object_keys`, not `uploaded_object_keys`). Caught by a test, not by review.
-- **Skipping an ingestion job is only safe if something else remembers.** "Start a job if this run uploaded something" plus "skip when a job is already running" loses data: the deferred run's change is already in the bucket, so the next run sees the page as unchanged, uploads nothing, and starts no job either - the change sits unindexed indefinitely. The store-free fix is to compare the bucket's newest `LastModified` against the last ingestion job's `startedAt` (Bedrock's own history), which is true exactly when there is unindexed content, regardless of which run put it there.
-- **An endpoint with no destination is worse than no endpoint.** The feedback path publishes to an SNS topic whose only subscriber is an address in config.yaml, and there is NO store - the email is the record. So a `/feedback` route deployed with `notify_email` unset would accept a student's report, return `202`, and drop it: a silent failure in the one feature whose purpose is to break a silence. Hence three distinct outcomes in `resolve_feedback`, not two: `enabled: false` builds nothing and says nothing (a choice); enabled with an EMPTY address builds nothing and emits a `FeedbackStatus` deploy output saying why (a mistake, so make it visible in the place someone is already looking); enabled with a MALFORMED address raises at synth (a typo - and the only signal it would otherwise produce is an SNS subscription nobody can ever confirm, which looks exactly like a working deployment). The handler still refuses with `503` when its topic env is missing, because "the stack would never do that" is not a runtime guarantee.
-- **An API Gateway authorizer's 401 carries NO CORS headers, so a browser cannot read it.** The docs say API Gateway "adds the configured CORS headers to the response from an integration" - and an authorizer rejection never reaches the integration. So a rejected token comes back to `fetch()` as an opaque network failure with no readable status, and a page CANNOT distinguish an expired session from a dead network by inspecting the response. Do not write a UI that depends on seeing that 401. The workable fix is to never send the doomed request: record the token's expiry (minus a safety margin) and check it BEFORE the fetch. Keep the `res.status === 401` branch anyway - it is correct wherever the response is readable (same-origin, curl, a future gateway that does send the headers) and costs one comparison. Doc-verified 2026-08-03, NOT verified against a deployed endpoint. This now applies to ONE surface, `PUT /theme` from the settings editor - the only gated route left - and it is why `Authorization` has to be in `allow_headers`, or the save dies at the OPTIONS and the CORS error masks the whole auth path. (It was learned on a pre-launch sign-in gate over `POST /query`, which is now public.)
-- **The offline chunking eval measures boundaries, never ranking.** `eval/run_chunking_eval.py` can tell you a 300-token window cuts 26% of golden answers in half; it cannot tell you whether a 600-token chunk still retrieves, because a bigger chunk averages its embedding over more text and can retrieve less precisely. The two halves need two instruments: pair it with `eval/retrieval_probe.py` against the live index. 300-token baseline to compare against: recall@1 71%, @3 88%, @5 94%, @8 100%.
-- **L1 `Cfn*` constructs do NOT enforce CloudFormation's property constraints at synth.** The `AWS::Bedrock::Guardrail` `Description` cap is 200 characters; a 274-character one synthed clean, passed all 292 infra tests, uploaded its assets, and then died in CloudFormation's *early change-set validation* (`expected maxLength: 200, actual: 274`) - so the first enforcement point is a deploy that fails before touching a single resource. This is a general hazard of the all-L1 stack, not a guardrail quirk: `maxLength`, `pattern` and enum constraints on any `Cfn*` prop are invisible until deploy. Prose in an AWS-visible description field is therefore a deploy-time landmine - put the rationale in a code comment and pin the rendered length with a template assertion (`test_guardrail_descriptions_fit_the_cloudformation_cap`).
+- **Verify CDK construct APIs against the installed package, not memory.** The Bedrock construct
+  surface is in flux and training data is stale, so introspect `aws-cdk-lib==2.260.0`. Current
+  gotcha: `CfnKnowledgeBase` `S3VectorsConfiguration` is a `oneOf` - pass `IndexArn` alone, and
+  adding `IndexName`/`VectorBucketArn` makes CloudFormation reject it ("2 subschemas matched
+  instead of one").
+- **L1 `Cfn*` constructs do NOT enforce CloudFormation's property constraints at synth.** A
+  274-character `AWS::Bedrock::Guardrail` `Description` (cap: 200) synthed clean, passed the whole
+  infra suite, uploaded its assets, then died in early change-set validation - so the first
+  enforcement point is a deploy that fails before touching a single resource. This is a general
+  hazard of an all-L1 stack: `maxLength`, `pattern` and enum constraints are invisible until
+  deploy. Put rationale in a code comment, not an AWS-visible description field, and pin the
+  rendered length with a template assertion.
+- **HTTP API v2 is in `aws-cdk-lib` core as of 2.260.0.** `HttpApi` + `CorsPreflightOptions` in
+  `aws_cdk.aws_apigatewayv2`, `HttpLambdaIntegration` in `aws_cdk.aws_apigatewayv2_integrations`.
+  The `-alpha` packages are gone and are not needed. HTTP API not REST (~71% cheaper for a
+  Lambda-proxy job); `HttpLambdaIntegration` defaults to payload format 2.0.
+- **CloudFront is slow to create AND destroy (~15-30 min each),** which dominates deploy and
+  destroy wall-clock. Real serving behaviour (OAC read, cache, HTTPS redirect) is only verifiable
+  at deploy.
+- **OAC + `auto_delete_objects` dependency cycle.** Do NOT add an explicit
+  `distribution.node.add_dependency(bucket)`: the origin already references the bucket, and the
+  explicit edge pulls in the auto-delete custom resource, which `DependsOn` the OAC bucket policy,
+  which `DependsOn` the distribution. Surfaces in `Template.from_stack` even when plain
+  `cdk synth` looks fine, so keep infra tests in the loop.
+- **Invoking a Claude model needs a `us.`-prefixed inference profile** - bare model ids are
+  rejected - which requires `InvokeModel*` on the profile ARN plus foundation-model ARNs across
+  routed regions, not the single-ARN on-demand grant. Applies to the query Lambda's generation
+  model and the scraper's enrichment model alike.
+- **Config keys reach the `from_asset` Lambdas ONLY as stack-set env vars** (the bundle excludes
+  config.yaml). A new runtime knob needs three touches - config.yaml, stack env-wiring, handler
+  read - or it silently no-ops. Synth-time-only keys are read by the stack directly.
+- **Deploy-time values reach a STATIC file via `s3deploy.Source.data`, not an env var.** A
+  hardcoded endpoint in HTML would break one-click install in a fresh account. `Source.data`
+  resolves CDK tokens *during deployment*: CDK stages the file with `<<marker:0xbaba:N>>`
+  placeholders and the deployment custom resource substitutes them from `SourceMarkers`. Verified
+  in the synthesized template and the staged asset. It substitutes EVERY literal occurrence,
+  comments included, so never spell a placeholder out in the file's own documentation.
+- **A second `BucketDeployment` into the widget bucket would delete widget.js.** `prune=True` is
+  the default, and it is `aws s3 sync --delete`: two deployments sharing a bucket fight, whichever
+  CloudFormation runs last wins, and production widget delivery breaks intermittently rather than
+  reproducibly. `destination_key_prefix` does scope the prune, and so does `exclude`, but both are
+  one config away from wrong - so the demo site gets its OWN bucket and distribution, making the
+  interference structurally impossible. **The theme-defaults deployment is the one exception, and
+  it earns it by being unable to fight:** `prune=False` deletes nothing at all,
+  `destination_key_prefix="defaults"` writes nowhere else, and the widget deployment's `exclude`
+  covers that prefix. The real invariant is not "one deployment per bucket" but **one PRUNING
+  deployment per bucket**, which `test_only_one_deployment_prunes_each_bucket` asserts directly.
+- **`cdk deploy` does NOT re-scrape unless the scraper Lambda itself changed.** Verified in the
+  synthesized template: `execute_on_handler_change=True` ties the install Trigger to the
+  function's `currentVersion`, whose logical id hashes the code asset plus the function
+  configuration (env vars, layers, memory, timeout, role). Deploy a widget tweak, a demo-page edit
+  or a query-Lambda change and that id is byte-identical, the custom resource is unchanged,
+  CloudFormation does not re-run it, and no scrape fires. That is why deploys can look like they
+  did nothing. The trap is the corollary: a config edit that moves a scraper ENV VAR *does* change
+  the hash and *does* re-fire, so a config-only change is not always free.
+- **An API Gateway authorizer's 401 carries NO CORS headers, so a browser cannot read it.** The
+  docs say API Gateway "adds the configured CORS headers to the response from an integration" -
+  and an authorizer rejection never reaches the integration. So a rejected token comes back to
+  `fetch()` as an opaque network failure with no readable status, and a page CANNOT distinguish
+  an expired session from a dead network by inspecting the response. Do not write a UI that
+  depends on seeing that 401. The workable fix is to never send the doomed request: record the
+  token's expiry (minus a safety margin) and check it BEFORE the fetch. Keep the `res.status ===
+  401` branch anyway - it is correct wherever the response is readable (same-origin, curl, a
+  future gateway that does send the headers) and costs one comparison. Doc-verified 2026-08-03,
+  NOT verified against a deployed endpoint. This now applies to ONE surface, `PUT /theme` from
+  the settings editor - the only gated route left - and it is why `Authorization` has to be in
+  `allow_headers`, or the save dies at the OPTIONS and the CORS error masks the whole auth path.
+  (It was learned on a pre-launch sign-in gate over `POST /query`, which is now public.)
+- **A constant does not belong behind a tool call.** The curated link table took no input and
+  returned the same rows every call, and the model kept not calling it - it would answer "where is
+  the financial aid office" from retrieved text, feel finished, and never fetch the map. That is
+  the measured **Tool-Skip** failure mode (frontier models skip a required call 12-26% of the time
+  - [ToolFailBench](https://arxiv.org/html/2607.04686v1)), and tool-description work cannot fix
+  it, because a description is only read once the model has already decided to look something up.
+  Worse, tool necessity is [linearly decodable from hidden states at AUROC
+  0.89-0.96](https://arxiv.org/html/2605.09252v1): the model *knows* and does not act, so more
+  instruction is not the missing ingredient, and prompt-only interventions move the whole
+  tool-call distribution rather than the boundary. Fix: preload it. Anything small, static and
+  usually-relevant belongs in context. Revisit only if such a table outgrows ~30 rows.
+- **Moving data out of a tool result silently breaks the eval judge.** The groundedness judge
+  grades against `tool_calls`, so anything the model sees that is NOT a tool result appears
+  nowhere in that trace - and a correct, curated URL reads as an invented one. That scoring
+  regression looks exactly like a quality drop. Any change that relocates evidence must add it to
+  the debug payload AND tell the judge prompt it exists, in the same commit.
+- **A live third-party API in the agent loop must never be able to kill a request.** The two Primo
+  tools hit an undocumented discovery endpoint whose fields use a `$$C..$$V..` / `$$R..$$V..$$M..`
+  encoding - parse it defensively, never index blindly, and make a shape change degrade rather
+  than throw. Every call is timed out under a total availability budget, and any failure soft-fails
+  to a "catalog unavailable" toolResult so the loop still answers. Availability is what the catalog
+  SHOWS, not a guarantee a copy is on the shelf, and `total == 0` is the only authoritative
+  not-held signal, because Primo relevance is query-relative.
+- **Cost scales with LOOP LENGTH, not conversation depth - the opposite of the obvious guess.**
+  Measured over 60 live questions (2026-07-29): ~$0.043 a question, **91% of it input tokens**.
+  The intuition that client-carried history makes deep conversations expensive is measurably wrong
+  here - a prior turn adds only **~54 tokens** to a ~10,700-token call, because `_seed_messages`
+  rebuilds history from TEXT turns only and never resends the tool results behind an earlier
+  answer, and it stops growing at the `MAX_HISTORY_MESSAGES` trim. What moves cost is whether the
+  model needs a second Converse call (measured 1.23 per question), because that resends the entire
+  context - worth about fifty turns of history growth in one go. First questions need that second
+  call far more often than follow-ups, which drags a naive cost-vs-position fit negative and reads
+  as "conversations get cheaper as they go", so divide by `model_calls` before fitting depth. The
+  lever on cost is `retrieval.number_of_results` and the priming retrieval, not conversation
+  length.
+- **Serving Spanish was a FRONTEND problem, not a retrieval one.** Verified by hand against the
+  deployed system (2026-07-29): Spanish questions already retrieve correctly from the ENGLISH
+  knowledge base and come back grounded and specific, including the authoritative database tool
+  ("¿Tienen JSTOR?" -> correctly not held, with alternatives) and the live catalog ("un libro
+  sobre la Revolución Mexicana" -> 12 titles). Unaccented input works too. So do NOT translate the
+  corpus, re-ingest, or touch chunking and retrieval for a language feature - that is cost and
+  risk for a problem that does not exist. The gap was the shell: every piece of chrome was
+  hardcoded English, so a Spanish speaker had no signal before typing, and auto-detection cannot
+  close that because it needs a message first. Hence a visible affordance rather than a sniffer,
+  and a backend change of one optional field and one system block.
+
+**Scraping and change gating**
+
+- **The extracted markdown is byte-stable; the metadata sidecar is not.** Measured 2026-07-29 by
+  scraping all 19 seed URLs twice back to back: all 19 `.md` files byte-identical, all 19 sidecars
+  different, and `scrape_timestamp` the only differing field. Content hashing works, but only if
+  the timestamp is excluded - include it and every page looks changed on every run, the gate
+  becomes an expensive no-op, and the KB re-ingests forever. Nothing volatile lives in the
+  document body, so nothing had to be removed from the corpus. The catalog object had the same
+  problem in a different place: its `generated_at` made it churn every run, which the fingerprint
+  gate stops by skipping the write entirely.
+- **Change gating silently removes the prune's safety net if you let it.** `prune_stale_objects`
+  deletes objects not in the expected set, and that set unions in "what this run wrote" as a guard
+  against the slug derivation drifting. The union used to cover the whole corpus for free, because
+  every successful page was re-uploaded every run. Once unchanged pages stop uploading, a page can
+  be live, correct and outside the union - one slug-scheme change away from deletion. Pages found
+  UNCHANGED must count as live too (`live_object_keys`, not `uploaded_object_keys`). Caught by a
+  test, not by review.
+- **Skipping an ingestion job is only safe if something else remembers.** "Start a job if this run
+  uploaded something" plus "skip when a job is already running" loses data: the deferred run's
+  change is already in the bucket, so the next run sees the page as unchanged, uploads nothing and
+  starts no job either, and the change sits unindexed indefinitely. The store-free fix is to
+  compare the bucket's newest `LastModified` against the last ingestion job's `startedAt`, which
+  is true exactly when there is unindexed content, whichever run put it there.
+- **The offline chunking eval measures boundaries, never ranking.** It can tell you a 300-token
+  window cuts 26% of golden answers in half; it cannot tell you whether a 600-token chunk still
+  retrieves, because a bigger chunk averages its embedding over more text and can retrieve less
+  precisely. Two halves, two instruments: pair it with `eval/retrieval_probe.py` against the live
+  index. The 300-token baseline to compare against is recall@1 71%, @3 88%, @5 94%, @8 100%.
+
+**Product shape**
+
+- **An endpoint with no destination is worse than no endpoint.** The feedback path publishes to a
+  topic whose only subscriber is an address in config.yaml, and there is no store - the email is
+  the record. So a `/feedback` route deployed with `notify_email` unset would accept a student's
+  report, return `202`, and drop it: a silent failure in the one feature whose purpose is to break
+  a silence. Hence three outcomes in `resolve_feedback`, not two. `enabled: false` builds nothing
+  and says nothing, which is a choice. Enabled with an EMPTY address builds nothing and emits a
+  `FeedbackStatus` deploy output saying why, because that is a mistake and it should be visible
+  where someone is already looking. Enabled with a MALFORMED address raises at synth, because the
+  only other signal is an SNS subscription nobody can confirm, which looks exactly like a working
+  deployment. The handler still refuses with `503` when its topic env is missing, since "the stack
+  would never do that" is not a runtime guarantee.
