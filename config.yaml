@@ -244,52 +244,6 @@ cors:
 demo_site:
   enabled: true
 
-# --- Feedback endpoint (POST /feedback -> SNS email to a librarian) ---------------------
-#
-# "It said something wrong, how do we fix it?" The RAG-first answer (D-20260727-10) is: edit the
-# library webpage, and the bot picks the change up on the next scheduled scrape of that page's tier.
-# That only works if
-# a librarian learns WHICH PAGE to edit, so the notification carries the source URLs the reported
-# answer cited. Without those it is a complaint box, not a fix path.
-#
-# TRANSPORT IS SNS, NOT SES, and that is a handoff decision rather than a technical preference:
-# SES starts every account in a sandbox that can only send to pre-verified addresses and needs a
-# support request to leave it, which would make one-click install into a fresh AWS account the
-# client's problem. An SNS email subscription needs one confirmation click by the recipient.
-# (Verified on the current account 2026-07-29: SES ProductionAccessEnabled is false, 200
-# messages/day - the sandbox is not hypothetical.)
-#
-# THERE IS NO SERVER-SIDE STORE. No table, no bucket, no logged copy: the email IS the record. A
-# report that fails to send is lost, deliberately - the alternative is a database of student
-# complaints nobody agreed to keep.
-#
-# The route EXISTS ONLY when this block is enabled AND notify_email is set. Enabled with an empty
-# address provisions NOTHING (no topic, no Lambda, no route) and the deploy prints a
-# FeedbackStatus output saying why - an endpoint accepting reports with nowhere to send them
-# would swallow them silently. A NON-empty but malformed address fails synth instead, because
-# that is a typo, and a typo must be loud.
-feedback:
-  enabled: true
-  # The librarian mailbox that receives reports. On the first deploy SNS emails ONE confirmation
-  # link here; until somebody clicks it every publish succeeds and nothing arrives. Prefer a
-  # shared/role address over a person's - staff turnover otherwise ends the feature silently.
-  # Empty on purpose: this is the one value to fill in at handoff.
-  notify_email: ""
-  # Hard cap on the free-text comment (characters). Over it the request is rejected with HTTP 400
-  # and nothing is sent. Feedback text NEVER reaches the model, so the Bedrock guardrails do not
-  # screen it: this cap and plain-text-only rendering are the ONLY controls on what a stranger can
-  # put in a librarian's inbox. A useful "the hours are wrong" report is a sentence or two.
-  max_comment_chars: 1000
-  # Hard cap on the whole request body (bytes, measured after any base64 decode). Over it -> HTTP
-  # 413, before the body is parsed or anything is published. The platform limits (API GW 10 MB,
-  # Lambda 6 MB) are far too high to be a control. Stage throttling above remains the volume
-  # control; this bounds the size of any single report.
-  max_body_bytes: 8192
-  # Cap on how many cited source URLs one report may carry. retrieval.number_of_results (8) plus
-  # the three synthetic tool sources is the real ceiling, so 12 accepts every genuine report from
-  # the widget and rejects a padded one.
-  max_sources: 12
-
 # --- Cost model (the demo page's session meter + monthly estimator) ---------------------
 #
 # Feeds frontend/demo-site.html, which the stack stamps at deploy time exactly like the API
@@ -564,3 +518,58 @@ guardrail:
   # stack passes this same string for it. It is unreachable by construction (nothing applies
   # this guardrail to output), which is why there is no second message to maintain here.
   blocked_input_messaging: "I can't help with that request. I'm here for questions about the Gavilan College Library, like hours, checkouts, and finding materials.\n\nNo puedo ayudarte con esa solicitud. Estoy aquí para responder preguntas sobre la Biblioteca de Gavilan College, como horarios, préstamos y cómo encontrar materiales."
+
+# --- ARCHIVED: feedback endpoint (NOT ACTIVE, NOT SUPPORTED) ---------------------------
+#
+# THIS FEATURE IS ARCHIVED AND WILL NOT WORK. It is switched off and there is nothing to
+# configure here. The backend route was built but the widget has no report-an-answer
+# button, so nothing can ever call it. Left in place only so the wiring is not lost.
+#
+# Leave `enabled: false`. Turning it on provisions an SNS topic and a Lambda that no part
+# of the product talks to. The notes below describe how it was meant to work.
+#
+# --- Feedback endpoint (POST /feedback -> SNS email to a librarian) ---------------------
+#
+# "It said something wrong, how do we fix it?" The RAG-first answer (D-20260727-10) is: edit the
+# library webpage, and the bot picks the change up on the next scheduled scrape of that page's tier.
+# That only works if
+# a librarian learns WHICH PAGE to edit, so the notification carries the source URLs the reported
+# answer cited. Without those it is a complaint box, not a fix path.
+#
+# TRANSPORT IS SNS, NOT SES, and that is a handoff decision rather than a technical preference:
+# SES starts every account in a sandbox that can only send to pre-verified addresses and needs a
+# support request to leave it, which would make one-click install into a fresh AWS account the
+# client's problem. An SNS email subscription needs one confirmation click by the recipient.
+# (Verified on the current account 2026-07-29: SES ProductionAccessEnabled is false, 200
+# messages/day - the sandbox is not hypothetical.)
+#
+# THERE IS NO SERVER-SIDE STORE. No table, no bucket, no logged copy: the email IS the record. A
+# report that fails to send is lost, deliberately - the alternative is a database of student
+# complaints nobody agreed to keep.
+#
+# The route EXISTS ONLY when this block is enabled AND notify_email is set. Enabled with an empty
+# address provisions NOTHING (no topic, no Lambda, no route) and the deploy prints a
+# FeedbackStatus output saying why - an endpoint accepting reports with nowhere to send them
+# would swallow them silently. A NON-empty but malformed address fails synth instead, because
+# that is a typo, and a typo must be loud.
+feedback:
+  enabled: false
+  # The librarian mailbox that receives reports. On the first deploy SNS emails ONE confirmation
+  # link here; until somebody clicks it every publish succeeds and nothing arrives. Prefer a
+  # shared/role address over a person's - staff turnover otherwise ends the feature silently.
+  # Leave empty. The feature is archived, so there is nothing to fill in here.
+  notify_email: ""
+  # Hard cap on the free-text comment (characters). Over it the request is rejected with HTTP 400
+  # and nothing is sent. Feedback text NEVER reaches the model, so the Bedrock guardrails do not
+  # screen it: this cap and plain-text-only rendering are the ONLY controls on what a stranger can
+  # put in a librarian's inbox. A useful "the hours are wrong" report is a sentence or two.
+  max_comment_chars: 1000
+  # Hard cap on the whole request body (bytes, measured after any base64 decode). Over it -> HTTP
+  # 413, before the body is parsed or anything is published. The platform limits (API GW 10 MB,
+  # Lambda 6 MB) are far too high to be a control. Stage throttling above remains the volume
+  # control; this bounds the size of any single report.
+  max_body_bytes: 8192
+  # Cap on how many cited source URLs one report may carry. retrieval.number_of_results (8) plus
+  # the three synthetic tool sources is the real ceiling, so 12 accepts every genuine report from
+  # the widget and rejects a padded one.
+  max_sources: 12

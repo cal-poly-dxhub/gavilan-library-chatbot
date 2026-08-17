@@ -1836,10 +1836,10 @@ def _statements_for_role_of(template, handler_name):
     return statements
 
 
-def test_no_feedback_endpoint_exists_when_no_address_is_configured():
-    # The shipped config: enabled, but with nowhere to send. Nothing is created - no topic, no
-    # subscription, no Lambda, no route - because an endpoint that accepts reports it cannot
-    # deliver loses them silently, and the email is the only record there is.
+def test_the_shipped_config_ships_feedback_archived_and_silent():
+    # The shipped config ARCHIVES the feature: enabled is false, so nothing is created - no
+    # topic, no subscription, no Lambda, no route. The widget has no report-an-answer button,
+    # so a deployed endpoint here would be unreachable by construction.
     template = _template()
     template.resource_count_is("AWS::SNS::Topic", 0)
     template.resource_count_is("AWS::SNS::Subscription", 0)
@@ -1855,10 +1855,9 @@ def test_no_feedback_endpoint_exists_when_no_address_is_configured():
     assert "POST /feedback" not in keys, keys
     assert "FeedbackApiUrl" not in template.find_outputs("*")
 
-    # ...but it is NOT silent about it. This case is a mistake rather than a choice, so the deploy
-    # output says why there is no endpoint instead of leaving it to be discovered by a lost report.
-    status = template.find_outputs("FeedbackStatus")["FeedbackStatus"]["Value"]
-    assert "notify_email" in status, status
+    # ...and it IS silent about it. Turning the feature off is a choice rather than a mistake, so
+    # there is no FeedbackStatus output pointing a librarian at a knob they should not touch.
+    assert "FeedbackStatus" not in template.find_outputs("*")
 
 
 def test_feedback_disabled_creates_nothing_and_says_nothing():
@@ -2091,8 +2090,9 @@ def test_feedback_config_resolves_the_three_states():
     off = resolve_feedback(_config_feedback_off())
     assert off["provision"] is False and off["status"] is None
 
-    # Enabled with no address: nothing provisioned, but a reason to show at deploy.
-    unconfigured = resolve_feedback(CONFIG)
+    # Enabled with no address: nothing provisioned, but a reason to show at deploy. Built
+    # explicitly rather than read from CONFIG, which now ships the feature archived (off).
+    unconfigured = resolve_feedback(_config_with_feedback(notify_email=""))
     assert unconfigured["provision"] is False
     assert "notify_email" in unconfigured["status"]
 
@@ -2142,8 +2142,8 @@ def test_feedback_caps_are_validated_even_while_disabled():
 
 
 def test_shipped_config_has_a_feedback_block_with_the_documented_knobs():
-    # The block is the contract with whoever does the handoff: an enable flag, the destination,
-    # and the caps. Shipped with an EMPTY address on purpose - see resolve_feedback.
+    # The block survives at the bottom of config.yaml so the wiring is not lost, but it ships
+    # ARCHIVED: off, with an empty address. The knobs are still pinned so the shape cannot rot.
     block = CONFIG["feedback"]
     assert set(block) == {
         "enabled",
@@ -2152,7 +2152,7 @@ def test_shipped_config_has_a_feedback_block_with_the_documented_knobs():
         "max_body_bytes",
         "max_sources",
     }, block
-    assert block["enabled"] is True
+    assert block["enabled"] is False
     assert block["notify_email"] == ""
 
 
